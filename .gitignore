@@ -1,0 +1,33 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+.ruff_cache/
+.pyright/
+
+# Virtual environments
+.venv/
+
+# Local configuration and secrets
+.env
+.env.*
+*.local.toml
+
+# Runtime state must remain outside the repository
+.runtime/
+artifacts/
+checkpoints/
+logs/
+mlruns/
+*.sqlite
+*.sqlite3
+
+# Model and temporary outputs
+*.pt
+*.pth
+*.ckpt
+*.tmp

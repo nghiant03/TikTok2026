@@ -1,0 +1,8 @@
+[budget]
+gpu_hours = 0.0
+wall_clock_seconds = 30
+tokens = 0
+disk_bytes = 104857600
+reserved_final_gpu_hours = 0.0
+frontier_capacity = 4
+max_repairs = 2

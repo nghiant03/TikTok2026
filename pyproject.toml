@@ -1,0 +1,61 @@
+[project]
+name = "tiktok2026"
+version = "0.1.0"
+description = "Autonomous recommender-system research controller"
+readme = "README.md"
+authors = [
+    { name = "nghiant", email = "nghiant@mailbox.org" }
+]
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "fastapi>=0.116",
+    "langgraph>=0.6",
+    "mlflow>=3.3",
+    "numpy>=2.4.6",
+    "openai>=1.100",
+    "pandas>=2.3,<3",
+    "pydantic>=2.11",
+    "pydantic-settings>=2.10",
+    "scikit-learn>=1.9.0",
+    "torch>=2.13.0",
+    "torchfm>=0.7.0",
+    "tqdm>=4.70.0",
+    "typer>=0.16",
+    "uvicorn>=0.35",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.404",
+    "pytest>=8.4",
+    "pytest-asyncio>=1.1",
+    "ruff>=0.12",
+]
+
+[project.scripts]
+tiktok2026 = "tiktok2026.cli:app"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = ["baseline", "data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = ["src", "tests"]
+exclude = ["baseline", "data"]
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"

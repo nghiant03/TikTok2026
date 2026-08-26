@@ -1,0 +1,9 @@
+[budget]
+# Set organizer-approved limits before starting an autonomous judged run.
+gpu_hours = 0.0
+wall_clock_seconds = 0
+tokens = 0
+disk_bytes = 0
+reserved_final_gpu_hours = 0.0
+frontier_capacity = 4
+max_repairs = 2
