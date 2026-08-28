@@ -1,0 +1,45 @@
+[project]
+name = "tiktok2026-research-agent"
+version = "0.1.0"
+description = "Contract-first Research Agent subgraph for the TikTok 2026 project"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "certifi>=2025.0",
+    "langgraph>=0.6",
+    "pydantic>=2.11",
+    "pypdf>=5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4",
+    "pytest-asyncio>=1.1",
+    "pyright>=1.1.400",
+    "ruff>=0.12",
+]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+ignore = [
+    # Agent/provider capability boundaries intentionally convert arbitrary
+    # implementation failures into typed ResearchAgentFailure values.
+    "BLE001",
+]

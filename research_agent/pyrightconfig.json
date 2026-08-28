@@ -1,0 +1,10 @@
+{
+  "include": ["src", "tests"],
+  "exclude": ["**/__pycache__"],
+  "extraPaths": ["src", "../TikTok2026-main/src"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "typeCheckingMode": "basic",
+  "reportTypedDictNotRequiredAccess": "none",
+  "reportOptionalMemberAccess": "none"
+}

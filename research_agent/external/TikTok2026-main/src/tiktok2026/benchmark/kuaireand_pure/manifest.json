@@ -1,0 +1,23 @@
+{
+  "benchmark_id": "kuairand-pure",
+  "data_root_env": "TIKTOK2026_KUAIRAND_PURE_DATA",
+  "data_access": "read-only",
+  "task": "within-user ranking over logged impressions",
+  "label": "long_view",
+  "splits": {
+    "train": [20220408, 20220421],
+    "valid": [20220422, 20220428],
+    "test": [20220429, 20220508]
+  },
+  "judging_metrics": ["NDCG@10", "Recall@50"],
+  "judging_evaluator_status": "provisional",
+  "validation_ranking": "mean(NDCG@10, Recall@50)",
+  "convergence": {"epsilon": 0.002, "consecutive_iterations": 3},
+  "protected_reference_files": {
+    "baseline/README.md": "c7a58e652a1aceea144e651ba9ef7a6a4f7dc13f0916e3c4ed342dce69699861",
+    "baseline/data.py": "1bf54f5f3a9f590eab2f87f09a3c27422031867a20a5328d56cbd8c7db36e541",
+    "baseline/evaluate.py": "ecfde28392eb14fec4f488083251df50624e1af2b86278b962daecfb42d195de",
+    "baseline/submit.py": "ab01bb2b970ae2a9f2ead299f5240b71ff4126c2d9bb0e0c4de6c7e245dc148c",
+    "baseline/baseline_scores.json": "950f98181770c030a68bdddab7be3c0abbf060531f54455a6a6f81a4cb003324"
+  }
+}
