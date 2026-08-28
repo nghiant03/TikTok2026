@@ -1,6 +1,5 @@
 # Research Agent Project Guide
 
-
 This guide explains what the Research Agent currently implements, which code files are responsible for each layer, and how to verify the system step by step with pytest, smoke tests, and a real DeepSeek call.
 
 **Intended audience:** People who can use agents but are new to agent engineering  
