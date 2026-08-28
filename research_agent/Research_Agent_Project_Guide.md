@@ -1,6 +1,5 @@
-# TikTok2026 Three-Agent System: Research Agent Project Guide
+ Research Agent Project Guide
 
-> A beginner-friendly guide to contracts, LangGraph, real capabilities, and verification.
 
 This guide explains what the Research Agent currently implements, which code files are responsible for each layer, and how to verify the system step by step with pytest, smoke tests, and a real DeepSeek call.
 
