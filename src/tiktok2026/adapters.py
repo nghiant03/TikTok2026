@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tiktok2026.agents.common.client import OpenAICompatibleClient
 from tiktok2026.contracts import (
+    AgentFailure,
+    AgentRole,
     AuditEvent,
     ContractModel,
     EvaluationResult,
@@ -22,6 +25,28 @@ from tiktok2026.persistence.repositories import ApplicationRepository
 from tiktok2026.persistence.resources import ResourceLedger
 from tiktok2026.policies.lifecycle import can_repair
 from tiktok2026.policies.paths import check_changed_paths
+
+
+class OpenAICompatibleAgentClient:
+    """Adapts OpenAICompatibleClient to the AgentClient protocol."""
+
+    def __init__(self, client: OpenAICompatibleClient) -> None:
+        self._client = client
+
+    async def invoke(self, request: ContractModel) -> ContractModel:
+
+        # This is a thin adapter — the actual structured invocation
+        # would be handled by the agent's prompt/context builder.
+        # For now, just call complete and return the raw dict.
+        raw = await self._client.complete("system", request.model_dump_json())
+        return AgentFailure(
+            request_id=str(raw.get("request_id", "unknown")),
+            role=AgentRole.RESEARCH,
+            kind="model",
+            message="structured parsing not yet implemented for production agents",
+            repair_attempts=0,
+        )
+
 
 # ---------------------------------------------------------------------------
 # RepositoryRunStore — wraps ApplicationRepository as a RunStore
@@ -60,11 +85,14 @@ class RepositoryRunStore:
             audit_event=audit_event,  # type: ignore[arg-type]
         )
 
-    def put_run(self, record: RunRecord, transition_id: str) -> None:
+    def put_run(
+        self, record: RunRecord, transition_id: str,
+        expected_predecessor: str | None = None,
+    ) -> None:
         self._repo.put_run(
             run=record,
             transition_id=transition_id,
-            expected_predecessor=None,
+            expected_predecessor=expected_predecessor,
         )
 
     def put_audit_event(self, event: ContractModel) -> None:
