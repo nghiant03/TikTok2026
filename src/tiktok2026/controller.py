@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -8,6 +8,23 @@ from tiktok2026.contracts import RunPhase
 from tiktok2026.graph.state import ProductionState
 
 Transition = Callable[[ProductionState], Awaitable[dict[str, object]]]
+
+
+class MissingTransitionError(RuntimeError):
+    """Raised when no transition is registered for the requested operation."""
+
+    def __init__(self, operation: str) -> None:
+        super().__init__(f"no transition registered for '{operation}'")
+        self.operation = operation
+
+
+class MissingRouteError(RuntimeError):
+    """Raised when a controller transition did not return a non-null pending_route."""
+
+    def __init__(self, operation: str, updates: dict[str, object]) -> None:
+        super().__init__(f"'{operation}' did not provide a non-null pending_route")
+        self.operation = operation
+        self.updates = updates
 
 
 class TransitionStore(Protocol):
@@ -18,20 +35,35 @@ class TransitionStore(Protocol):
 
 @dataclass(frozen=True)
 class ControllerServices:
-    transitions: dict[str, Transition]
+    transitions: Mapping[str, Transition]
     store: TransitionStore
 
 
 class ProductionController:
+    """Controller that owns the full lifecycle of autonomous research runs.
+
+    Every transition is backed by a registered typed function, persists
+    through the checkpoint store BEFORE returning, and returns updates that
+    include a non-null ``pending_route``.
+    """
+
     def __init__(self, services: ControllerServices) -> None:
         self.services = services
 
     async def _run(self, operation: str, state: ProductionState) -> dict[str, object]:
         transition = self.services.transitions.get(operation)
-        updates = await transition(state) if transition is not None else {}
+        if transition is None:
+            raise MissingTransitionError(operation)
+        updates = await transition(state)
+        # Fail closed: every transition must include a non-null pending_route
+        if "pending_route" not in updates or updates["pending_route"] is None:
+            raise MissingRouteError(operation, updates)
         next_version = state["state_version"] + 1
         persisted = {**updates, "state_version": next_version}
-        self.services.store.persist_transition(state["run_id"], operation, next_version, persisted)
+        # Persist BEFORE returning
+        self.services.store.persist_transition(
+            state["run_id"], operation, next_version, persisted
+        )
         return persisted
 
     async def bootstrap(self, state: ProductionState) -> dict[str, object]:

@@ -1,4 +1,5 @@
 from collections.abc import Hashable
+from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
@@ -32,7 +33,10 @@ NODES = (
 )
 
 
-def build_production_graph(controller: ControllerOperations):
+def build_production_graph(
+    controller: ControllerOperations,
+    checkpointer: Any = None,
+):
     graph = StateGraph(ProductionState)
     for name, node in controller_nodes(controller).items():
         graph.add_node(name, node)
@@ -45,4 +49,4 @@ def build_production_graph(controller: ControllerOperations):
         if name not in {"bootstrap", "inspect", "export"}:
             graph.add_conditional_edges(name, route_pending, destinations)
     graph.add_conditional_edges("export", route_pending, destinations)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
