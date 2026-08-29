@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -38,10 +39,8 @@ def test_failed_migration_rolls_back_all_schema_changes(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(Exception):
+    with pytest.raises(sqlite3.OperationalError):
         MigrationRunner(database, migrations).apply()
-
-    import sqlite3
 
     with sqlite3.connect(database) as connection:
         table = connection.execute(

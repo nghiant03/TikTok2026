@@ -41,6 +41,7 @@ def test_graph_nodes_depend_on_controller_protocol_only() -> None:
 
     assert imports <= {
         "__future__",
+        "collections.abc",
         "typing",
         "tiktok2026.graph.state",
     }
