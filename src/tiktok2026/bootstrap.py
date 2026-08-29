@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from tiktok2026.benchmark.kuaireand_pure.manifest import (
     BenchmarkManifest,
@@ -254,7 +255,7 @@ class _FakeResourceAccountant:
 def build_synthetic_controller(
     repository_root: Path,
     runtime_root: Path,
-) -> tuple[ProductionController, object, object]:
+) -> tuple[ProductionController, object, Any]:
     """Build a synthetic composition: real service-driven transitions with
     scripted agents, fake executor/evaluator/policy, and real persistence.
 
