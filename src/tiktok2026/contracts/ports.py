@@ -11,6 +11,12 @@ from tiktok2026.contracts.models import (
     ExecutionRequest,
     ExecutionResult,
     ExperimentSpec,
+    FailureRecord,
+    FinalizationRecord,
+    PolicyDecisionModel,
+    ProvenanceRequest,
+    ResourceState,
+    RunRecord,
     SourceRegistration,
     WorktreeAssignment,
 )
@@ -72,3 +78,76 @@ class LiteratureReader(Protocol):
 
 class TraceSink(Protocol):
     def record(self, run_id: str, payload: ContractModel) -> Path: ...
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 Lane B: new seam protocols
+# ---------------------------------------------------------------------------
+
+
+class ResourceAccountant(Protocol):
+    """Seam for resource reservation, consumption, and state queries."""
+
+    def state(self) -> ResourceState: ...
+
+    def reserve(self, reservation: ContractModel) -> bool: ...
+
+    def consume(self, reservation_id: str, **usage: float | int) -> bool: ...
+
+
+class PolicyGate(Protocol):
+    """Seam for deterministic policy decisions."""
+
+    def check_paths(
+        self, changed_paths: tuple[str, ...], allowed_scopes: tuple[str, ...]
+    ) -> PolicyDecisionModel: ...
+
+    def can_repair(self, repair_attempts: int) -> PolicyDecisionModel: ...
+
+
+class RunStore(Protocol):
+    """Seam for persisting experiments, evaluations, failures, audit events."""
+
+    def put_experiment(
+        self,
+        spec: ExperimentSpec,
+        status: str,
+        run_id: str,
+        transition_id: str,
+        expected_predecessor: str | None = None,
+        audit_event: ContractModel | None = None,
+    ) -> None: ...
+
+    def put_evaluation(self, result: EvaluationResult, provenance: ProvenanceRequest) -> None: ...
+
+    def put_failure(self, record: FailureRecord, run_id: str) -> None: ...
+
+    def put_run(self, record: RunRecord, transition_id: str) -> None: ...
+
+    def put_audit_event(self, event: ContractModel) -> None: ...
+
+    def get_source_registration(self, experiment_id: str) -> SourceRegistration | None: ...
+
+    def persist_provisional_finalization(
+        self, request: ContractModel
+    ) -> FinalizationRecord: ...
+
+
+class ExportService(Protocol):
+    """Seam for writing deterministic Markdown and JSONL exports."""
+
+    async def export_run(self, run_id: str, output_dir: Path) -> dict[str, Path]: ...
+
+
+class FrontierService(Protocol):
+    """Seam for updating the experiment frontier after persistence."""
+
+    def update(self, experiment_id: str, score: float) -> str | None: ...
+
+
+class AgentResultParser(Protocol):
+    """Seam for parsing and repairing structured agent responses."""
+
+    async def parse(
+        self, client: AgentClient, request: ContractModel, model_type: type
+    ) -> ContractModel: ...

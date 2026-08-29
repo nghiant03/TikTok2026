@@ -545,6 +545,24 @@ class FinalizationRecord(ContractModel):
     consumed_test_access: bool
 
 
+class ProvenanceRequest(ContractModel):
+    """Provenance metadata carried alongside an evaluation persistence."""
+    run_id: str
+    experiment_id: str
+    source_commit: FullCommitSha
+    execution_id: str
+    dataset_manifest_id: str
+    dataset_manifest_sha256: Sha256
+    evaluator_id: str
+    evaluator_sha256: Sha256
+
+
+class PolicyDecisionModel(ContractModel):
+    """Serializable version of a pure policy decision."""
+    allowed: bool
+    reason: str
+
+
 class AuditEvent(ContractModel):
     schema_version: Literal["1"] = "1"
     event_id: str
