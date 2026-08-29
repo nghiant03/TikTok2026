@@ -21,8 +21,12 @@ wheels/
 .runtime/
 artifacts/
 checkpoints/
+exports/
+literature/
 logs/
 mlruns/
+traces/
+worktrees/
 *.sqlite
 *.sqlite3
 
@@ -31,3 +35,5 @@ mlruns/
 *.pth
 *.ckpt
 *.tmp
+submission_final.csv
+run_log.jsonl

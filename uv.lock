@@ -2844,7 +2844,6 @@ name = "tiktok2026"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "fastapi" },
     { name = "langgraph" },
     { name = "mlflow" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -2858,7 +2857,6 @@ dependencies = [
     { name = "torchfm" },
     { name = "tqdm" },
     { name = "typer" },
-    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -2871,7 +2869,6 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fastapi", specifier = ">=0.116" },
     { name = "langgraph", specifier = ">=0.6" },
     { name = "mlflow", specifier = ">=3.3" },
     { name = "numpy", specifier = ">=2.4.6" },
@@ -2884,7 +2881,6 @@ requires-dist = [
     { name = "torchfm", specifier = ">=0.7.0" },
     { name = "tqdm", specifier = ">=4.70.0" },
     { name = "typer", specifier = ">=0.16" },
-    { name = "uvicorn", specifier = ">=0.35" },
 ]
 
 [package.metadata.requires-dev]

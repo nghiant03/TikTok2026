@@ -2,13 +2,24 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{7,64}$")]
+
 
 class ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class AgentRole(StrEnum):
+    ORCHESTRATION = "orchestration"
+    RESEARCH = "research"
+    IMPLEMENTOR = "implementor"
+    VALIDATOR = "validator"
 
 
 class Fidelity(StrEnum):
@@ -57,9 +68,73 @@ class FailureKind(StrEnum):
     SCIENTIFIC_NON_IMPROVEMENT = "scientific_non_improvement"
 
 
+class RunPhase(StrEnum):
+    BOOTSTRAP = "bootstrap"
+    RESEARCH = "research"
+    IMPLEMENT = "implement"
+    EXECUTE = "execute"
+    EVALUATE = "evaluate"
+    PERSIST = "persist"
+    FINALIZE = "finalize"
+    COMPLETE = "complete"
+
+
+class ArtifactRetention(StrEnum):
+    TEMPORARY = "temporary"
+    RUN = "run"
+    CHAMPION = "champion"
+    PROVENANCE = "provenance"
+
+
+class RuntimePaths(ContractModel):
+    root: Path
+    application_db: Path
+    graph_db: Path
+    artifacts: Path
+    worktrees: Path
+    traces: Path
+    exports: Path
+    locks: Path
+    literature: Path
+    temporary: Path
+
+    @classmethod
+    def create(cls, repository_root: Path, runtime_root: Path) -> RuntimePaths:
+        repository = repository_root.resolve()
+        root = runtime_root.resolve()
+        if root == repository or repository in root.parents:
+            raise ValueError("runtime root must be outside the repository")
+        directories = {
+            "artifacts": root / "artifacts",
+            "worktrees": root / "worktrees",
+            "traces": root / "traces",
+            "exports": root / "exports",
+            "locks": root / "locks",
+            "literature": root / "literature",
+            "temporary": root / "tmp",
+        }
+        root.mkdir(parents=True, exist_ok=True)
+        for directory in directories.values():
+            directory.mkdir(parents=True, exist_ok=True)
+        return cls(
+            root=root,
+            application_db=root / "application.sqlite3",
+            graph_db=root / "graph.sqlite3",
+            **directories,
+        )
+
+
 class MetricValue(ContractModel):
     name: Literal["NDCG@10", "Recall@50"]
     value: Annotated[float, Field(ge=0.0, le=1.0)]
+
+
+class Hypothesis(ContractModel):
+    schema_version: Literal["1"] = "1"
+    hypothesis_id: str
+    statement: str
+    mechanism: str
+    evidence_refs: tuple[str, ...] = ()
 
 
 class ExperimentSpec(ContractModel):
@@ -79,6 +154,23 @@ class ExperimentSpec(ContractModel):
     failure_criteria: str
     leakage_risks: tuple[str, ...] = ()
     source_provenance: tuple[str, ...] = ()
+
+
+class EvidenceItem(ContractModel):
+    evidence_id: str
+    kind: str
+    summary: str
+    source_ref: str
+    authorized: bool = True
+    contains_test_labels: bool = False
+
+
+class ResearchDecision(ContractModel):
+    request_id: str
+    kind: Literal["proposal", "evidence_request", "interpretation"]
+    experiment_spec: ExperimentSpec | None = None
+    message: str
+    evidence_refs: tuple[str, ...] = ()
 
 
 class OrchestrationDecision(ContractModel):
@@ -116,6 +208,21 @@ class ValidationReport(ContractModel):
     scientific_confidence: str | None = None
 
 
+class ExecutionRequest(ContractModel):
+    execution_id: str
+    experiment_id: str
+    source_commit: CommitSha
+    command: tuple[str, ...]
+    image: str
+    source_path: Path
+    dataset_path: Path
+    output_path: Path
+    timeout_seconds: Annotated[int, Field(gt=0)]
+    memory_bytes: Annotated[int, Field(gt=0)]
+    cpus: Annotated[float, Field(gt=0)]
+    gpu_count: Annotated[int, Field(ge=0)] = 0
+
+
 class ExecutionResult(ContractModel):
     schema_version: Literal["1"] = "1"
     execution_id: str
@@ -137,6 +244,16 @@ class ExecutionResult(ContractModel):
         return self
 
 
+class EvaluationRequest(ContractModel):
+    evaluation_id: str
+    experiment_id: str
+    checkpoint_id: str
+    user_ids: tuple[str, ...]
+    labels: tuple[int, ...]
+    scores: tuple[float, ...]
+    prediction_sha256: Sha256
+
+
 class EvaluationResult(ContractModel):
     schema_version: Literal["1"] = "1"
     evaluation_id: str
@@ -144,8 +261,8 @@ class EvaluationResult(ContractModel):
     checkpoint_id: str
     metrics: tuple[MetricValue, ...]
     evaluator_artifact_id: str
-    evaluator_sha256: str
-    prediction_sha256: str
+    evaluator_sha256: Sha256
+    prediction_sha256: Sha256
     validity: Literal["provisional", "official", "invalid"]
 
     @property
@@ -175,6 +292,103 @@ class ResourceState(ContractModel):
     remaining_tokens: Annotated[int, Field(ge=0)]
     disk_bytes_available: Annotated[int, Field(ge=0)]
     reserved_final_gpu_hours: Annotated[float, Field(ge=0.0)]
+
+
+class ResearchRequest(ContractModel):
+    request_id: str
+    objective: str
+    resource_state: ResourceState
+    parent_experiment_id: str | None = None
+    allowed_paths: tuple[str, ...] = ("src/tiktok2026/experiment",)
+
+
+class ArtifactRecord(ContractModel):
+    artifact_id: str
+    run_id: str
+    experiment_id: str | None = None
+    kind: str
+    uri: str
+    sha256: Sha256
+    size_bytes: Annotated[int, Field(ge=0)]
+    producer: str
+    retention: ArtifactRetention
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class ResourceReservation(ContractModel):
+    reservation_id: str
+    run_id: str
+    experiment_id: str | None = None
+    gpu_hours: Annotated[float, Field(ge=0.0)]
+    wall_seconds: Annotated[float, Field(ge=0.0)]
+    tokens: Annotated[int, Field(ge=0)]
+    disk_bytes: Annotated[int, Field(ge=0)]
+
+
+class WorktreeAssignment(ContractModel):
+    worktree_id: str
+    run_id: str
+    experiment_id: str
+    path: Path
+    branch: str
+    parent_commit: CommitSha
+
+
+class SourceRegistration(ContractModel):
+    experiment_id: str
+    parent_commit: CommitSha
+    source_commit: CommitSha
+    patch_sha256: Sha256
+
+
+class ModelUsage(ContractModel):
+    role: AgentRole
+    model: str
+    prompt_tokens: Annotated[int, Field(ge=0)]
+    completion_tokens: Annotated[int, Field(ge=0)]
+
+
+class AgentFailure(ContractModel):
+    request_id: str
+    role: AgentRole
+    kind: Literal["model", "schema", "policy", "capability"]
+    message: str
+    repair_attempts: Annotated[int, Field(ge=0, le=1)]
+
+
+class LessonRecord(ContractModel):
+    lesson_id: str
+    statement: str
+    evidence_strength: Literal["weak", "moderate", "strong"]
+    experiment_ids: tuple[str, ...]
+    tags: tuple[str, ...] = ()
+
+
+class FrontierCandidate(ContractModel):
+    experiment_id: str
+    slot: Literal["champion", "alternative", "diagnostic"]
+    score: float
+    diversity_tags: tuple[str, ...] = ()
+
+
+class GraphStateReference(ContractModel):
+    run_id: str
+    phase: RunPhase
+    current_experiment_id: str | None = None
+    repair_attempts: Annotated[int, Field(ge=0, le=2)] = 0
+    terminal_reason: str | None = None
+
+
+class FinalizationRecord(ContractModel):
+    finalization_id: str
+    run_id: str
+    experiment_id: str
+    source_commit: CommitSha
+    checkpoint_id: str
+    evaluation_id: str
+    validity: Literal["provisional", "official"]
+    bundle_artifact_id: str
+    consumed_test_access: bool
 
 
 class AuditEvent(ContractModel):
