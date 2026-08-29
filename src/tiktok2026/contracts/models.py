@@ -245,14 +245,72 @@ class ExecutionResult(ContractModel):
         return self
 
 
-class EvaluationRequest(ContractModel):
+class EvaluationContext(ContractModel):
+    """Controller-owned, immutable context for one offline evaluation."""
+
+    run_id: str
     evaluation_id: str
     experiment_id: str
     checkpoint_id: str
-    user_ids: tuple[str, ...]
-    labels: tuple[int, ...]
-    scores: tuple[float, ...]
+    source_commit: FullCommitSha
+    execution_id: str
+    dataset_manifest_id: str
+    dataset_manifest_sha256: Sha256
+    split: Literal["valid", "test"]
+    prediction_artifact_id: str
     prediction_sha256: Sha256
+    evaluator_id: str
+    evaluator_sha256: Sha256
+    authorization_claim_id: str | None = None
+
+
+class FinalTestAuthorizationClaim(ContractModel):
+    """Authoritative claim returned by the persistence-backed resolver."""
+
+    claim_id: str
+    run_id: str
+    experiment_id: str
+    source_commit: FullCommitSha
+    evaluator_id: str
+    evaluator_sha256: Sha256 | None = None
+    dataset_manifest_id: str
+    dataset_manifest_sha256: Sha256
+    split: Literal["test"]
+    checkpoint_id: str
+    execution_id: str
+    prediction_artifact_id: str
+    prediction_sha256: Sha256
+
+
+class PredictionArtifactRegistration(ContractModel):
+    artifact_id: str
+    path: Path
+    sha256: Sha256
+    checkpoint_id: str
+    source_commit: FullCommitSha
+    execution_id: str
+    dataset_manifest_id: str
+    dataset_manifest_sha256: Sha256
+    split: Literal["valid", "test"]
+
+
+class EvaluationRequest(ContractModel):
+    evaluation_id: str
+    context: EvaluationContext
+
+    @model_validator(mode="after")
+    def validate_context_identity(self) -> EvaluationRequest:
+        if self.evaluation_id != self.context.evaluation_id:
+            raise ValueError("evaluation request/context IDs do not match")
+        return self
+
+
+class PredictionRow(ContractModel):
+    row_id: str
+    user_id: str
+    item_id: str
+    score: float
+    row_identity: tuple[str, ...]
 
 
 class FinalTestAuthorizationRequest(ContractModel):
@@ -260,6 +318,14 @@ class FinalTestAuthorizationRequest(ContractModel):
     experiment_id: str
     source_commit: FullCommitSha
     evaluator_id: str
+    evaluator_sha256: Sha256 | None = None
+    dataset_manifest_id: str | None = None
+    dataset_manifest_sha256: Sha256 | None = None
+    split: Literal["test"] | None = None
+    checkpoint_id: str | None = None
+    execution_id: str | None = None
+    prediction_artifact_id: str | None = None
+    prediction_sha256: Sha256 | None = None
 
 
 class FinalTestClaim(ContractModel):
@@ -268,6 +334,14 @@ class FinalTestClaim(ContractModel):
     experiment_id: str
     source_commit: FullCommitSha
     evaluator_id: str
+    evaluator_sha256: Sha256 | None = None
+    dataset_manifest_id: str | None = None
+    dataset_manifest_sha256: Sha256 | None = None
+    split: Literal["test"] | None = None
+    checkpoint_id: str | None = None
+    execution_id: str | None = None
+    prediction_artifact_id: str | None = None
+    prediction_sha256: Sha256 | None = None
 
 
 class ProvisionalFinalizationRequest(ContractModel):
@@ -305,6 +379,13 @@ class EvaluationResult(ContractModel):
     evaluator_sha256: Sha256
     prediction_sha256: Sha256
     validity: Literal["provisional", "official", "invalid"]
+    dataset_manifest_sha256: Sha256 | None = None
+    split: Literal["valid", "test"] | None = None
+    run_id: str | None = None
+    source_commit: FullCommitSha | None = None
+    execution_id: str | None = None
+    dataset_manifest_id: str | None = None
+    prediction_artifact_id: str | None = None
 
     @property
     def validation_score(self) -> float:

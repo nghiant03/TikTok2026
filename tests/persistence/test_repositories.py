@@ -20,6 +20,7 @@ from tiktok2026.persistence.migrations import MigrationRunner
 from tiktok2026.persistence.repositories import (
     ApplicationRepository,
     FinalTestAccessError,
+    PersistedFinalTestClaimResolver,
     PersistenceConflictError,
 )
 from tiktok2026.repository.diffs import patch_signature
@@ -223,8 +224,16 @@ def test_final_test_is_controller_owned_and_single_use(tmp_path: Path) -> None:
         experiment_id="exp-1",
         source_commit=source.source_commit,
         evaluator_id="official-v1",
+        dataset_manifest_id="manifest-1",
+        dataset_manifest_sha256="c" * 64,
+        split="test",
+        checkpoint_id="checkpoint-1",
+        execution_id="execution-1",
+        prediction_artifact_id="predictions-1",
+        prediction_sha256="d" * 64,
     )
     claim = repository.authorize_final_test(authorization)
+    assert PersistedFinalTestClaimResolver(repository).resolve(claim.claim_id) == claim
     request = FinalTestRequest(
         claim_id=claim.claim_id,
         finalization_id="final-1",

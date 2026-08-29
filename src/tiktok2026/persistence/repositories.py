@@ -31,6 +31,16 @@ class FinalTestAccessError(PermissionError):
     """A final-test request does not satisfy controller policy."""
 
 
+class PersistedFinalTestClaimResolver:
+    """Resolve immutable Phase 1 claims for evaluator-side authorization."""
+
+    def __init__(self, repository: ApplicationRepository) -> None:
+        self.repository = repository
+
+    def resolve(self, claim_id: str) -> FinalTestClaim | None:
+        return self.repository.get_final_test_claim(claim_id)
+
+
 def _content_hash(payload: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -705,6 +715,22 @@ class ApplicationRepository:
             ).fetchone()
         return FinalizationRecord.model_validate_json(row[0]) if row else None
 
+    def get_final_test_claim(self, claim_id: str) -> FinalTestClaim | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT claim_json, content_sha256 FROM final_test_claims WHERE claim_id = ?",
+                (claim_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        claim_json, content_sha256 = row
+        if _content_hash(claim_json) != content_sha256:
+            raise FinalTestAccessError("persisted final test claim integrity check failed")
+        claim = FinalTestClaim.model_validate_json(claim_json)
+        if claim.claim_id != claim_id:
+            raise FinalTestAccessError("persisted final test claim identity mismatch")
+        return claim
+
     def authorize_final_test(
         self, request: FinalTestAuthorizationRequest, actor_id: str = "controller"
     ) -> FinalTestClaim:
@@ -748,6 +774,7 @@ class ApplicationRepository:
             if evaluator_row is None:
                 raise FinalTestAccessError("evaluator identity is not registered")
             identity = EvaluatorIdentity.model_validate_json(evaluator_row[0])
+            claim = claim.model_copy(update={"evaluator_sha256": identity.evaluator_sha256})
             existing = connection.execute(
                 "SELECT claim_json, claim_id FROM final_test_claims WHERE run_id = ?",
                 (request.run_id,),
