@@ -21,6 +21,7 @@ def create_repository(path: Path) -> str:
     run_git(path, "init")
     run_git(path, "config", "user.name", "Test")
     run_git(path, "config", "user.email", "test@example.invalid")
+    run_git(path, "config", "commit.gpgsign", "false")
     (path / "README.md").write_text("base\n", encoding="utf-8")
     run_git(path, "add", "README.md")
     run_git(path, "commit", "-m", "base")

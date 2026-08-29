@@ -244,6 +244,8 @@ def test_git_head_output_accepts_trailing_newline(tmp_path: Path) -> None:
             "user.email=test@example.invalid",
             "-c",
             "user.name=test",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "--allow-empty",
             "-m",

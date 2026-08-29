@@ -93,6 +93,8 @@ class GitWorktreeManager:
                 self._git("reset", cwd=assignment.path)
                 raise ValueError(decision.reason)
             self._git(
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "-m",
                 f"Evaluate experiment {assignment.experiment_id}",
