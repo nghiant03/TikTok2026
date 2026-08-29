@@ -37,7 +37,10 @@ ACTION_ROUTES = {
 def route_after_failure(state: ProductionState, failure: FailureRecord) -> str:
     if failure.kind in REPAIRABLE_FAILURES and state["repair_attempts"] < 2:
         return "repair"
-    return "persist_failure"
+    # ``persist_failure`` is a persistence operation, not a retry edge.  Once
+    # classified and persisted, a non-repairable/exhausted failure can only
+    # leave the experiment through the finite export path.
+    return "export"
 
 
 def route_after_validation(state: ProductionState, report: ValidationReport) -> str:

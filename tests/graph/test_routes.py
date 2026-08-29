@@ -70,10 +70,10 @@ def test_graph_state_contains_references_not_artifacts() -> None:
 
 def test_repairable_failure_routes_to_repair_until_limit() -> None:
     assert route_after_failure(state(repair_attempts=1), repairable_failure(1)) == "repair"
-    assert route_after_failure(state(repair_attempts=2), repairable_failure(2)) == "persist_failure"
+    assert route_after_failure(state(repair_attempts=2), repairable_failure(2)) == "export"
 
 
-def test_nonrepairable_failure_is_persisted() -> None:
+def test_nonrepairable_failure_terminates_at_export() -> None:
     failure = FailureRecord(
         failure_id="failure-science",
         experiment_id="experiment-1",
@@ -83,7 +83,7 @@ def test_nonrepairable_failure_is_persisted() -> None:
         scientific_evidence=True,
     )
 
-    assert route_after_failure(state(), failure) == "persist_failure"
+    assert route_after_failure(state(), failure) == "export"
 
 
 def test_approved_result_routes_to_interpretation() -> None:

@@ -75,8 +75,10 @@ def test_production_run_fails_with_clear_message_on_missing_credentials(
         app,
         [
             "run",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(repo_dir),
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(repo_dir),
         ],
     )
     assert result.exit_code != 0
@@ -115,9 +117,12 @@ def test_production_resume_rejects_identity_mismatch(tmp_path: Path) -> None:
         app,
         [
             "resume",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(repo_dir),
-            "--run-id", "run-1",
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(repo_dir),
+            "--run-id",
+            "run-1",
         ],
     )
     assert result.exit_code != 0
@@ -143,9 +148,12 @@ def test_production_finalize_rejects_ineligible(tmp_path: Path) -> None:
         app,
         [
             "finalize",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(repo_dir),
-            "--run-id", "run-1",
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(repo_dir),
+            "--run-id",
+            "run-1",
         ],
     )
     assert result.exit_code != 0
@@ -189,9 +197,12 @@ def test_production_finalize_succeeds_on_eligible_run(tmp_path: Path) -> None:
         app,
         [
             "finalize",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(repo_dir),
-            "--run-id", "run-1",
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(repo_dir),
+            "--run-id",
+            "run-1",
         ],
     )
     # Should fail because the run is not converged
@@ -203,8 +214,8 @@ def test_production_finalize_succeeds_on_eligible_run(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_production_export_writes_files_from_persisted_events(tmp_path: Path) -> None:
-    """Export command writes JSONL+Markdown from persisted events."""
+def test_production_export_rejects_without_persisted_finalization(tmp_path: Path) -> None:
+    """Export command refuses events that lack authoritative finalization."""
     runtime_root, repo_dir = _setup_runtime(tmp_path)
 
     from tiktok2026.adapters import RepositoryRunStore
@@ -230,20 +241,25 @@ def test_production_export_writes_files_from_persisted_events(tmp_path: Path) ->
         app,
         [
             "export",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(repo_dir),
-            "--run-id", "run-1",
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(repo_dir),
+            "--run-id",
+            "run-1",
         ],
     )
-    assert result.exit_code == 0, result.output
-    assert ".jsonl" in result.output or ".md" in result.output
+    assert result.exit_code != 0
+    assert "persisted finalization" in result.output
 
     result2 = CliRunner().invoke(
         app,
         [
             "export",
-            "--runtime-root", str(runtime_root),
-            "--run-id", "nonexistent-run",
+            "--runtime-root",
+            str(runtime_root),
+            "--run-id",
+            "nonexistent-run",
         ],
     )
     assert result2.exit_code != 0
@@ -267,8 +283,10 @@ def test_synthetic_resume_records_accepted(tmp_path: Path) -> None:
         app,
         [
             "run",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(repo_dir),
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(repo_dir),
             "--synthetic",
         ],
     )
@@ -281,9 +299,12 @@ def test_synthetic_resume_records_accepted(tmp_path: Path) -> None:
         app,
         [
             "resume",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(repo_dir),
-            "--run-id", run_id,
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(repo_dir),
+            "--run-id",
+            run_id,
             "--synthetic",
         ],
     )

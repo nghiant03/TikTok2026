@@ -50,7 +50,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
 include = ["src", "tests"]
-exclude = ["baseline", "data", "tests/controller/test_adapters.py"]
+exclude = ["baseline", "data", "tests"]
 reportMissingTypeStubs = false
 reportUnknownMemberType = false
 

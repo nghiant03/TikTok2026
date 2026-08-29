@@ -163,6 +163,100 @@ class ApplicationRepository:
             ),
         )
 
+    def persist_transition(
+        self,
+        run_id: str,
+        operation: str,
+        state_version: int,
+        updates: dict[str, object],
+    ) -> None:
+        """Atomically append a controller transition and its audit event.
+
+        The transition table is represented by the generic records table, but
+        the read/compare/write and audit insertion deliberately share one
+        ``BEGIN IMMEDIATE`` transaction.  This is the authority boundary for
+        graph transitions; callers must not implement a split CAS themselves.
+        """
+        if state_version < 1:
+            raise PersistenceConflictError("transition versions start at one")
+        payload = json.dumps(
+            {
+                "run_id": run_id,
+                "operation": operation,
+                "state_version": state_version,
+                "updates": updates,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        record_id = f"{run_id}:{state_version}"
+        event_id = f"transition-{run_id}-{state_version}"
+        now = datetime.now(UTC)
+        event = AuditEvent(
+            event_id=event_id,
+            run_id=run_id,
+            event_type="controller_transition",
+            actor_type="controller",
+            actor_id="production-controller",
+            payload={
+                "operation": operation,
+                "state_version": state_version,
+                "updates": updates,
+            },
+            created_at=now,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT payload_json FROM records WHERE kind = 'transition' AND record_id = ?",
+                (record_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload:
+                    raise PersistenceConflictError(
+                        f"transition {record_id} content changed"
+                    )
+                # An interrupted transaction cannot leave this path half
+                # committed, but older data may lack its audit event.  Repair
+                # that event during an identical, idempotent retry.
+                audit = connection.execute(
+                    "SELECT payload_json FROM audit_events WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()
+                if audit is None:
+                    self._insert_audit(connection, event)
+                else:
+                    actual = json.loads(audit[0])
+                    expected = event.model_dump(mode="json")
+                    actual.pop("created_at", None)
+                    expected.pop("created_at", None)
+                    if actual != expected:
+                        raise PersistenceConflictError(
+                            f"audit event {event_id} content changed"
+                        )
+                return
+
+            rows = connection.execute(
+                "SELECT payload_json FROM records WHERE kind = 'transition'"
+            ).fetchall()
+            versions = {
+                int(value["state_version"])
+                for (raw,) in rows
+                if (value := json.loads(raw)).get("run_id") == run_id
+            }
+            if state_version == 1:
+                if versions:
+                    raise PersistenceConflictError("transition version one has a predecessor")
+            elif state_version - 1 not in versions or any(
+                version > state_version for version in versions
+            ):
+                raise PersistenceConflictError("transition CAS predecessor is stale")
+            connection.execute(
+                "INSERT INTO records (kind, record_id, payload_json) VALUES ('transition', ?, ?)",
+                (record_id, payload),
+            )
+            self._insert_audit(connection, event)
+
     def register_artifact(self, record: ArtifactRecord) -> None:
         payload = record.model_dump_json()
         digest = _content_hash(payload)

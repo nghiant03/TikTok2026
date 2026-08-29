@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Protocol
 
-from tiktok2026.contracts import RunPhase
+from tiktok2026.contracts import TransitionStore
 from tiktok2026.graph.state import ProductionState
 
 Transition = Callable[[ProductionState], Awaitable[dict[str, object]]]
@@ -27,10 +26,16 @@ class MissingRouteError(RuntimeError):
         self.updates = updates
 
 
-class TransitionStore(Protocol):
-    def persist_transition(
-        self, run_id: str, operation: str, state_version: int, updates: dict[str, object]
-    ) -> None: ...
+class TransitionPersistenceError(RuntimeError):
+    """A transition could not become durable and authoritative."""
+
+    terminal = True
+
+    def __init__(self, run_id: str, operation: str, cause: Exception) -> None:
+        super().__init__(f"could not persist {operation} for run {run_id}: {cause}")
+        self.run_id = run_id
+        self.operation = operation
+        self.cause = cause
 
 
 @dataclass(frozen=True)
@@ -61,10 +66,20 @@ class ProductionController:
         next_version = state["state_version"] + 1
         persisted = {**updates, "state_version": next_version}
         # Persist BEFORE returning
-        self.services.store.persist_transition(
-            state["run_id"], operation, next_version, persisted
-        )
+        try:
+            self.services.store.persist_transition(
+                state["run_id"], operation, next_version, persisted
+            )
+        except Exception as error:
+            raise TransitionPersistenceError(state["run_id"], operation, error) from error
         return persisted
+
+    def reload(self, run_id: str, state_version: int) -> dict[str, object] | None:
+        """Reload a durable transition payload without consulting graph memory."""
+        loader = getattr(self.services.store, "load_transition", None)
+        if loader is None:
+            return None
+        return loader(run_id, state_version)
 
     async def bootstrap(self, state: ProductionState) -> dict[str, object]:
         return await self._run("bootstrap", state)
@@ -127,9 +142,7 @@ class ProductionController:
         return await self._run("persist_failure", state)
 
     async def finalize(self, state: ProductionState) -> dict[str, object]:
-        updates = await self._run("finalize", state)
-        return {"phase": RunPhase.FINALIZE, **updates}
+        return await self._run("finalize", state)
 
     async def export(self, state: ProductionState) -> dict[str, object]:
-        updates = await self._run("export", state)
-        return {"phase": RunPhase.COMPLETE, "pending_route": "complete", **updates}
+        return await self._run("export", state)

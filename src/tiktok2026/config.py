@@ -45,6 +45,8 @@ class AppSettings(BaseModel):
     docker_image: str = "tiktok2026:local"
     evaluator_id: str = "provisional-within-user-v1"
     mlflow_uri: str | None = None
+    plateau_epsilon: float = Field(default=0.002, ge=0.0)
+    plateau_patience: int = Field(default=3, ge=1)
 
     @property
     def paths(self) -> RuntimePaths:
@@ -84,9 +86,4 @@ class AppSettings(BaseModel):
 def _load_toml(path: Path) -> dict[str, object]:
     with path.open("rb") as handle:
         raw = tomllib.load(handle)
-    result: dict[str, object] = {}
-    if "budget" in raw:
-        result["budget"] = raw["budget"]
-    if "models" in raw:
-        result["models"] = raw["models"]
-    return result
+    return {str(key): value for key, value in raw.items()}

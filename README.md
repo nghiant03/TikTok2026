@@ -50,3 +50,5 @@ uv run tiktok2026 synthetic-run --iterations 2 \
 ```
 
 Default verification requires no network, paid model, Docker, GPU, or KuaiRand data. Live Docker, provider, dataset, and MLflow checks are operator-enabled diagnostics only.
+
+Production `run` and `resume` load the committed `config/budgets/judged.toml` profile by default. Supply `--profile-path` for another committed profile and `--operator-config` for an external TOML containing operator-specific settings such as model endpoints, dataset paths, and the immutable Docker image.

@@ -6,14 +6,18 @@ from typing import Protocol
 from tiktok2026.contracts.models import (
     ArtifactRecord,
     ContractModel,
+    DatasetManifestIdentity,
     EvaluationRequest,
     EvaluationResult,
+    EvaluatorIdentity,
     ExecutionRequest,
     ExecutionResult,
     ExperimentSpec,
     FailureRecord,
+    FinalizationBundleRequest,
     FinalizationRecord,
     PolicyDecisionModel,
+    PredictionArtifactRegistration,
     ProvenanceRequest,
     ResourceState,
     RunRecord,
@@ -94,6 +98,8 @@ class ResourceAccountant(Protocol):
 
     def consume(self, reservation_id: str, **usage: float | int) -> bool: ...
 
+    def reconcile(self, reservation_id: str, **usage: float | int) -> bool: ...
+
 
 class PolicyGate(Protocol):
     """Seam for deterministic policy decisions."""
@@ -106,6 +112,12 @@ class PolicyGate(Protocol):
 
 
 class RunStore(Protocol):
+    def persist_transition(
+        self, run_id: str, operation: str, state_version: int, updates: dict[str, object]
+    ) -> None: ...
+
+    def load_transition(self, run_id: str, state_version: int) -> dict[str, object] | None: ...
+
     """Seam for persisting experiments, evaluations, failures, audit events."""
 
     def put_experiment(
@@ -123,13 +135,41 @@ class RunStore(Protocol):
     def put_failure(self, record: FailureRecord, run_id: str) -> None: ...
 
     def put_run(
-        self, record: RunRecord, transition_id: str,
+        self,
+        record: RunRecord,
+        transition_id: str,
         expected_predecessor: str | None = None,
     ) -> None: ...
 
     def put_audit_event(self, event: ContractModel) -> None: ...
 
     def get_source_registration(self, experiment_id: str) -> SourceRegistration | None: ...
+
+    def get_experiment(self, experiment_id: str) -> ExperimentSpec | None: ...
+
+    def put_source_registration(self, registration: SourceRegistration) -> None: ...
+
+    def put_execution_result(self, result: ExecutionResult) -> None: ...
+
+    def get_execution_result(self, execution_id: str) -> ExecutionResult | None: ...
+
+    def get_evaluation_result(self, evaluation_id: str) -> EvaluationResult | None: ...
+
+    def get_artifact(self, artifact_id: str) -> ArtifactRecord | None: ...
+
+    def put_artifact(self, record: ArtifactRecord) -> None: ...
+
+    def put_evaluator_identity(self, identity: EvaluatorIdentity) -> None: ...
+
+    def get_evaluator_identity(self, evaluator_id: str) -> EvaluatorIdentity | None: ...
+
+    def put_dataset_manifest_identity(self, identity: DatasetManifestIdentity) -> None: ...
+
+    def get_dataset_manifest_identity(self) -> DatasetManifestIdentity | None: ...
+
+    def get_prediction_artifact(
+        self, artifact_id: str
+    ) -> PredictionArtifactRegistration | None: ...
 
     def put_worktree_assignment(self, assignment: WorktreeAssignment) -> None: ...
 
@@ -139,9 +179,17 @@ class RunStore(Protocol):
 
     def list_json(self, kind: str) -> tuple[str, ...]: ...
 
-    def persist_provisional_finalization(
-        self, request: ContractModel
-    ) -> FinalizationRecord: ...
+    def persist_provisional_finalization(self, request: ContractModel) -> FinalizationRecord: ...
+
+    def get_finalization(self, finalization_id: str) -> FinalizationRecord | None: ...
+
+
+class TransitionStore(Protocol):
+    """Durable CAS store for controller graph transitions."""
+
+    def persist_transition(
+        self, run_id: str, operation: str, state_version: int, updates: dict[str, object]
+    ) -> None: ...
 
 
 class ExportService(Protocol):
@@ -150,8 +198,16 @@ class ExportService(Protocol):
     async def export_run(self, run_id: str, output_dir: Path) -> dict[str, Path]: ...
 
 
+class FinalizationBundleService(Protocol):
+    """Create a persisted, provenance-bearing finalization bundle."""
+
+    def create(self, request: FinalizationBundleRequest) -> ArtifactRecord: ...
+
+
 class FrontierService(Protocol):
     """Seam for updating the experiment frontier after persistence."""
+
+    def initialize(self, run_id: str) -> None: ...
 
     def update(self, experiment_id: str, score: float) -> str | None: ...
 

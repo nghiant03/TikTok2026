@@ -47,8 +47,10 @@ def test_run_synthetic_exits_zero(tmp_path: Path) -> None:
         app,
         [
             "run",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(test_repo_root),
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(test_repo_root),
             "--synthetic",
         ],
     )
@@ -84,8 +86,10 @@ def test_resume_on_clean_synthetic_run_succeeds(tmp_path: Path) -> None:
         app,
         [
             "run",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(test_repo_root),
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(test_repo_root),
             "--synthetic",
         ],
     )
@@ -100,9 +104,12 @@ def test_resume_on_clean_synthetic_run_succeeds(tmp_path: Path) -> None:
         app,
         [
             "resume",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(test_repo_root),
-            "--run-id", run_id,
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(test_repo_root),
+            "--run-id",
+            run_id,
             "--synthetic",
         ],
     )
@@ -118,8 +125,10 @@ def test_resume_rejects_nonresumable_state(tmp_path: Path) -> None:
         app,
         [
             "resume",
-            "--runtime-root", str(runtime_root),
-            "--run-id", "nonexistent-run",
+            "--runtime-root",
+            str(runtime_root),
+            "--run-id",
+            "nonexistent-run",
         ],
     )
     assert result.exit_code != 0
@@ -144,8 +153,10 @@ def test_finalize_on_synthetic_run_succeeds(tmp_path: Path) -> None:
         app,
         [
             "run",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(test_repo_root),
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(test_repo_root),
             "--synthetic",
         ],
     )
@@ -159,9 +170,12 @@ def test_finalize_on_synthetic_run_succeeds(tmp_path: Path) -> None:
         app,
         [
             "finalize",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(test_repo_root),
-            "--run-id", run_id,
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(test_repo_root),
+            "--run-id",
+            run_id,
             "--synthetic",
         ],
     )
@@ -178,8 +192,10 @@ def test_finalize_rejects_nonexistent_run(tmp_path: Path) -> None:
         app,
         [
             "finalize",
-            "--runtime-root", str(runtime_root),
-            "--run-id", "nonexistent",
+            "--runtime-root",
+            str(runtime_root),
+            "--run-id",
+            "nonexistent",
         ],
     )
     assert result.exit_code != 0
@@ -204,8 +220,10 @@ def test_export_on_synthetic_run_succeeds(tmp_path: Path) -> None:
         app,
         [
             "run",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(test_repo_root),
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(test_repo_root),
             "--synthetic",
         ],
     )
@@ -219,9 +237,12 @@ def test_export_on_synthetic_run_succeeds(tmp_path: Path) -> None:
         app,
         [
             "export",
-            "--runtime-root", str(runtime_root),
-            "--repository-root", str(test_repo_root),
-            "--run-id", run_id,
+            "--runtime-root",
+            str(runtime_root),
+            "--repository-root",
+            str(test_repo_root),
+            "--run-id",
+            run_id,
             "--synthetic",
         ],
     )
@@ -239,8 +260,10 @@ def test_export_rejects_nonexistent_run(tmp_path: Path) -> None:
         app,
         [
             "export",
-            "--runtime-root", str(runtime_root),
-            "--run-id", "nonexistent",
+            "--runtime-root",
+            str(runtime_root),
+            "--run-id",
+            "nonexistent",
         ],
     )
     assert result.exit_code != 0
@@ -268,7 +291,9 @@ def test_recovery_releases_stale_state_when_all_identities_agree(tmp_path: Path)
     )
     released: list[str] = []
 
-    result = reconcile_recovery(candidate, released.append)
+    result = reconcile_recovery(
+        candidate, lambda reservation_id: released.append(reservation_id) or True
+    )
 
     assert result.resumable
     assert result.released_reservation_id == "reservation-1"
@@ -293,7 +318,9 @@ def test_recovery_preserves_state_and_blocks_on_identity_mismatch(tmp_path: Path
     )
     released: list[str] = []
 
-    result = reconcile_recovery(candidate, released.append)
+    result = reconcile_recovery(
+        candidate, lambda reservation_id: released.append(reservation_id) or True
+    )
 
     assert not result.resumable
     assert result.reason == "source identity mismatch"

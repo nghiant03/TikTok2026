@@ -184,15 +184,41 @@ class OrchestrationDecision(ContractModel):
     rationale: str
 
 
+class ImplementationEdit(ContractModel):
+    """One bounded file replacement requested by the implementor."""
+
+    relative_path: str
+    content: str
+
+
 class ImplementationResult(ContractModel):
     schema_version: Literal["1"] = "1"
     experiment_id: str
     patch_artifact_id: str
     changed_files: tuple[str, ...]
+    edits: tuple[ImplementationEdit, ...] = ()
     changed_symbols: tuple[str, ...] = ()
     checks: tuple[str, ...] = ()
     assumptions: tuple[str, ...] = ()
     unresolved_issues: tuple[str, ...] = ()
+
+
+class ImplementationRequest(ContractModel):
+    """Controller-owned request sent to the implementor role."""
+
+    request_id: str
+    experiment_id: str
+    allowed_scopes: tuple[str, ...]
+    capabilities: tuple[str, ...] = ()
+
+
+class ValidationRequest(ContractModel):
+    """Controller-owned request sent to the validator role."""
+
+    request_id: str
+    experiment_id: str
+    stage: ValidationStage
+    subject: dict[str, object] = {}
 
 
 class ValidationReport(ContractModel):
@@ -210,6 +236,7 @@ class ValidationReport(ContractModel):
 
 
 class ExecutionRequest(ContractModel):
+    run_id: str | None = None
     execution_id: str
     experiment_id: str
     source_commit: CommitSha
@@ -235,6 +262,7 @@ class ExecutionResult(ContractModel):
     gpu_hours: Annotated[float, Field(ge=0.0)]
     artifact_ids: tuple[str, ...] = ()
     failure_kind: FailureKind | None = None
+    checkpoint_id: str | None = None
 
     @model_validator(mode="after")
     def validate_failure(self) -> ExecutionResult:
@@ -355,6 +383,17 @@ class ProvisionalFinalizationRequest(ContractModel):
     evaluator_id: str
 
 
+class FinalizationBundleRequest(ContractModel):
+    """References that must be materialized before provisional finalization."""
+
+    run_id: str
+    experiment_id: str
+    source_commit: FullCommitSha
+    checkpoint_id: str
+    evaluation_id: str
+    evaluator_id: str
+
+
 class FinalTestRequest(ContractModel):
     """Evaluator-side completion request; authorization is mandatory."""
 
@@ -398,7 +437,7 @@ class EvaluationResult(ContractModel):
 class FailureRecord(ContractModel):
     schema_version: Literal["1"] = "1"
     failure_id: str
-    experiment_id: str
+    experiment_id: str | None = None
     kind: FailureKind
     evidence_refs: tuple[str, ...]
     repair_attempt: Annotated[int, Field(ge=0, le=2)]
@@ -474,6 +513,11 @@ class EvaluatorIdentity(ContractModel):
     validity: Literal["provisional", "official"]
 
 
+class DatasetManifestIdentity(ContractModel):
+    manifest_id: str
+    manifest_sha256: Sha256
+
+
 class WorktreeAssignment(ContractModel):
     worktree_id: str
     run_id: str
@@ -533,6 +577,16 @@ class GraphStateReference(ContractModel):
     terminal_reason: str | None = None
 
 
+class OperationResult(ContractModel):
+    """Typed result returned by bootstrap-owned operator operations."""
+
+    operation: str
+    run_id: str | None = None
+    phase: RunPhase | None = None
+    status: str
+    values: dict[str, object] = Field(default_factory=dict)
+
+
 class FinalizationRecord(ContractModel):
     finalization_id: str
     run_id: str
@@ -547,6 +601,7 @@ class FinalizationRecord(ContractModel):
 
 class ProvenanceRequest(ContractModel):
     """Provenance metadata carried alongside an evaluation persistence."""
+
     run_id: str
     experiment_id: str
     source_commit: FullCommitSha
@@ -559,6 +614,7 @@ class ProvenanceRequest(ContractModel):
 
 class PolicyDecisionModel(ContractModel):
     """Serializable version of a pure policy decision."""
+
     allowed: bool
     reason: str
 

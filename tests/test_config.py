@@ -31,3 +31,21 @@ def test_settings_reject_unknown_fields(tmp_path: Path) -> None:
                 "unknown": "forbidden",
             }
         )
+
+
+def test_settings_load_operator_values(tmp_path: Path) -> None:
+    profile = tmp_path / "judged.toml"
+    profile.write_text(
+        "docker_image = \"controller:sha256\"\n\n"
+        "[budget]\nwall_clock_seconds = 90\n",
+        encoding="utf-8",
+    )
+
+    settings = AppSettings.load(
+        repository_root=tmp_path / "repo",
+        profile_path=profile,
+        overrides={"runtime_root": tmp_path / "runtime"},
+    )
+
+    assert settings.budget.wall_clock_seconds == 90
+    assert settings.docker_image == "controller:sha256"
