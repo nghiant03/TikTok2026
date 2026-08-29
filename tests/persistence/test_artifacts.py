@@ -27,7 +27,7 @@ def test_artifact_is_hashed_published_and_registered(tmp_path: Path) -> None:
 
     assert Path(record.uri.removeprefix("file://")).read_bytes() == b"score\n0.5\n"
     assert len(record.sha256) == 64
-    assert repository.list_json("artifact") == (record.model_dump_json(),)
+    assert repository.get_artifact(record.artifact_id) == record
 
 
 def test_artifact_rejects_traversing_filename(tmp_path: Path) -> None:

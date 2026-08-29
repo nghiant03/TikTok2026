@@ -55,7 +55,7 @@ class ArtifactStore:
             producer=producer,
             retention=retention,
         )
-        self.repository.put_json("artifact", artifact_id, record.model_dump_json())
+        self.repository.register_artifact(record)
         return record
 
     def read(self, record: ArtifactRecord) -> bytes:

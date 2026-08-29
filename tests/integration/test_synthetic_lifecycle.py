@@ -24,6 +24,4 @@ async def test_two_cycles_persist_audit_and_provisional_bundle(tmp_path: Path) -
     ) == (True, True)
     assert len(repository.list_audit_events(result.run_id)) >= 4
     assert len(repository.list_json("evaluation")) == 2
-    assert len(repository.list_json("finalization")) == 1
-    assert repository.claim_final_test_access(result.run_id)
-    assert not repository.claim_final_test_access(result.run_id)
+    assert repository.get_finalization(result.finalization.finalization_id) == result.finalization

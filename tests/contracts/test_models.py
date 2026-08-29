@@ -6,6 +6,7 @@ from tiktok2026.contracts import (
     ExecutionResult,
     FailureKind,
     MetricValue,
+    ResourceState,
 )
 
 
@@ -51,4 +52,17 @@ def test_successful_execution_rejects_failure_classification() -> None:
             elapsed_seconds=1.0,
             gpu_hours=0.0,
             failure_kind=FailureKind.TIMEOUT,
+        )
+
+
+def test_final_gpu_reserve_cannot_exceed_remaining_budget() -> None:
+    with pytest.raises(ValidationError):
+        ResourceState(
+            remaining_gpu_hours=1.0,
+            accumulated_gpu_hours=0.0,
+            remaining_wall_seconds=1.0,
+            used_tokens=0,
+            remaining_tokens=1,
+            disk_bytes_available=1,
+            reserved_final_gpu_hours=1.1,
         )

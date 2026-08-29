@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from tiktok2026.contracts import ExperimentSpec, Fidelity
+from tiktok2026.persistence.repositories import ApplicationRepository
 from tiktok2026.repository.diffs import validate_diff
 from tiktok2026.repository.inspector import RepositoryInspector
 from tiktok2026.repository.worktrees import GitWorktreeManager
@@ -41,10 +42,21 @@ def spec() -> ExperimentSpec:
     )
 
 
+def create_manager(repository: Path, runtime: Path, parent: str) -> GitWorktreeManager:
+    application = ApplicationRepository(runtime / "application.sqlite3")
+    application.initialize()
+    return GitWorktreeManager(
+        repository,
+        runtime,
+        approved_parent_validator=lambda candidate: candidate == parent,
+        artifact_registry=application,
+    )
+
+
 def test_worktree_is_created_under_runtime_root(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     head = create_repository(repository)
-    manager = GitWorktreeManager(repository, tmp_path / "runtime")
+    manager = create_manager(repository, tmp_path / "runtime", head)
     assignment = manager.create("run-1", spec(), head)
     assert assignment.path.is_relative_to(tmp_path / "runtime" / "worktrees")
     assert assignment.parent_commit == head
@@ -70,7 +82,7 @@ def test_diff_rejects_scope_traversal() -> None:
 def test_worktree_rejects_unsafe_run_identity(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     head = create_repository(repository)
-    manager = GitWorktreeManager(repository, tmp_path / "runtime")
+    manager = create_manager(repository, tmp_path / "runtime", head)
 
     with pytest.raises(ValueError, match="safe identifier"):
         manager.create("../escaped", spec(), head)
@@ -79,7 +91,7 @@ def test_worktree_rejects_unsafe_run_identity(tmp_path: Path) -> None:
 def test_source_registration_commits_only_validated_scope(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     head = create_repository(repository)
-    manager = GitWorktreeManager(repository, tmp_path / "runtime")
+    manager = create_manager(repository, tmp_path / "runtime", head)
     assignment = manager.create("run-1", spec(), head)
     target = assignment.path / "src/tiktok2026/experiment/change.py"
     target.parent.mkdir(parents=True)
@@ -92,6 +104,11 @@ def test_source_registration_commits_only_validated_scope(tmp_path: Path) -> Non
 
     assert registration.parent_commit == head
     assert registration.source_commit != head
+    assert registration.allowed_scopes == ("src/tiktok2026/experiment",)
+    assert registration.patch_artifact_uri is not None
+    assert Path(registration.patch_artifact_uri.removeprefix("file://")).read_text(
+        encoding="utf-8"
+    ).endswith("\n")
     assert run_git(assignment.path, "status", "--porcelain") == ""
     assert run_git(assignment.path, "show", "--format=", "--name-only", "HEAD") == (
         "src/tiktok2026/experiment/change.py"
@@ -102,7 +119,7 @@ def test_source_registration_commits_only_validated_scope(tmp_path: Path) -> Non
 def test_source_registration_rejects_out_of_scope_changes(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     head = create_repository(repository)
-    manager = GitWorktreeManager(repository, tmp_path / "runtime")
+    manager = create_manager(repository, tmp_path / "runtime", head)
     assignment = manager.create("run-1", spec(), head)
     (assignment.path / "README.md").write_text("changed\n", encoding="utf-8")
 
@@ -111,6 +128,34 @@ def test_source_registration_rejects_out_of_scope_changes(tmp_path: Path) -> Non
             assignment,
             allowed_scopes=("src/tiktok2026/experiment",),
         )
+    manager.remove(assignment)
+
+
+def test_source_registration_recovers_after_patch_publish_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    head = create_repository(repository)
+    manager = create_manager(repository, tmp_path / "runtime", head)
+    assignment = manager.create("run-1", spec(), head)
+    target = assignment.path / "src/tiktok2026/experiment/change.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+
+    def fail_publish(*args: object, **kwargs: object) -> Path:
+        raise OSError("injected patch publication failure")
+
+    monkeypatch.setattr(manager, "_publish_patch", fail_publish)
+    with pytest.raises(OSError, match="publication failure"):
+        manager.register_source(assignment, ("src/tiktok2026/experiment",))
+    assert run_git(assignment.path, "rev-parse", "HEAD") != head
+
+    monkeypatch.undo()
+    registration = manager.register_source(
+        assignment, ("src/tiktok2026/experiment",)
+    )
+    assert registration.source_commit == run_git(assignment.path, "rev-parse", "HEAD")
+    assert registration.patch_artifact_uri is not None
     manager.remove(assignment)
 
 

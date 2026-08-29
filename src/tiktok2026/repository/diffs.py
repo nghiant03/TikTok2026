@@ -11,6 +11,11 @@ def validate_diff(
     return check_changed_paths(changed_paths, allowed_scopes)
 
 
+def normalize_patch(patch: str) -> str:
+    lines = patch.replace("\r\n", "\n").splitlines()
+    normalized = "\n".join(line.rstrip() for line in lines)
+    return f"{normalized}\n" if normalized else ""
+
+
 def patch_signature(patch: str) -> str:
-    normalized = "\n".join(line.rstrip() for line in patch.replace("\r\n", "\n").splitlines())
-    return hashlib.sha256(normalized.encode()).hexdigest()
+    return hashlib.sha256(normalize_patch(patch).encode()).hexdigest()

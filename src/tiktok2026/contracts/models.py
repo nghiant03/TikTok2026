@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{7,64}$")]
+FullCommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 
 
 class ContractModel(BaseModel):
@@ -254,6 +255,46 @@ class EvaluationRequest(ContractModel):
     prediction_sha256: Sha256
 
 
+class FinalTestAuthorizationRequest(ContractModel):
+    run_id: str
+    experiment_id: str
+    source_commit: FullCommitSha
+    evaluator_id: str
+
+
+class FinalTestClaim(ContractModel):
+    claim_id: str
+    run_id: str
+    experiment_id: str
+    source_commit: FullCommitSha
+    evaluator_id: str
+
+
+class ProvisionalFinalizationRequest(ContractModel):
+    finalization_id: str
+    run_id: str
+    experiment_id: str
+    source_commit: FullCommitSha
+    checkpoint_id: str
+    evaluation_id: str
+    bundle_artifact_id: str
+    evaluator_id: str
+
+
+class FinalTestRequest(ContractModel):
+    """Evaluator-side completion request; authorization is mandatory."""
+
+    claim_id: str
+    finalization_id: str
+    run_id: str
+    experiment_id: str
+    source_commit: FullCommitSha
+    checkpoint_id: str
+    evaluation_id: str
+    bundle_artifact_id: str
+    evaluator_id: str
+
+
 class EvaluationResult(ContractModel):
     schema_version: Literal["1"] = "1"
     evaluation_id: str
@@ -292,6 +333,14 @@ class ResourceState(ContractModel):
     remaining_tokens: Annotated[int, Field(ge=0)]
     disk_bytes_available: Annotated[int, Field(ge=0)]
     reserved_final_gpu_hours: Annotated[float, Field(ge=0.0)]
+    accumulated_wall_seconds: Annotated[float, Field(ge=0.0)] = 0.0
+    used_disk_bytes: Annotated[int, Field(ge=0)] = 0
+
+    @model_validator(mode="after")
+    def validate_final_reserve(self) -> ResourceState:
+        if self.reserved_final_gpu_hours > self.remaining_gpu_hours:
+            raise ValueError("final GPU reserve cannot exceed remaining GPU hours")
+        return self
 
 
 class ResearchRequest(ContractModel):
@@ -323,6 +372,25 @@ class ResourceReservation(ContractModel):
     wall_seconds: Annotated[float, Field(ge=0.0)]
     tokens: Annotated[int, Field(ge=0)]
     disk_bytes: Annotated[int, Field(ge=0)]
+    purpose: Literal["iteration", "final"] = "iteration"
+
+
+class ResourceUsage(ContractModel):
+    gpu_hours: Annotated[float, Field(ge=0.0)]
+    wall_seconds: Annotated[float, Field(ge=0.0)]
+    tokens: Annotated[int, Field(ge=0)]
+    disk_bytes: Annotated[int, Field(ge=0)]
+
+
+class RunRecord(ContractModel):
+    run_id: str
+    status: str
+
+
+class EvaluatorIdentity(ContractModel):
+    evaluator_id: str
+    evaluator_sha256: Sha256
+    validity: Literal["provisional", "official"]
 
 
 class WorktreeAssignment(ContractModel):
@@ -331,14 +399,19 @@ class WorktreeAssignment(ContractModel):
     experiment_id: str
     path: Path
     branch: str
-    parent_commit: CommitSha
+    parent_commit: FullCommitSha
 
 
 class SourceRegistration(ContractModel):
     experiment_id: str
-    parent_commit: CommitSha
-    source_commit: CommitSha
+    run_id: str
+    parent_commit: FullCommitSha
+    source_commit: FullCommitSha
     patch_sha256: Sha256
+    patch_artifact_id: str
+    patch_artifact_uri: str
+    allowed_scopes: tuple[str, ...]
+    eligible: bool = False
 
 
 class ModelUsage(ContractModel):
@@ -383,7 +456,7 @@ class FinalizationRecord(ContractModel):
     finalization_id: str
     run_id: str
     experiment_id: str
-    source_commit: CommitSha
+    source_commit: FullCommitSha
     checkpoint_id: str
     evaluation_id: str
     validity: Literal["provisional", "official"]

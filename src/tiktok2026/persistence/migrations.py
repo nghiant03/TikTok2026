@@ -10,6 +10,10 @@ class MigrationChecksumError(RuntimeError):
     pass
 
 
+def application_migrations_path() -> Path:
+    return Path(__file__).resolve().parents[3] / "migrations" / "application"
+
+
 class MigrationRunner:
     def __init__(self, database: Path, migrations: Path) -> None:
         self.database = database
