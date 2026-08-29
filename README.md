@@ -51,6 +51,50 @@ timeout_seconds = 120.0
 
 Set the corresponding credential variables, including the variables named by the other role tables, before invoking `run` or `resume`.
 
+### LiteLLM gateway for all agents
+
+The four runtime agents can share a local LiteLLM OpenAI-compatible gateway. The
+checked-in configuration in `config/litellm/config.yaml` maps the
+`tiktok2026-chatgpt` alias to LiteLLM's documented `chatgpt/gpt-5.4` provider,
+and `config/litellm/operator-models.toml` configures that gateway for
+orchestration, research, implementor, and validator. Merge those four model
+tables into the external operator TOML used for a production run; do not add
+credentials to the repository.
+
+Install and start the gateway in one terminal:
+
+```bash
+uv sync --dev --group gateway
+export LITELLM_MASTER_KEY="$(openssl rand -hex 32)"
+export LITELLM_API_KEY="$LITELLM_MASTER_KEY"
+uv run --group gateway litellm \
+  --config "$REPO_ROOT/config/litellm/config.yaml" \
+  --host 127.0.0.1 --port 4000
+```
+
+During proxy startup or first use, LiteLLM prints an OAuth device code and
+verification URL. Complete that flow in the gateway terminal. LiteLLM stores
+the resulting tokens locally for reuse. The current LiteLLM documentation
+specifies this subscription flow for ChatGPT Pro and Max; ChatGPT Plus is not
+documented as a supported subscription tier. A Plus subscription therefore
+cannot be assumed to authorize this integration. Use an eligible Pro/Max
+subscription or configure a separately billed OpenAI API key instead.
+
+With the gateway running, start the controller using an operator TOML containing
+the four tables from `config/litellm/operator-models.toml`:
+
+```bash
+uv run tiktok2026 run \
+  --runtime-root "$RUNTIME_ROOT" --repository-root "$REPO_ROOT" \
+  --profile-path "$REPO_ROOT/config/budgets/judged.toml" \
+  --operator-config /external/tiktok2026-operator.toml
+```
+
+The controller still sends ordinary OpenAI-compatible `/v1/chat/completions`
+requests. LiteLLM bridges supported ChatGPT subscription models to the
+Responses API, so agent contracts and deterministic controller boundaries are
+unchanged.
+
 For a live run, the configured dataset directory must contain `manifest.json` and pass train/valid manifest verification; all four role credentials must be available; the repository must have an approved Git commit; and the Docker image must be pinned by digest. The current bootstrap wires SQLite persistence, the constrained Docker executor, Git worktrees, the verified training dataset view, the provisional evaluator, and four role-specific OpenAI-compatible clients. A configured `mlflow_uri` is accepted by settings, but MLflow telemetry, trace sinks, and a concrete literature reader are not composed into the current production bootstrap.
 
 ## CLI

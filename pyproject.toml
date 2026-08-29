@@ -29,6 +29,9 @@ dev = [
     "pytest-asyncio>=1.1",
     "ruff>=0.12",
 ]
+gateway = [
+    "litellm[proxy]>=1.81.13,<2",
+]
 
 [project.scripts]
 tiktok2026 = "tiktok2026.cli:app"

@@ -1,0 +1,11 @@
+# LiteLLM proxy configuration for the four TikTok2026 runtime agents.
+# ChatGPT subscription authentication is performed by LiteLLM's OAuth device flow.
+model_list:
+  - model_name: tiktok2026-chatgpt
+    model_info:
+      mode: responses
+    litellm_params:
+      model: chatgpt/gpt-5.4
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
