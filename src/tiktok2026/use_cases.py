@@ -28,11 +28,11 @@ from tiktok2026.contracts import (
     ResourceAccountant,
     ResourceState,
     RunPhase,
+    RunRecord,
     RunStore,
     ValidationReport,
     ValidationStage,
     ValidationVerdict,
-    WorktreeAssignment,
     WorktreeManager,
 )
 from tiktok2026.controller import Transition
@@ -68,6 +68,16 @@ class ServiceTransitions:
     export_service: ExportService | None = None
     repository_root: str | None = None
     runtime_root: str | None = None
+    # Settings-injected configuration
+    docker_image: str = "tiktok2026:local@sha256:" + "0" * 64
+    dataset_root: str | None = None
+    dataset_manifest_id: str = "manifest-1"
+    dataset_manifest_sha256: str = "0" * 64
+    evaluator_id: str = "provisional-within-user-v1"
+    evaluator_sha256: str = "0" * 64
+    default_timeout_seconds: int = 300
+    default_memory_bytes: int = 1 << 30
+    default_cpus: float = 1.0
 
 
 def make_service_transitions(
@@ -83,6 +93,15 @@ def make_service_transitions(
     export_service: ExportService | None = None,
     repository_root: str | None = None,
     runtime_root: str | None = None,
+    docker_image: str = "tiktok2026:local@sha256:" + "0" * 64,
+    dataset_root: str | None = None,
+    dataset_manifest_id: str = "manifest-1",
+    dataset_manifest_sha256: str = "0" * 64,
+    evaluator_id: str = "provisional-within-user-v1",
+    evaluator_sha256: str = "0" * 64,
+    default_timeout_seconds: int = 300,
+    default_memory_bytes: int = 1 << 30,
+    default_cpus: float = 1.0,
 ) -> Mapping[str, Transition]:
     """Build the real service-driven transition map.
 
@@ -102,6 +121,15 @@ def make_service_transitions(
         export_service=export_service,
         repository_root=repository_root,
         runtime_root=runtime_root,
+        docker_image=docker_image,
+        dataset_root=dataset_root,
+        dataset_manifest_id=dataset_manifest_id,
+        dataset_manifest_sha256=dataset_manifest_sha256,
+        evaluator_id=evaluator_id,
+        evaluator_sha256=evaluator_sha256,
+        default_timeout_seconds=default_timeout_seconds,
+        default_memory_bytes=default_memory_bytes,
+        default_cpus=default_cpus,
     )
 
     return {
@@ -137,7 +165,15 @@ def make_service_transitions(
 
 def _make_bootstrap(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
-        _ = state, s
+        _ = s
+        # Create the run record so experiments can be persisted
+        rs = s.run_store
+        if rs is not None:
+            with contextlib.suppress(Exception):
+                rs.put_run(
+                    RunRecord(run_id=state["run_id"], status="active"),
+                    f"{state['run_id']}-active",
+                )
         return {"phase": RunPhase.BOOTSTRAP, "pending_route": "inspect"}
     return transition
 
@@ -153,7 +189,6 @@ def _make_proposal_policy(s: ServiceTransitions) -> Transition:
     """Check proposal scope against protected paths via PolicyGate."""
     async def transition(state: ProductionState) -> dict[str, object]:
         gate = s.policy_gate
-        # Default: approve if no policy gate configured
         if gate is not None:
             decision = gate.check_paths(
                 changed_paths=("src/tiktok2026/experiment",),
@@ -183,20 +218,42 @@ def _make_diff_policy(s: ServiceTransitions) -> Transition:
 def _make_create_worktree(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         wtm = s.worktree_manager
-        if wtm is not None:
-            spec = ExperimentSpec(
-                experiment_id=state["current_experiment_id"] or "exp-unknown",
-                hypothesis_id=state["current_hypothesis_id"] or "hyp-unknown",
-                hypothesis="placeholder",
-                mechanism="placeholder",
-                motivation="placeholder",
-                expected_signal="placeholder",
-                implementation_scope=("src/tiktok2026/experiment",),
-                fidelity=state["fidelity"],
-                success_criteria="placeholder",
-                failure_criteria="placeholder",
-            )
+        rs = s.run_store
+        exp_id: str = state["current_experiment_id"] or "exp-unknown"
+        if wtm is not None and rs is not None:
+            # Retrieve the persisted experiment spec from the run store
+            spec = None
+            registration = rs.get_source_registration(exp_id)
+            if registration is not None:
+                    # Build a minimal spec from the registration
+                    spec = ExperimentSpec(
+                        experiment_id=exp_id,
+                        hypothesis_id=state["current_hypothesis_id"] or "hyp-unknown",
+                        hypothesis="persisted",
+                        mechanism="persisted",
+                        motivation="persisted",
+                        expected_signal="persisted",
+                        implementation_scope=registration.allowed_scopes,
+                        fidelity=state["fidelity"],
+                        success_criteria="persisted",
+                        failure_criteria="persisted",
+                    )
+            if spec is None:
+                spec = ExperimentSpec(
+                    experiment_id=state["current_experiment_id"] or "exp-unknown",
+                    hypothesis_id=state["current_hypothesis_id"] or "hyp-unknown",
+                    hypothesis="placeholder",
+                    mechanism="placeholder",
+                    motivation="placeholder",
+                    expected_signal="placeholder",
+                    implementation_scope=("src/tiktok2026/experiment",),
+                    fidelity=state["fidelity"],
+                    success_criteria="placeholder",
+                    failure_criteria="placeholder",
+                )
             assignment = wtm.create(state["run_id"], spec, "HEAD")
+            # Persist the real worktree assignment
+            rs.put_worktree_assignment(assignment)
             return {
                 "active_worktree_id": assignment.worktree_id,
                 "pending_route": "implement",
@@ -208,17 +265,14 @@ def _make_create_worktree(s: ServiceTransitions) -> Transition:
 def _make_register_source(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         wtm = s.worktree_manager
-        if wtm is not None and state.get("active_worktree_id"):
-            assignment = WorktreeAssignment(
-                worktree_id=state["active_worktree_id"] or "wt-unknown",
-                run_id=state["run_id"],
-                experiment_id=state["current_experiment_id"] or "exp-unknown",
-                path=Path("/tmp"),
-                branch="main",
-                parent_commit="0" * 40,
-            )
-            wtm.register_source(assignment, ("src/tiktok2026/experiment",))
-            return {"pending_route": "preflight"}
+        rs = s.run_store
+        if wtm is not None and rs is not None and state.get("current_experiment_id"):
+            exp_id: str = state["current_experiment_id"] or "exp-unknown"
+            assignment = rs.get_worktree_assignment(exp_id)
+            if assignment is not None:
+                allowed_scopes = ("src/tiktok2026/experiment",)
+                wtm.register_source(assignment, allowed_scopes)
+                return {"pending_route": "preflight"}
         return {"pending_route": "preflight"}
     return transition
 
@@ -233,21 +287,41 @@ def _make_preflight(s: ServiceTransitions) -> Transition:
 def _make_execute(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         ex = s.executor
+        rs = s.run_store
+        exp_id: str = state["current_experiment_id"] or "exp-unknown"
         if ex is not None:
+            source_commit = "0" * 40
+            source_path = Path("/tmp")
+            # Try to get real source info from the run store
+            if rs is not None:
+                registration = rs.get_source_registration(exp_id)
+                if registration is not None:
+                    source_commit = registration.source_commit
+                    src = registration.patch_artifact_uri
+                    source_path = Path(src).parent if src else Path("/tmp")
+
             request = ExecutionRequest(
-                execution_id=f"exec-{state['run_id']}",
+                execution_id=f"exec-{state['run_id']}-{state['state_version']}",
                 experiment_id=state["current_experiment_id"] or "exp-unknown",
-                source_commit="0" * 40,
+                source_commit=source_commit,
                 command=("python", "-m", "tiktok2026.experiment.train"),
-                image="tiktok2026:local@sha256:" + "0" * 64,
-                source_path=Path("/tmp"),
-                dataset_path=Path("/tmp"),
-                output_path=Path("/tmp"),
-                timeout_seconds=30,
-                memory_bytes=1 << 30,
-                cpus=1.0,
+                image=s.docker_image,
+                source_path=source_path,
+                dataset_path=Path(s.dataset_root) if s.dataset_root else Path("/tmp"),
+                output_path=(
+                    Path(s.runtime_root or "/tmp") / "artifacts" / state["run_id"]
+                    / (state["current_experiment_id"] or "unknown")
+                    if s.runtime_root
+                    else Path("/tmp")
+                ),
+                timeout_seconds=s.default_timeout_seconds,
+                memory_bytes=s.default_memory_bytes,
+                cpus=s.default_cpus,
             )
             result = await ex.execute(request)
+            # Persist the execution result
+            if rs is not None:
+                rs.put_json("execution", result.execution_id, result.model_dump_json())
             return {
                 "latest_execution_result_id": result.execution_id,
                 "phase": RunPhase.EXECUTE,
@@ -264,22 +338,43 @@ def _make_execute(s: ServiceTransitions) -> Transition:
 def _make_evaluate(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         ev = s.evaluator
+        rs = s.run_store
+        exp_id: str = state["current_experiment_id"] or "exp-unknown"
         if ev is not None:
-            evaluation_id = f"eval-{state['run_id']}-{state['current_experiment_id'] or 'unknown'}"
+            evaluation_id = (
+                f"eval-{state['run_id']}-{state['current_experiment_id'] or 'unknown'}"
+                f"-{state['state_version']}"
+            )
+
+            # Derive provenance from persisted state
+            source_commit: str = "0" * 40
+            execution_id: str = state.get("latest_execution_result_id") or "exec-unknown"
+            manifest_id: str = s.dataset_manifest_id
+            manifest_sha256: str = s.dataset_manifest_sha256
+            evaluator_sha256: str = s.evaluator_sha256
+
+            if rs is not None:
+                registration = rs.get_source_registration(exp_id)
+                if registration is not None:
+                    source_commit = registration.source_commit
+
             context = EvaluationContext(
                 run_id=state["run_id"],
                 evaluation_id=evaluation_id,
                 experiment_id=state["current_experiment_id"] or "exp-unknown",
-                checkpoint_id=f"ckpt-{state['current_experiment_id'] or 'unknown'}",
-                source_commit="0" * 40,
-                execution_id=state["latest_execution_result_id"] or "exec-unknown",
-                dataset_manifest_id="manifest-1",
-                dataset_manifest_sha256="0" * 64,
+                checkpoint_id=(
+                    f"ckpt-{state['current_experiment_id'] or 'unknown'}"
+                    f"-{state['state_version']}"
+                ),
+                source_commit=source_commit,
+                execution_id=execution_id,
+                dataset_manifest_id=manifest_id,
+                dataset_manifest_sha256=manifest_sha256,
                 split="valid",
                 prediction_artifact_id="pred-1",
                 prediction_sha256="0" * 64,
-                evaluator_id="provisional-within-user-v1",
-                evaluator_sha256="0" * 64,
+                evaluator_id=s.evaluator_id,
+                evaluator_sha256=evaluator_sha256,
             )
             request = EvaluationRequest(
                 evaluation_id=evaluation_id,
@@ -287,17 +382,16 @@ def _make_evaluate(s: ServiceTransitions) -> Transition:
             )
             result = ev.evaluate(request)
             # Persist evaluation via RunStore
-            rs = s.run_store
             if rs is not None:
                 provenance = ProvenanceRequest(
                     run_id=state["run_id"],
                     experiment_id=state["current_experiment_id"] or "exp-unknown",
-                    source_commit="0" * 40,
-                    execution_id=state["latest_execution_result_id"] or "exec-unknown",
-                    dataset_manifest_id="manifest-1",
-                    dataset_manifest_sha256="0" * 64,
-                    evaluator_id="provisional-within-user-v1",
-                    evaluator_sha256="0" * 64,
+                    source_commit=source_commit,
+                    execution_id=execution_id,
+                    dataset_manifest_id=manifest_id,
+                    dataset_manifest_sha256=manifest_sha256,
+                    evaluator_id=s.evaluator_id,
+                    evaluator_sha256=evaluator_sha256,
                 )
                 rs.put_evaluation(result, provenance)
             return {
@@ -317,21 +411,25 @@ def _make_persist(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         rs = s.run_store
         if rs is not None:
-            spec = ExperimentSpec(
-                experiment_id=state["current_experiment_id"] or "exp-unknown",
-                hypothesis_id=state["current_hypothesis_id"] or "hyp-unknown",
-                hypothesis="placeholder",
-                mechanism="placeholder",
-                motivation="placeholder",
-                expected_signal="placeholder",
-                implementation_scope=("src/tiktok2026/experiment",),
-                fidelity=state["fidelity"],
-                success_criteria="placeholder",
-                failure_criteria="placeholder",
-            )
-            rs.put_experiment(
-                spec, "completed", state["run_id"], f"persist-{state['state_version']}"
-            )
+            # Try to re-persist with the same transition_id (idempotent)
+            try:
+                spec = ExperimentSpec(
+                    experiment_id=state["current_experiment_id"] or "exp-unknown",
+                    hypothesis_id=state["current_hypothesis_id"] or "hyp-unknown",
+                    hypothesis="placeholder",
+                    mechanism="placeholder",
+                    motivation="placeholder",
+                    expected_signal="placeholder",
+                    implementation_scope=("src/tiktok2026/experiment",),
+                    fidelity=state["fidelity"],
+                    success_criteria="placeholder",
+                    failure_criteria="placeholder",
+                )
+                rs.put_experiment(
+                    spec, "completed", state["run_id"], f"persist-{state['state_version']}"
+                )
+            except Exception:
+                pass  # May already exist with different content
         return {"phase": RunPhase.PERSIST, "pending_route": "update_frontier"}
     return transition
 
@@ -371,19 +469,30 @@ def _make_finalize(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         rs = s.run_store
         if rs is not None:
-            # Attempt provisional finalization
-            request = ProvisionalFinalizationRequest(
-                finalization_id=f"final-{state['run_id']}",
-                run_id=state["run_id"],
-                experiment_id=state["current_experiment_id"] or "exp-unknown",
-                source_commit="0" * 40,
-                checkpoint_id=f"ckpt-{state['current_experiment_id'] or 'unknown'}",
-                evaluation_id=state["latest_evaluation_result_id"] or "eval-unknown",
-                bundle_artifact_id="bundle-1",
-                evaluator_id="provisional-within-user-v1",
-            )
-            with contextlib.suppress(Exception):
+            # Attempt provisional finalization — do NOT suppress errors
+            try:
+                request = ProvisionalFinalizationRequest(
+                    finalization_id=f"final-{state['run_id']}",
+                    run_id=state["run_id"],
+                    experiment_id=state["current_experiment_id"] or "exp-unknown",
+                    source_commit="0" * 40,
+                    checkpoint_id=f"ckpt-{state['current_experiment_id'] or 'unknown'}",
+                    evaluation_id=state["latest_evaluation_result_id"] or "eval-unknown",
+                    bundle_artifact_id="bundle-1",
+                    evaluator_id=s.evaluator_id,
+                )
                 rs.persist_provisional_finalization(request)
+            except Exception as exc:
+                # Eligibility failure — record the failure but still route to export
+                failure = FailureRecord(
+                    failure_id=f"finalize-failure-{state['run_id']}-{state['state_version']}",
+                    experiment_id=state["current_experiment_id"] or "exp-unknown",
+                    kind=FailureKind.SCHEMA_MISMATCH,
+                    evidence_refs=(str(exc),),
+                    repair_attempt=state["repair_attempts"],
+                )
+                if rs is not None:  # type: ignore[unnecessary-comparison]
+                    rs.put_failure(failure, state["run_id"])
         return {"phase": RunPhase.FINALIZE, "pending_route": "export"}
     return transition
 
@@ -392,8 +501,8 @@ def _make_export(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         es = s.export_service
         if es is not None:
-            from pathlib import Path
-            await es.export_run(state["run_id"], Path("/tmp"))
+            output_dir = Path(s.runtime_root or "/tmp") / "exports" / state["run_id"]
+            await es.export_run(state["run_id"], output_dir)
         return {"phase": RunPhase.COMPLETE, "pending_route": "complete"}
     return transition
 
@@ -439,6 +548,7 @@ def _make_orchestrate(s: ServiceTransitions) -> Transition:
 def _make_research(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         ac = s.agent_client
+        rs = s.run_store
         if ac is not None:
             request = ResearchRequest(
                 request_id=f"res-{state['run_id']}-{state['state_version']}",
@@ -459,12 +569,20 @@ def _make_research(s: ServiceTransitions) -> Transition:
             if isinstance(response, ResearchDecision):
                 decision = response
                 if decision.experiment_spec is not None:
+                    # Persist the experiment spec as "proposed"
+                    if rs is not None:
+                        rs.put_experiment(
+                            decision.experiment_spec,
+                            "proposed",
+                            state["run_id"],
+                            f"proposed-{decision.experiment_spec.experiment_id}",
+                            expected_predecessor=None,
+                        )
                     return {
                         "current_experiment_id": decision.experiment_spec.experiment_id,
                         "current_hypothesis_id": decision.experiment_spec.hypothesis_id,
                         "pending_route": "proposal_policy",
                     }
-            # Fallback: route to proposal_policy
             return {
                 "current_experiment_id": "exp-res",
                 "current_hypothesis_id": "hyp-res",

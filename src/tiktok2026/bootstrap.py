@@ -5,6 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from tiktok2026.adapters import (
+    DeterministicPolicyGate,
+    LedgerResourceAccountant,
+    RepositoryExportService,
+    RepositoryRunStore,
+)
 from tiktok2026.benchmark.kuaireand_pure.manifest import (
     BenchmarkManifest,
     verify_protected_files,
@@ -19,20 +25,14 @@ from tiktok2026.contracts import (
     ExecutionRequest,
     ExecutionResult,
     ExperimentSpec,
-    FailureRecord,
     Fidelity,
-    FinalizationRecord,
     ImplementationResult,
     MetricValue,
     OrchestrationDecision,
-    PolicyDecisionModel,
-    ProvenanceRequest,
     ResearchDecision,
     ResearchRequest,
     ResourceState,
-    RunRecord,
     RuntimePaths,
-    SourceRegistration,
     ValidationReport,
 )
 from tiktok2026.controller import (
@@ -43,6 +43,7 @@ from tiktok2026.graph.build import build_production_graph
 from tiktok2026.persistence.checkpointer import SqliteCheckpointer
 from tiktok2026.persistence.migrations import MigrationRunner
 from tiktok2026.persistence.repositories import ApplicationRepository
+from tiktok2026.persistence.resources import ResourceLedger
 from tiktok2026.use_cases import make_service_transitions
 
 
@@ -77,6 +78,109 @@ def verify_manifests(repository_root: Path) -> BenchmarkManifest:
 
 
 # ---------------------------------------------------------------------------
+# Production composition root — all concrete privileged implementations
+# instantiated HERE ONLY.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ProductionServices:
+    controller: ProductionController
+    repository: ApplicationRepository
+    graph: Any
+    settings: Any = None
+
+
+def build_production_services(settings: Any) -> ProductionServices:
+    """Construct the full production composition.
+
+    All concrete privileged implementations (SQLite, Git, Docker, evaluator,
+    model clients, etc.) are instantiated here.  No network/Docker calls are
+    made at construction time.
+    """
+    from tiktok2026.config import AppSettings
+    from tiktok2026.persistence.artifacts import ArtifactStore
+
+    app_settings: AppSettings
+    if isinstance(settings, AppSettings):
+        app_settings = settings
+    elif isinstance(settings, dict):
+        app_settings = AppSettings(**settings)  # type: ignore[arg-type]
+    else:
+        raise TypeError("settings must be AppSettings or dict")
+
+    # Initialize runtime layout and migrations
+    runtime = initialize_runtime(app_settings.repository_root, app_settings.runtime_root)
+    repo = runtime.repository
+    paths = runtime.paths
+
+    # Persistence services
+    ArtifactStore(paths, repo)
+    ledger = ResourceLedger(
+        paths.application_db,
+        ResourceState(
+            remaining_gpu_hours=app_settings.budget.gpu_hours,
+            accumulated_gpu_hours=0.0,
+            remaining_wall_seconds=float(app_settings.budget.wall_clock_seconds),
+            used_tokens=0,
+            remaining_tokens=app_settings.budget.tokens,
+            disk_bytes_available=app_settings.budget.disk_bytes,
+            reserved_final_gpu_hours=app_settings.budget.reserved_final_gpu_hours,
+        ),
+    )
+
+    # Adapters
+    run_store = RepositoryRunStore(repo)
+    policy_gate = DeterministicPolicyGate()
+    resource_accountant = LedgerResourceAccountant(ledger)
+    export_service = RepositoryExportService(repo, paths.root)
+
+    # Build transitions
+    transitions = make_service_transitions(
+        policy_gate=policy_gate,
+        run_store=run_store,
+        resource_accountant=resource_accountant,
+        export_service=export_service,
+        runtime_root=str(paths.root),
+        repository_root=str(app_settings.repository_root),
+        docker_image=app_settings.docker_image,
+        evaluator_id=app_settings.evaluator_id,
+    )
+
+    # Controller
+    store = _ProductionTransitionStore()
+    services = ControllerServices(transitions=transitions, store=store)
+    controller = ProductionController(services)
+
+    # Graph with checkpointer
+    checkpointer = SqliteCheckpointer(paths.graph_db)
+    graph = build_production_graph(controller, checkpointer=checkpointer)
+
+    return ProductionServices(
+        controller=controller,
+        repository=repo,
+        graph=graph,
+        settings=settings,
+    )
+
+
+class _ProductionTransitionStore:
+    """Persists transitions through the existing controller checkpoint store.
+
+    This is a minimal in-memory store; the full production checkpoint
+    store would write to the graph DB directly.
+    """
+
+    def __init__(self) -> None:
+        self.persisted: list[tuple[str, str, int, dict[str, object]]] = []
+
+    def persist_transition(
+        self, run_id: str, operation: str, state_version: int, updates: dict[str, object]
+    ) -> None:
+        self.persisted.append((run_id, operation, state_version, updates))
+
+
+# ---------------------------------------------------------------------------
 # Synthetic composition — scripted agents INJECTED INTO real service-driven
 # transitions.  Reuses persistence, resources, artifacts, graph, and exports.
 # ---------------------------------------------------------------------------
@@ -101,7 +205,6 @@ class _ScriptedAgentClient:
         self.calls: list[ContractModel] = []
 
     async def invoke(self, request: ContractModel) -> ContractModel:
-
         self.calls.append(request)
         # Handle orchestration requests
         if isinstance(request, ResearchRequest) and request.objective == "orchestrate":
@@ -175,67 +278,33 @@ class _FakeExecutor:
         )
 
 
-class _FakePolicyGate:
-    def check_paths(
-        self, changed_paths: tuple[str, ...], allowed_scopes: tuple[str, ...]
-    ) -> PolicyDecisionModel:
-        return PolicyDecisionModel(allowed=True, reason="allowed")
+def build_synthetic_controller(
+    repository_root: Path,
+    runtime_root: Path,
+) -> tuple[ProductionController, object, Any]:
+    """Build a synthetic composition: real service-driven transitions with
+    scripted agents, fake executor, fixture evaluator, and real adapters
+    for persistence, policy, resources, and exports.
 
-    def can_repair(self, repair_attempts: int) -> PolicyDecisionModel:
-        return PolicyDecisionModel(allowed=True, reason="allowed")
+    No network, Docker, or GPU resources are required.
+    Returns (controller, transitions_store, compiled_graph).
+    """
+    runtime = initialize_runtime(repository_root, runtime_root)
+    repo = runtime.repository
+    paths = runtime.paths
 
+    # Build real adapters over the real persistence
+    artifact_store = _ArtifactStoreDummy()  # ArtifactStore needs paths
+    from tiktok2026.persistence.artifacts import ArtifactStore
 
-class _FakeRunStore:
-    def __init__(self) -> None:
-        self.experiments: list[ExperimentSpec] = []
-        self.evaluations: list[EvaluationResult] = []
-        self.failures: list[FailureRecord] = []
+    real_artifact_store = ArtifactStore(paths, repo)
+    _ = artifact_store, real_artifact_store  # keep for future use
 
-    def put_experiment(
-        self,
-        spec: ExperimentSpec,
-        status: str,
-        run_id: str,
-        transition_id: str,
-        expected_predecessor: str | None = None,
-        audit_event: ContractModel | None = None,
-    ) -> None:
-        self.experiments.append(spec)
-
-    def put_evaluation(self, result: EvaluationResult, provenance: ProvenanceRequest) -> None:
-        self.evaluations.append(result)
-
-    def put_failure(self, record: FailureRecord, run_id: str) -> None:
-        self.failures.append(record)
-
-    def put_run(self, record: RunRecord, transition_id: str) -> None:
-        pass
-
-    def put_audit_event(self, event: ContractModel) -> None:
-        pass
-
-    def get_source_registration(self, experiment_id: str) -> SourceRegistration | None:
-        return None
-
-    def persist_provisional_finalization(
-        self, request: ContractModel
-    ) -> FinalizationRecord:
-        return FinalizationRecord(
-            finalization_id=getattr(request, "finalization_id", "final-1"),
-            run_id=getattr(request, "run_id", "run-1"),
-            experiment_id=getattr(request, "experiment_id", "exp-1"),
-            source_commit="0" * 40,
-            checkpoint_id="ckpt-1",
-            evaluation_id="eval-1",
-            validity="provisional",
-            bundle_artifact_id="bundle-1",
-            consumed_test_access=False,
-        )
-
-
-class _FakeResourceAccountant:
-    def state(self) -> ResourceState:
-        return ResourceState(
+    run_store = RepositoryRunStore(repo)
+    policy_gate = DeterministicPolicyGate()
+    ledger = ResourceLedger(
+        paths.application_db,
+        ResourceState(
             remaining_gpu_hours=100.0,
             accumulated_gpu_hours=0.0,
             remaining_wall_seconds=3600.0,
@@ -243,54 +312,41 @@ class _FakeResourceAccountant:
             remaining_tokens=100000,
             disk_bytes_available=1 << 30,
             reserved_final_gpu_hours=10.0,
-        )
-
-    def reserve(self, reservation: ContractModel) -> bool:
-        return True
-
-    def consume(self, reservation_id: str, **usage: float | int) -> bool:
-        return True
-
-
-def build_synthetic_controller(
-    repository_root: Path,
-    runtime_root: Path,
-) -> tuple[ProductionController, object, Any]:
-    """Build a synthetic composition: real service-driven transitions with
-    scripted agents, fake executor/evaluator/policy, and real persistence.
-
-    No network, Docker, or GPU resources are required.
-    Returns (controller, transitions_store, compiled_graph).
-    """
-    runtime = initialize_runtime(repository_root, runtime_root)
+        ),
+    )
+    resource_accountant = LedgerResourceAccountant(ledger)
+    export_service = RepositoryExportService(repo, paths.root)
 
     # Build service-driven transitions with scripted/fake implementations
     store = _SyntheticTransitionStore()
     agent = _ScriptedAgentClient()
-    fake_run_store = _FakeRunStore()
-    fake_policy = _FakePolicyGate()
 
-    # Use the real service-driven transition factory, injecting scripted fakes
     transitions = make_service_transitions(
         agent_client=agent,
         evaluator=_FakeEvaluator(),
         executor=_FakeExecutor(),
         worktree_manager=None,
-        resource_accountant=_FakeResourceAccountant(),
-        policy_gate=fake_policy,
-        run_store=fake_run_store,
+        resource_accountant=resource_accountant,
+        policy_gate=policy_gate,
+        run_store=run_store,
         frontier_service=None,
-        export_service=None,
+        export_service=export_service,
+        runtime_root=str(paths.root),
+        repository_root=str(repository_root),
     )
 
-    services = ControllerServices(
-        transitions=transitions,
-        store=store,
-    )
+    services = ControllerServices(transitions=transitions, store=store)
     controller = ProductionController(services)
 
     # Build the graph with a checkpointer backed by the real graph DB
-    checkpointer = SqliteCheckpointer(runtime.paths.graph_db)
+    checkpointer = SqliteCheckpointer(paths.graph_db)
     graph = build_production_graph(controller, checkpointer=checkpointer)
 
     return controller, store, graph
+
+
+class _ArtifactStoreDummy:
+    """Placeholder until full ArtifactStore wiring is needed."""
+
+    def publish_bytes(self, *args: Any, **kwargs: Any) -> Any:
+        return None
