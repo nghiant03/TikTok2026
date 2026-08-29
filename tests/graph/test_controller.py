@@ -203,6 +203,9 @@ async def test_sqlite_checkpointer_round_trip(graph_db: Path) -> None:
     assert retrieved.checkpoint["channel_values"]["run_id"] == "run-1"
     assert retrieved.checkpoint["channel_values"]["pending_route"] == "research"
     assert retrieved.checkpoint["channel_values"]["state_version"] == 1
+    assert retrieved.metadata is not None
+    assert retrieved.metadata["step"] == 1
+    assert retrieved.config["configurable"]["run_id"] == "thread-1"
 
     # A different thread_id should not find it
     other_config: RunnableConfig = {

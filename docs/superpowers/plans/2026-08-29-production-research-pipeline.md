@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-29-production-research-pipeline-design.md`
 
+**Progress at Phase 3 HEAD `9122a9f`:** The checked implementation steps below mark source paths that are present in the canonical tree. Unchecked test-writing, test-execution, and verification steps are not claims that those checks passed. Phase 4 Task 12 remains open, including its final verification and any authorship-history operation.
+
 ## Global Constraints
 
 - Preserve exactly four runtime roles: Orchestration, Research, Implementor, and Validator.
@@ -89,7 +91,7 @@ def test_provisional_finalization_cannot_claim_official() -> None:
 Run: `uv run pytest tests/contracts/test_models.py tests/contracts/test_ports.py -v`
 Expected: FAIL because the new contracts and ports do not exist.
 
-- [ ] **Step 3: Implement strict versioned models and protocols**
+- [x] **Step 3: Implement strict versioned models and protocols**
 
 Implement enums `AgentRole`, `RunPhase`, `ArtifactRetention`, and typed models including `Hypothesis`, `EvidenceItem`, `ResearchRequest`, `ResearchDecision`, `AgentFailure`, `WorktreeAssignment`, `SourceRegistration`, `ExecutionRequest`, `EvaluationRequest`, `ArtifactRecord`, `ResourceReservation`, `LessonRecord`, `FrontierCandidate`, `GraphStateReference`, `FinalizationRecord`, and `ModelUsage`. Add protocols with exact async or sync signatures:
 
@@ -162,7 +164,7 @@ def test_changed_applied_migration_is_rejected(tmp_path: Path) -> None:
 Run: `uv run pytest tests/test_config.py tests/persistence -v`
 Expected: FAIL because settings and persistence modules are absent.
 
-- [ ] **Step 3: Implement configuration and transactional repositories**
+- [x] **Step 3: Implement configuration and transactional repositories**
 
 `RuntimePaths.create(repository_root, runtime_root)` resolves paths, rejects containment in the repository, and creates `artifacts`, `worktrees`, `traces`, `exports`, `locks`, `literature`, and `tmp`. `AppSettings` loads profile TOML, optional operator TOML, environment values, and CLI overrides, with per-role `ModelSettings(base_url, model, api_key_env, temperature, max_tokens, timeout_seconds)`.
 
@@ -214,7 +216,7 @@ def test_final_reserve_cannot_fund_iteration() -> None:
 Run: `uv run pytest tests/policies tests/persistence/test_artifacts.py tests/persistence/test_resources.py -v`
 Expected: FAIL because policy and stores are absent.
 
-- [ ] **Step 3: Implement stores and pure decisions**
+- [x] **Step 3: Implement stores and pure decisions**
 
 `ArtifactStore.publish_bytes()` writes to runtime `tmp`, flushes, hashes, atomically renames under `artifacts/<run>/<experiment>`, and registers only after publication. `ResourceLedger` uses `BEGIN IMMEDIATE` to reserve, consume, release, and reconcile GPU hours, wall seconds, tokens, and disk.
 
@@ -311,7 +313,7 @@ def test_diff_rejects_out_of_scope_file() -> None:
 Run: `uv run pytest tests/repository -v`
 Expected: FAIL because repository services are absent.
 
-- [ ] **Step 3: Implement narrow Git services**
+- [x] **Step 3: Implement narrow Git services**
 
 Use non-interactive `git` subprocess calls with argument arrays and captured output. Worktrees are siblings under runtime root, branch names derive from validated IDs, and assignments record parent commit. Normalize `git diff --binary --no-ext-diff`, list changed paths, enforce scope/protected policy, hash the patch, and detect duplicate signatures. `register_source()` verifies clean staged content and controller-created commit identity; no agent receives this method.
 
@@ -352,7 +354,7 @@ def test_cuda_oom_evidence_is_classified() -> None:
 Run: `uv run pytest tests/execution -v`
 Expected: FAIL because executor modules are absent.
 
-- [ ] **Step 3: Implement constrained executor**
+- [x] **Step 3: Implement constrained executor**
 
 Build a Docker CLI argument list containing `--network=none`, `--read-only`, explicit mounts, memory/CPU/GPU limits, working directory, environment allowlist, and image identity. Run asynchronously with timeout, process-group termination, bounded output publication, and resource usage. Classify known evidence without converting valid non-improvement into an execution failure.
 
@@ -454,7 +456,7 @@ async def test_implementor_cannot_write_protected_path(scripted_model, scoped_re
 Run: `uv run pytest tests/agents/orchestration tests/agents/implementor tests/agents/validator tests/architecture/test_agent_capabilities.py -v`
 Expected: FAIL because agents are absent.
 
-- [ ] **Step 3: Implement role-specific typed agents**
+- [x] **Step 3: Implement role-specific typed agents**
 
 Port orchestration iteration/recovery/finalization ideas from source commit `448f7e39e70d5745a784a72f7305bd5ad8df357c`, excluding its recipe queue, direct subprocesses, test scoring, and in-repository sandboxes. Orchestration returns only allowed `DecisionAction` values and deterministic policy validates them.
 

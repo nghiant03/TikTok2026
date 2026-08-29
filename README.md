@@ -1,54 +1,119 @@
 # TikTok2026 Autonomous Recommender Research
 
-TikTok2026 is a CLI-operated research controller for forming, implementing, validating, executing, evaluating, and learning from recommender-system experiments. LLM agents provide typed judgments; deterministic services retain authority over policy, identity, Git, execution, evaluation, persistence, resources, routing, and finalization.
+TikTok2026 is a CLI-operated research controller for recommender-system experiments. Agents return typed judgments; deterministic controller code owns identity, policy, repository mutation, execution, evaluation, persistence, resource accounting, routing, and finalization. The protected files under `baseline/` are references, not the editable experiment target. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the current boundaries.
 
-The canonical architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The files under `baseline/` are protected Starter Kit references, not the editable experiment target.
+## Setup and operator configuration
 
-## Setup
+Install the project from the repository root:
 
 ```bash
 uv sync --dev
-export TIKTOK2026_RUNTIME_ROOT="$(dirname "$PWD")/TikTok2026.runtime"
-export TIKTOK2026_KUAIRAND_PURE_DATA=/external/read-only/KuaiRand-Pure
-uv run tiktok2026 runtime-init --runtime-root "$TIKTOK2026_RUNTIME_ROOT"
-uv run tiktok2026 verify-manifests
+
+export REPO_ROOT="$PWD"
+export RUNTIME_ROOT="/external/tiktok2026-runtime"
+export TIKTOK2026_RUNTIME_ROOT="$RUNTIME_ROOT"
+export TIKTOK2026_KUAIRAND_PURE_DATA="/external/read-only/KuaiRand-Pure"
+
+uv run tiktok2026 runtime-init \
+  --runtime-root "$RUNTIME_ROOT" --repository-root "$REPO_ROOT"
+uv run tiktok2026 migrate \
+  --runtime-root "$RUNTIME_ROOT" --repository-root "$REPO_ROOT"
+uv run tiktok2026 verify-manifests --repository-root "$REPO_ROOT"
 ```
 
-Runtime state and datasets must be outside the repository. Dataset mounts are read-only and identified by manifests and hashes.
+`runtime-init` creates the external application and graph SQLite databases and runtime directories, and applies migrations. `migrate` can be run again after migration changes. The runtime root must be outside the repository. Dataset files are external, read-only inputs; the repository manifest identifies their files and hashes. `verify-manifests` verifies the committed benchmark manifest and protected baseline reference hashes; it does not verify the external dataset.
 
-## Operator commands
+Production uses `config/budgets/judged.toml` by default. That checked-in profile contains zero resource limits and is a template, not a runnable judged configuration. Use `--profile-path` for another profile and `--operator-config` for an external TOML file. The operator file may provide `dataset_root`, an immutable `docker_image` containing `@sha256:...`, budget values, and a `[models.<role>]` table for each of `orchestration`, `research`, `implementor`, and `validator`. Each model table supports `base_url`, `model`, `api_key_env`, `temperature`, `max_tokens`, and `timeout_seconds`. Credentials are supplied through the named environment variables and are not persisted.
+
+For example, `/external/tiktok2026-operator.toml` can contain the following settings (repeat the model table for each role when using different endpoints):
+
+```toml
+dataset_root = "/external/read-only/KuaiRand-Pure"
+docker_image = "registry.example/tiktok2026@sha256:REPLACE_WITH_IMAGE_DIGEST"
+
+[budget]
+gpu_hours = 1.0
+wall_clock_seconds = 7200
+tokens = 200000
+disk_bytes = 21474836480
+reserved_final_gpu_hours = 0.25
+frontier_capacity = 4
+max_repairs = 2
+
+[models.orchestration]
+base_url = "https://provider.example/v1"
+model = "operator-approved-model"
+api_key_env = "TIKTOK2026_ORCHESTRATION_API_KEY"
+temperature = 0.0
+max_tokens = 4096
+timeout_seconds = 120.0
+```
+
+Set the corresponding credential variables, including the variables named by the other role tables, before invoking `run` or `resume`.
+
+For a live run, the configured dataset directory must contain `manifest.json` and pass train/valid manifest verification; all four role credentials must be available; the repository must have an approved Git commit; and the Docker image must be pinned by digest. The current bootstrap wires SQLite persistence, the constrained Docker executor, Git worktrees, the verified training dataset view, the provisional evaluator, and four role-specific OpenAI-compatible clients. A configured `mlflow_uri` is accepted by settings, but MLflow telemetry, trace sinks, and a concrete literature reader are not composed into the current production bootstrap.
+
+## CLI
+
+The executable is `uv run tiktok2026`. The commands and their actual options are:
 
 ```text
-runtime-init       Create external runtime directories and databases
-migrate            Apply checksummed application and graph migrations
-verify-manifests   Verify protected benchmark reference hashes
-synthetic-run      Run offline deterministic lifecycle verification
-run                Start a configured production run
-resume             Resume an identity-verified interrupted run
-inspect            Read persisted run audit state
-finalize           Finalize an eligible converged run
-export             Export deterministic Markdown and JSONL records
-diagnostics        Verify configured environment boundaries
+runtime-init   --runtime-root PATH [--repository-root PATH]
+migrate        --runtime-root PATH [--repository-root PATH]
+verify-manifests [--repository-root PATH]
+synthetic-run  [--iterations INTEGER] [--runtime-root PATH]
+run            --runtime-root PATH [--repository-root PATH]
+               [--profile-path PATH] [--operator-config PATH] [--synthetic]
+resume         --runtime-root PATH --run-id TEXT [--repository-root PATH]
+               [--profile-path PATH] [--operator-config PATH] [--synthetic]
+inspect        --runtime-root PATH --run-id TEXT
+finalize       --runtime-root PATH --run-id TEXT [--repository-root PATH] [--synthetic]
+export         --runtime-root PATH --run-id TEXT [--repository-root PATH] [--synthetic]
+diagnostics    [--repository-root PATH]
 ```
 
-The HTTP, SSE, FastAPI, and Uvicorn control surfaces are intentionally out of scope.
-
-## Models and evaluation
-
-Each of the four roles can use an independent OpenAI-compatible Chat Completions endpoint. Configure `base_url`, `model`, `api_key_env`, `temperature`, `max_tokens`, and `timeout_seconds` per role. Credentials are read from environment variables at call time and are not persisted.
-
-Judging metrics are NDCG@10 and Recall@50. The included evaluator and locally generated final bundles are explicitly `provisional`; they must never be represented as official organizer results. Iterative agents cannot access test labels. A controller-only test claim is single-use after convergence and cannot route later research.
-
-## Verification
+For example, a configured production run and its later operations are:
 
 ```bash
-uv run pytest
-uv run ruff check .
-uv run pyright
-uv run tiktok2026 synthetic-run --iterations 2 \
-  --runtime-root "$(dirname "$PWD")/TikTok2026.synthetic-runtime"
+uv run tiktok2026 run \
+  --runtime-root "$RUNTIME_ROOT" --repository-root "$REPO_ROOT" \
+  --profile-path "$REPO_ROOT/config/budgets/judged.toml" \
+  --operator-config /external/tiktok2026-operator.toml
+
+uv run tiktok2026 resume --runtime-root "$RUNTIME_ROOT" --run-id RUN_ID \
+  --repository-root "$REPO_ROOT" \
+  --operator-config /external/tiktok2026-operator.toml
+uv run tiktok2026 inspect --runtime-root "$RUNTIME_ROOT" --run-id RUN_ID
+uv run tiktok2026 finalize --runtime-root "$RUNTIME_ROOT" --run-id RUN_ID
+uv run tiktok2026 export --runtime-root "$RUNTIME_ROOT" --run-id RUN_ID
 ```
 
-Default verification requires no network, paid model, Docker, GPU, or KuaiRand data. Live Docker, provider, dataset, and MLflow checks are operator-enabled diagnostics only.
+`run --synthetic` and `resume --synthetic` select the deterministic fixture composition. The `--synthetic` options on `finalize` and `export` are accepted by the CLI but are not used by those operations. `diagnostics` currently verifies the repository benchmark manifest and reports the evaluator status; it is not a live provider, Docker, data, or MLflow smoke test.
 
-Production `run` and `resume` load the committed `config/budgets/judged.toml` profile by default. Supply `--profile-path` for another committed profile and `--operator-config` for an external TOML containing operator-specific settings such as model endpoints, dataset paths, and the immutable Docker image.
+## Synthetic and offline operation
+
+```bash
+uv run tiktok2026 synthetic-run --iterations 2 \
+  --runtime-root "$RUNTIME_ROOT/synthetic"
+```
+
+Synthetic lifecycle tests use scripted agents, deterministic fixture rows, a fake executor/evaluator, the same persistence, artifact, resource, graph, and export boundaries, and no network, paid model, Docker, GPU, or KuaiRand data. They are lifecycle checks only and do not produce official benchmark results. The default `synthetic-run` runtime is an external sibling of the repository when `--runtime-root` is omitted.
+
+## Metrics and finalization
+
+The judging contract is NDCG@10 and Recall@50, with the local validation ranking defined as their mean. The repository evaluator and synthetic evaluator return `validity="provisional"`; the protected Starter Kit metrics are diagnostic only. No local metric, run, submission, or final bundle is an official organizer result.
+
+Iterative execution receives only the verified train/valid view. The contracts and persistence layer contain one controller-authorized test-access boundary, but the current CLI does not expose an organizer evaluator or a separate final-test command. Until that evaluator is supplied and configured, finalization is provisional only.
+
+`finalize` requires persisted converged run/experiment state, a registered source, an evaluation, and a matching bundle artifact. It writes a provenance-bearing bundle under the external runtime artifacts tree. `export` requires that persisted finalization and writes deterministic audit records to:
+
+```text
+$RUNTIME_ROOT/exports/<run-id>/iterations.jsonl
+$RUNTIME_ROOT/exports/<run-id>/iterations.md
+```
+
+The export contains the persisted audit-event records, sorted deterministically by event ID. Application and graph databases, artifacts, worktrees, logs/traces, exports, and temporary files remain outside Git.
+
+## Recovery
+
+`resume` requires a durable graph checkpoint for the supplied run ID. For production runs, recovery checks the pending worktree/source/artifact identities, assigned worktree path and commit, cleanliness, lock ownership, and stale reservation before resuming. Matching stale reservations are released and stale locks are removed; an identity mismatch is rejected and recorded as a resume audit event rather than guessed through. Synthetic resume uses the fixture composition and does not perform the production boundary reconciliation.

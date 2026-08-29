@@ -58,6 +58,6 @@ Excluded payloads and behavior:
 - generated submissions, histories, traces, and free-form authoritative dictionaries;
 - FastAPI, Uvicorn, REST, SSE, and frontend integration.
 
-## Authorship preservation status
+## Authorship and integration status
 
-This document records the exact source identities and port boundaries. Contributor-authored reconstructed commits and merge history are a separate Git-history operation and must be explicitly authorized before creation. No claim is made that uncommitted working-tree changes currently preserve commit authorship.
+As of canonical implementation HEAD `9122a9f`, neither source commit is an ancestor of the integration branch and neither source branch was merged. The current implementation is a selective reconstruction in the canonical package; these source references do not claim that the current commits preserve the original commit authorship. Contributor-authored reconstructed commits or merge history remain a separate Git-history operation and require explicit authorization. This documentation change also makes no authorship claim for uncommitted working-tree changes.

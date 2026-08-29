@@ -5,10 +5,15 @@ import sqlite3
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.base import BaseCheckpointSaver, Checkpoint, CheckpointMetadata
+from langgraph.checkpoint.base import (
+    BaseCheckpointSaver,
+    Checkpoint,
+    CheckpointMetadata,
+    CheckpointTuple,
+)
 
 ChannelVersions = dict[str, str | int | float]
 
@@ -64,24 +69,51 @@ class SqliteCheckpointer(BaseCheckpointSaver[int]):
             return None
         conn = self._connect()
         try:
-            row = conn.execute(
-                "SELECT checkpoint_id, state_json, created_at FROM graph_checkpoints "
-                "WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
-                (thread_id,),
-            ).fetchone()
+            requested_id = config.get("configurable", {}).get("checkpoint_id")
+            if requested_id is None:
+                row = conn.execute(
+                    "SELECT rowid, checkpoint_id, state_json FROM graph_checkpoints "
+                    "WHERE run_id = ? ORDER BY rowid DESC LIMIT 1",
+                    (thread_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT rowid, checkpoint_id, state_json FROM graph_checkpoints "
+                    "WHERE run_id = ? AND checkpoint_id = ? LIMIT 1",
+                    (thread_id, requested_id),
+                ).fetchone()
             if row is None:
                 return None
-            checkpoint = json.loads(row["state_json"])
-            parent_config: RunnableConfig | None = None
-            return _CheckpointTuple(
+            checkpoint, metadata = _decode_checkpoint(row["state_json"])
+            parent = conn.execute(
+                "SELECT checkpoint_id FROM graph_checkpoints "
+                "WHERE run_id = ? AND rowid < ? ORDER BY rowid DESC LIMIT 1",
+                (thread_id, row["rowid"]),
+            ).fetchone()
+            configurable = config.get("configurable", {})
+            checkpoint_config: dict[str, Any] = {
+                "thread_id": thread_id,
+                "run_id": thread_id,
+                "checkpoint_ns": configurable.get("checkpoint_ns", ""),
+                "checkpoint_id": row["checkpoint_id"],
+            }
+            parent_config: RunnableConfig | None = (
+                cast(
+                    RunnableConfig,
+                    {
+                        "configurable": {
+                            **checkpoint_config,
+                            "checkpoint_id": parent["checkpoint_id"],
+                        }
+                    },
+                )
+                if parent is not None
+                else None
+            )
+            return CheckpointTuple(
                 checkpoint=checkpoint,
-                config={
-                    "configurable": {
-                        "thread_id": thread_id,
-                        "checkpoint_id": row["checkpoint_id"],
-                    }
-                },
-                metadata=None,
+                config={"configurable": checkpoint_config},
+                metadata=metadata,
                 parent_config=parent_config,
             )
         finally:
@@ -107,21 +139,24 @@ class SqliteCheckpointer(BaseCheckpointSaver[int]):
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT checkpoint_id, state_json, created_at FROM graph_checkpoints "
-                "WHERE run_id = ? ORDER BY created_at DESC LIMIT ?",
+                "SELECT rowid, checkpoint_id, state_json FROM graph_checkpoints "
+                "WHERE run_id = ? ORDER BY rowid DESC LIMIT ?",
                 (thread_id, limit or 100),
             ).fetchall()
             for row in rows:
-                checkpoint = json.loads(row["state_json"])
-                yield _CheckpointTuple(
+                checkpoint, metadata = _decode_checkpoint(row["state_json"])
+                configurable = config.get("configurable", {})
+                yield CheckpointTuple(
                     checkpoint=checkpoint,
                     config={
                         "configurable": {
                             "thread_id": thread_id,
+                            "run_id": thread_id,
+                            "checkpoint_ns": configurable.get("checkpoint_ns", ""),
                             "checkpoint_id": row["checkpoint_id"],
                         }
                     },
-                    metadata=None,
+                    metadata=metadata,
                     parent_config=None,
                 )
         finally:
@@ -139,12 +174,14 @@ class SqliteCheckpointer(BaseCheckpointSaver[int]):
             thread_id = config.get("configurable", {}).get("run_id", "unknown")
         checkpoint_id = checkpoint.get("id", "checkpoint-" + _now_str())
         now = _now_str()
+        stored_checkpoint = dict(checkpoint)
+        stored_checkpoint["_tiktok2026_metadata"] = dict(metadata)
         conn = self._connect()
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO graph_checkpoints "
                 "(run_id, checkpoint_id, state_json, created_at) VALUES (?, ?, ?, ?)",
-                (thread_id, checkpoint_id, json.dumps(checkpoint), now),
+                (thread_id, checkpoint_id, json.dumps(stored_checkpoint), now),
             )
             conn.commit()
         finally:
@@ -152,6 +189,8 @@ class SqliteCheckpointer(BaseCheckpointSaver[int]):
         return {
             "configurable": {
                 "thread_id": thread_id,
+                "run_id": thread_id,
+                "checkpoint_ns": config.get("configurable", {}).get("checkpoint_ns", ""),
                 "checkpoint_id": checkpoint_id,
             }
         }
@@ -176,27 +215,30 @@ class SqliteCheckpointer(BaseCheckpointSaver[int]):
             conn.close()
 
 
-class _CheckpointTuple:
-    """Minimal compatible checkpoint tuple."""
-
-    def __init__(
-        self,
-        checkpoint: Checkpoint,
-        config: RunnableConfig,
-        metadata: Any,
-        parent_config: RunnableConfig | None,
-        pending_writes: list[Any] | None = None,
-    ) -> None:
-        self.checkpoint = checkpoint
-        self.config = config
-        self.metadata = metadata
-        self.parent_config = parent_config
-        self.pending_writes = pending_writes or []
-
-
 def _resolve_thread_id(config: RunnableConfig) -> str | None:
     conf = config.get("configurable", {})
     return conf.get("thread_id") or conf.get("run_id")
+
+
+def _decode_checkpoint(raw: str) -> tuple[Checkpoint, CheckpointMetadata]:
+    decoded: object = json.loads(raw)
+    if not isinstance(decoded, dict):
+        raise ValueError("stored graph checkpoint must be an object")
+    decoded_mapping = cast(dict[object, object], decoded)
+    value = cast(Checkpoint, {str(key): item for key, item in decoded_mapping.items()})
+    metadata_value: object = value.pop("_tiktok2026_metadata", None)
+    if isinstance(metadata_value, dict):
+        metadata = cast(CheckpointMetadata, metadata_value)
+    else:
+        channels: object = cast(object, value.get("channel_values", {}))
+        raw_step: object = (
+            cast(object, channels.get("state_version", 0)) if isinstance(channels, dict) else 0
+        )
+        step = int(raw_step) if isinstance(raw_step, (int, float, str)) else 0
+        metadata = cast(
+            CheckpointMetadata, {"source": "sqlite-recovery", "step": step, "parents": {}}
+        )
+    return value, metadata
 
 
 def _now_str() -> str:

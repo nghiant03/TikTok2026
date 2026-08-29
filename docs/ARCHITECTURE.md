@@ -2,87 +2,101 @@
 
 ## System boundary
 
-TikTok2026 is a CLI-operated autonomous research controller. Exactly four runtime roles provide typed judgments:
+TikTok2026 is a CLI-operated research controller. Exactly four runtime roles provide typed judgments:
 
-1. Orchestration selects one policy-allowed next action.
-2. Research forms evidence-backed hypotheses, experiment specifications, and interpretations.
-3. Implementor changes only the assigned worktree and approved scope.
-4. Validator performs read-only proposal, implementation, and result review.
+1. **Orchestration** selects one policy-allowed next action.
+2. **Research** forms evidence-backed hypotheses and experiment specifications.
+3. **Implementor** edits only the assigned worktree and approved scope.
+4. **Validator** performs read-only proposal, implementation, and result review.
 
-Agents do not own authority. Deterministic code owns identity, policy, repository mutation, source registration, execution, evaluation, persistence, resource accounting, routing, and finalization. FastAPI, Uvicorn, REST, SSE, and a browser UI are intentionally excluded.
+Agents do not own authority. Deterministic code owns identity, policy, repository mutation, source registration, execution, evaluation, persistence, resource accounting, routing, and finalization. The current runtime has no web control plane; the supported operator boundary is the Typer CLI in `src/tiktok2026/cli.py`.
 
-## Dependency direction
+## Dependency direction and composition
 
 ```text
 contracts and pure policies
-          ↓
+           ↓
 agents and capability protocols
-          ↓
+           ↓
 controller use cases
-          ↓
+           ↓
 repository, execution, evaluation, persistence, observability
-          ↓
+           ↓
 bootstrap composition
 ```
 
-Contracts depend only on Pydantic and standard-library types. Agents depend on contracts and injected capabilities, never concrete Git, Docker, SQLite, evaluator, or MLflow implementations. Graph nodes call controller methods only. Evaluation, persistence, memory, and benchmark code do not depend on LangGraph or agent implementations. `bootstrap.py` is the composition root for concrete privileged adapters.
+`src/tiktok2026/contracts` contains versioned Pydantic models and capability protocols. `policies` contains pure decisions. Agent code depends on contracts and injected capabilities, not concrete Git, Docker, SQLite, or evaluator services. Graph nodes call controller operations; they do not issue SQL, shell, Git, Docker, or evaluator calls. `bootstrap.py` is the composition root for the concrete production adapters. The CLI constructs `ProductionOperations`, which delegates service construction to that root.
 
-## Runtime lifecycle
-
-```text
-bootstrap → inspect → orchestrate → research
-→ proposal policy → proposal validation → create worktree
-→ implement → diff policy → implementation validation
-→ controller source registration → preflight → constrained execution
-→ failure classification → protected evaluation → result validation
-→ interpretation/persistence → frontier/resource update → orchestrate
-→ convergence/budget stop → controller-only finalization → exports
-```
-
-Repairable implementation and execution failures retain the experiment and hypothesis identity for at most two repair attempts. Scientific redesign requires a new immutable `ExperimentSpec`. Invalid runs are persisted as failures and never become scientific evidence. Valid non-improvement remains scientific evidence.
-
-LangGraph stores only compact recovery references: run, phase, experiment, hypothesis, worktree, validation/execution/evaluation/decision IDs, repair count, fidelity, pending route, terminal reason, and state version. SQLite and artifacts remain canonical.
+The production bootstrap currently composes the application and graph SQLite stores, resource ledger, artifact store, Git worktree manager, constrained Docker executor, verified dataset provider, provisional evaluator, and one role-specific OpenAI-compatible client per role. The repository also contains reusable memory, trace, and MLflow protocol/adapter modules, but those are not wired into `build_production_services`; a concrete literature adapter is not present. The dedicated `ResearchAgent` and research context modules are available as typed components, while the current production composition uses `RoleSpecificAgentClient` with bootstrap-supplied prompts and capability names.
 
 ## Authority boundaries
 
 | Module | Owns | Must not own |
 |---|---|---|
 | `contracts` | Versioned models and capability protocols | I/O or framework state |
-| `agents` | Prompted judgment and structured validation | Policy exceptions or privileged adapters |
+| `policies` | Protected paths, scope, repair, resource, fidelity, and convergence decisions | Side effects |
+| `agents` | Prompted judgment and structured responses | Policy exceptions or privileged adapters |
 | `graph` | Compact state and finite routing | SQL, shell, Git, Docker, evaluation |
-| `controller` | Ordered use cases and persisted transitions | Concrete adapter construction |
-| `policies` | Pure path, resource, repair, fidelity, convergence checks | Side effects |
-| `repository` | Bounded inspection, diffs, worktrees, source identity | Scientific selection |
-| `execution` | Constrained Docker command and failure evidence | Interpretation |
-| `evaluation` | Prediction validation and metric provenance | Training or routing |
-| `persistence` | Migrations, transactions, audit and record storage | Agent context judgment |
-| `memory` | Bounded evidence-backed lesson retrieval | Canonical history |
-| `literature` | Configured local licensed-source retrieval | Benchmark performance claims |
-| `observability` | Restricted traces, MLflow telemetry, deterministic exports | Canonical scientific truth |
-| `bootstrap` | Concrete dependency construction | Domain policy |
+| `controller` and `use_cases` | Ordered transitions and persisted operation boundaries | Concrete adapter construction |
+| `repository` | Inspection, diffs, worktrees, source identity, and patch artifacts | Scientific selection |
+| `execution` | Constrained container execution and failure evidence | Interpretation |
+| `evaluation` | Prediction validation, metric calculation, and evaluator provenance | Training or routing decisions |
+| `persistence` | Migrations, transactions, audit, records, and resource state | Agent judgment |
+| `memory` | Bounded experiment-backed retrieval | Canonical history |
+| `observability` | Deterministic exports and optional telemetry/trace seams | Canonical scientific truth |
+| `bootstrap` | Construction and wiring of concrete services | Domain policy |
+
+The implementor receives a `ScopedWorktreeRepository` only after a worktree is assigned. Validator capabilities are read-only. The controller, not an agent, creates/registers the source commit and decides whether a transition may proceed.
+
+## Runtime lifecycle
+
+The production graph in `src/tiktok2026/graph/build.py` and `src/tiktok2026/use_cases.py` follows this bounded route:
+
+```text
+bootstrap → inspect → orchestrate → research
+→ proposal policy → proposal validation → create worktree
+→ implement → diff policy → implementation validation
+→ source registration → preflight → constrained execution
+→ failure classification → valid-split evaluation → result validation
+→ interpretation → persistence → frontier/resource update
+→ orchestrate again → convergence or stop
+→ provisional finalization → deterministic export → complete
+```
+
+Repairable implementation and execution failures retain experiment identity up to two repair attempts. Scientific redesign requires a new `ExperimentSpec`. Invalid runs are persisted as failures and do not become scientific evidence; valid non-improvement remains evidence. The frontier uses the configured plateau epsilon and patience (defaults are `0.002` and `3` in `AppSettings`).
+
+The application database is authoritative for runs, experiments, evaluations, source registrations, artifacts, failures, resources, and audit events. The LangGraph SQLite checkpointer stores only the compact `ProductionState`: run/phase, experiment and hypothesis IDs, worktree and latest result IDs, orchestration decision ID, repair count, fidelity, pending route, terminal reason, and state version. It does not store source files, logs, checkpoints, or full evidence. `resume` loads the latest checkpoint and, for production runs, validates the persisted source/artifact/worktree boundary before continuing.
 
 ## Source, data, and runtime isolation
 
-Every evaluated source state is a validated Git commit in a sibling worktree under an external runtime root. Protected `baseline/` files cannot be modified. Experiment changes are limited to approved scopes.
+Every production execution is tied to a validated Git commit in a sibling worktree at:
 
-KuaiRand data is an external, read-only input. Runtime datasets, derived data, checkpoints, predictions, submissions, traces, papers, databases, logs, exports, and worktrees are never committed. The runtime root contains application and graph SQLite files plus artifacts, worktrees, traces, exports, locks, literature cache, and temporary files.
+```text
+<runtime-root>/worktrees/<run-id>/<experiment-id>
+```
 
-Startup recovery resumes only when persisted source and artifact identities match the worktree and filesystem. Otherwise, stale locks and reservations are preserved for an audited intervention.
+The worktree is created from an approved parent commit. The implementor's changed paths are checked against the experiment scope and protected baseline paths. After validation, the controller creates one source commit, records its parent/source identities, normalizes and hashes the patch, publishes the patch artifact, and requires a clean worktree before execution.
 
-## Models, memory, and observability
+`RuntimePaths.create()` rejects a runtime root inside the repository and creates `artifacts`, `worktrees`, `traces`, `exports`, `locks`, `literature`, and `tmp`, plus `application.sqlite3` and `graph.sqlite3`. Dataset files are external read-only inputs. The KuaiRand manifest at `src/tiktok2026/benchmark/kuaireand_pure/manifest.json` identifies files and hashes; production verifies the external manifest and train/valid files before creating the authorized training view. Test data is not placed in that iterative view. Runtime outputs, derived data, checkpoints, predictions, submissions, traces, and databases are not committed.
 
-Each role independently configures a generic OpenAI-compatible Chat Completions client. Role prompts are versioned beside their agent packages. Pydantic validates structured output, with one bounded repair request before a typed failure. Secrets are loaded at call time and redacted from restricted trace artifacts.
+Recovery refuses to infer missing provenance. It checks the assigned path, source commit, patch artifact hash/URI, worktree cleanliness, and lock identity; it releases a matching stale reservation and removes the stale lock only after those identities agree. Otherwise it persists a rejected-resume audit event and requires intervention.
 
-Memory retrieval returns bounded experiment-backed lessons, not raw histories. Literature retrieval is limited to configured local sources with explicit license provenance. External training data and pretrained weights remain prohibited.
+## Contracts, agents, and models
 
-MLflow records telemetry and artifact IDs only; SQLite and the artifact store remain authoritative. Deterministic Markdown and JSONL exports contain audit events, evaluation validity, lineage references, failures, interventions, and final selection evidence.
+Contracts in `src/tiktok2026/contracts/models.py` and `ports.py` carry schema versions and reject unknown fields. They cover role requests/responses, evidence, experiment specifications, worktrees, source registrations, execution/evaluation, artifacts, resources, finalization, and audit events. The research context protocol gathers bounded repository, data, memory, and literature evidence concurrently and rejects duplicate, unauthorized, or test-label evidence.
 
-## Metrics and finalization
+Each role has independent `ModelSettings`: `base_url`, `model`, `api_key_env`, `temperature`, `max_tokens`, and `timeout_seconds`. `OpenAICompatibleClient` sends standard Chat Completions JSON requests and reads the credential at call time. The current production client returns structured role responses; Pydantic validation and one bounded repair are applied by the structured invocation path. Secrets are not serialized into application records.
 
-NDCG@10 and Recall@50 are the judging contract. The included within-user binary evaluator is provisional. Starter Kit GAUC and nDCG@5 are diagnostic only and cannot rank champions. Until organizer evaluator code is supplied, all metric records and final bundles are labeled `provisional`.
+## Execution, evaluation, and finalization
 
-Iterative agents never receive test labels. Final test access can be claimed exactly once after convergence, is controller-only, and cannot influence later research routing.
+The Docker executor accepts a typed request, verifies registered source identity, stages only the authorized train/valid dataset view, disables network access, applies read-only and resource limits, and publishes bounded output artifacts. Failure classification distinguishes execution failures from scientific non-improvement.
 
-## Verification
+The evaluation registry validates prediction shape, row identity, ordering, hashes, dataset manifest identity, source, checkpoint, and execution provenance. NDCG@10 and Recall@50 are the judging metrics and their mean is the local validation ranking. The repository's evaluator is `provisional`; the protected Starter Kit's incompatible metrics are diagnostic only. Current production composition does not configure an organizer evaluator or expose a CLI final-test operation. Therefore all current evaluation records and finalization records are provisional and must not be described as official results.
 
-Default tests are offline and require no paid model, network, Docker, GPU, or KuaiRand data. They cover contracts, policies, migrations, artifacts, resources, benchmark manifests, evaluation, repositories, agents, graph routing, recovery, traces, MLflow references, and two persisted synthetic cycles. Live provider, Docker, dataset, and local MLflow checks are opt-in diagnostics.
+Finalization is controller/persistence controlled. It requires converged persisted run and experiment state, an eligible source registration, a matching evaluation, evaluator identity, and a materialized bundle artifact. The bundle records source, checkpoint, evaluation, evaluator, and provenance references. The CLI export service writes audit-event records, sorted deterministically by event ID, as `iterations.jsonl` and `iterations.md` under the external run export directory. The bundle and exports are records of a provisional local run, not organizer submissions or official scores.
+
+## Runtime status and verification boundary
+
+The checked-in `judged.toml` profile supplies zero resource limits and must be completed by an operator through an external configuration/profile before a live run. A live production run additionally needs a verified external dataset manifest, all four model credentials, an approved repository commit, and an immutable Docker image digest. `diagnostics` currently checks the committed benchmark/protected-file manifest and reports evaluator status; it does not perform live model, Docker, dataset, or MLflow smoke checks.
+
+Synthetic lifecycle operation uses scripted agents, a deterministic fixture evaluator/executor, a temporary source-manager fixture that creates directories and fabricated source identities without Git operations, the same persistence/artifact/resource boundaries, and external runtime paths. It is suitable for offline lifecycle checks and needs no network, paid model, Docker, GPU, or KuaiRand data. It is not evidence of benchmark performance.

@@ -30,7 +30,6 @@ from tiktok2026.contracts import (
     ContractModel,
     DatasetManifestIdentity,
     DecisionAction,
-    EvaluationRequest,
     EvaluationResult,
     EvaluatorIdentity,
     ExecutionRequest,
@@ -40,7 +39,6 @@ from tiktok2026.contracts import (
     FinalizationBundleRequest,
     ImplementationRequest,
     ImplementationResult,
-    MetricValue,
     OperationResult,
     OrchestrationDecision,
     PredictionArtifactRegistration,
@@ -969,18 +967,21 @@ class _SyntheticExecutor:
         store: RepositoryRunStore,
         manifest: DatasetManifestIdentity,
         evaluator_hash: str,
+        artifact_store: Any,
     ) -> None:
-        self.root, self.store, self.manifest, self.evaluator_hash = (
+        self.root, self.store, self.manifest, self.evaluator_hash, self.artifact_store = (
             root,
             store,
             manifest,
             evaluator_hash,
+            artifact_store,
         )
 
     async def execute(self, request: ExecutionRequest) -> ExecutionResult:
         payload = json.dumps(
             {
                 "schema_version": "1",
+                "manifest_id": self.manifest.manifest_id,
                 "manifest_sha256": self.manifest.manifest_sha256,
                 "split": "valid",
                 "source_commit": request.source_commit,
@@ -991,32 +992,23 @@ class _SyntheticExecutor:
         ).encode()
         digest = hashlib.sha256(payload).hexdigest()
         run_id = request.run_id or "synthetic-run"
-        path = (
-            self.root / "artifacts" / run_id / request.experiment_id / f"prediction-{digest}.json"
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(payload)
-        artifact_id = f"prediction-{digest}"
-        self.store.put_artifact(
-            ArtifactRecord(
-                artifact_id=artifact_id,
-                run_id=run_id,
-                experiment_id=request.experiment_id,
-                kind="prediction",
-                uri=path.as_uri(),
-                sha256=digest,
-                size_bytes=len(payload),
-                producer="synthetic-executor",
-                retention=ArtifactRetention.RUN,
-            )
+        prediction_filename = f"prediction-{digest}.json"
+        prediction = self.artifact_store.publish_bytes(
+            run_id,
+            request.experiment_id,
+            "prediction",
+            prediction_filename,
+            payload,
+            "synthetic-executor",
+            ArtifactRetention.RUN,
         )
         self.store.put_json(
             "prediction_artifact",
-            artifact_id,
+            prediction.artifact_id,
             PredictionArtifactRegistration(
-                artifact_id=artifact_id,
-                path=path,
-                sha256=digest,
+                artifact_id=prediction.artifact_id,
+                path=Path(prediction.uri.removeprefix("file://")),
+                sha256=prediction.sha256,
                 checkpoint_id=f"checkpoint-{digest}",
                 source_commit=request.source_commit,
                 execution_id=request.execution_id,
@@ -1032,32 +1024,19 @@ class _SyntheticExecutor:
                 "data_manifest_id": self.manifest.manifest_id,
                 "source_commit": request.source_commit,
                 "execution_id": request.execution_id,
-                "prediction_artifact": path.name,
+                "prediction_artifact": prediction_filename,
             },
             sort_keys=True,
         ).encode()
         checkpoint_digest = hashlib.sha256(checkpoint_payload).hexdigest()
-        checkpoint_path = (
-            self.root
-            / "artifacts"
-            / run_id
-            / request.experiment_id
-            / f"checkpoint-{checkpoint_digest}.json"
-        )
-        checkpoint_path.write_bytes(checkpoint_payload)
-        checkpoint_artifact_id = f"checkpoint-{checkpoint_digest}"
-        self.store.put_artifact(
-            ArtifactRecord(
-                artifact_id=checkpoint_artifact_id,
-                run_id=run_id,
-                experiment_id=request.experiment_id,
-                kind="checkpoint",
-                uri=checkpoint_path.as_uri(),
-                sha256=checkpoint_digest,
-                size_bytes=len(checkpoint_payload),
-                producer="synthetic-executor",
-                retention=ArtifactRetention.RUN,
-            )
+        checkpoint = self.artifact_store.publish_bytes(
+            run_id,
+            request.experiment_id,
+            "checkpoint",
+            f"checkpoint-{checkpoint_digest}.json",
+            checkpoint_payload,
+            "synthetic-executor",
+            ArtifactRetention.RUN,
         )
         return ExecutionResult(
             execution_id=request.execution_id,
@@ -1067,33 +1046,8 @@ class _SyntheticExecutor:
             exit_code=0,
             elapsed_seconds=0.1,
             gpu_hours=0,
-            artifact_ids=(artifact_id, checkpoint_artifact_id),
+            artifact_ids=(prediction.artifact_id, checkpoint.artifact_id),
             checkpoint_id=f"checkpoint-{digest}",
-        )
-
-
-class _SyntheticEvaluator:
-    def evaluate(self, request: EvaluationRequest) -> EvaluationResult:
-        context = request.context
-        return EvaluationResult(
-            evaluation_id=request.evaluation_id,
-            experiment_id=context.experiment_id,
-            checkpoint_id=context.checkpoint_id,
-            metrics=(
-                MetricValue(name="NDCG@10", value=0.5),
-                MetricValue(name="Recall@50", value=0.6),
-            ),
-            evaluator_artifact_id=context.evaluator_id,
-            evaluator_sha256=context.evaluator_sha256,
-            prediction_sha256=context.prediction_sha256,
-            validity="provisional",
-            run_id=context.run_id,
-            source_commit=context.source_commit,
-            execution_id=context.execution_id,
-            dataset_manifest_id=context.dataset_manifest_id,
-            dataset_manifest_sha256=context.dataset_manifest_sha256,
-            prediction_artifact_id=context.prediction_artifact_id,
-            split=context.split,
         )
 
 
@@ -1147,8 +1101,10 @@ class _ScriptedAgent:
 
 
 def build_synthetic_controller(
-    repository_root: Path, runtime_root: Path
+    repository_root: Path, runtime_root: Path, iterations: int = 2
 ) -> tuple[ProductionController, object, Any]:
+    if iterations < 2:
+        raise ValueError("synthetic controller requires at least two iterations")
     runtime = initialize_runtime(repository_root, runtime_root)
     repo = RepositoryTransitionStore(runtime.repository)
     manifest = DatasetManifestIdentity(
@@ -1165,10 +1121,17 @@ def build_synthetic_controller(
         )
     )
     agent_clients = {role: _ScriptedAgent() for role in AgentRole}
+    from tiktok2026.persistence.artifacts import ArtifactStore
+    from tiktok2026.testing.synthetic import FixtureEvaluator
+
+    artifact_store = ArtifactStore(runtime.paths, runtime.repository)
+
     transitions = make_service_transitions(
         agent_clients=agent_clients,
-        evaluator=_SyntheticEvaluator(),
-        executor=_SyntheticExecutor(runtime.paths.root, repo, manifest, evaluator_hash),
+        evaluator=FixtureEvaluator(),
+        executor=_SyntheticExecutor(
+            runtime.paths.root, repo, manifest, evaluator_hash, artifact_store
+        ),
         worktree_manager=_SyntheticWorktreeManager(runtime.paths.root, repo),
         resource_accountant=LedgerResourceAccountant(
             ResourceLedger(
@@ -1188,7 +1151,9 @@ def build_synthetic_controller(
         run_store=repo,
         export_service=RepositoryExportService(runtime.repository, runtime.paths.root),
         bundle_service=RepositoryFinalizationBundleService(runtime.repository, runtime.paths.root),
-        frontier_service=RepositoryFrontierService(runtime.repository, patience=1),
+        frontier_service=RepositoryFrontierService(
+            runtime.repository, patience=max(1, iterations - 1)
+        ),
         runtime_root=str(runtime.paths.root),
         repository_root=str(repository_root),
         parent_commit=hashlib.sha1(b"synthetic-parent").hexdigest(),
