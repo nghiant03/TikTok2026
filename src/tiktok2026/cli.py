@@ -11,6 +11,7 @@ from tiktok2026.bootstrap import (
     build_production_operations,
 )
 from tiktok2026.contracts import OperationResult
+from tiktok2026.logging import configure_logging
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -26,6 +27,7 @@ def _operations(
     profile_path: Path | None = None,
     operator_config: Path | None = None,
 ) -> ProductionOperations:
+    configure_logging(runtime_root)
     return build_production_operations(
         repository_root or Path.cwd(), runtime_root, profile_path, operator_config
     )

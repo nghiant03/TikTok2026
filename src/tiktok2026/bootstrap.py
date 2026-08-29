@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
+from loguru import logger
+
 from tiktok2026.adapters import (
     DeterministicPolicyGate,
     LedgerResourceAccountant,
@@ -289,6 +291,11 @@ class ProductionOperations:
 
     def run(self, *, synthetic: bool = False, run_id: str | None = None) -> OperationResult:
         actual_run_id = run_id or ("test-run" if synthetic else f"prod-{uuid.uuid4().hex[:8]}")
+        logger.info(
+            "Run starting synthetic={} runtime_root={}",
+            synthetic,
+            self.runtime_root,
+        )
         if synthetic:
             _controller, _store, graph = build_synthetic_controller(
                 self.repository_root, self.runtime_root

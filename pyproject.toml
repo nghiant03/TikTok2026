@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "langgraph>=0.6",
+    "loguru>=0.7.3",
     "mlflow>=3.3",
     "numpy>=2.4.6",
     "openai>=1.100",
@@ -30,7 +31,8 @@ dev = [
     "ruff>=0.12",
 ]
 gateway = [
-    "litellm[proxy]>=1.81.13,<2",
+    "litellm[proxy]==1.89.5",
+    "prisma>=0.15.0",
 ]
 
 [project.scripts]

@@ -5,6 +5,7 @@ import os
 from typing import Protocol, cast
 
 import httpx
+from loguru import logger
 
 from tiktok2026.config import ModelSettings
 
@@ -47,11 +48,16 @@ class OpenAICompatibleClient:
             "max_tokens": self.settings.max_tokens,
             "response_format": {"type": "json_object"},
         }
+        logger.info("Request started mode={} timeout={}", self.settings.model, self.settings.timeout_seconds)
         response = await self.transport.post_json(
             f"{self.settings.base_url.rstrip('/')}/chat/completions",
             payload,
             {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             self.settings.timeout_seconds,
+        )
+        logger.debug(
+            "Response received choices_present={}",
+            bool(response.get("choices")),
         )
         choices_value = response.get("choices")
         if not isinstance(choices_value, list) or not choices_value:
@@ -68,6 +74,11 @@ class OpenAICompatibleClient:
         content = message.get("content")
         if not isinstance(content, str):
             raise ValueError("chat response content must be text")
+        logger.debug(
+            "Model response finish_reason={} content_length={}",
+            choice.get("finish_reason"),
+            len(content),
+        )
         parsed: object = json.loads(content)
         if not isinstance(parsed, dict):
             raise ValueError("structured response must be an object")
