@@ -1,34 +1,33 @@
-# Merge these model tables into the external operator TOML used for a live run.
-# The same local LiteLLM gateway serves each of the four runtime roles.
+# config/litellm/operator-models.toml
 
 [models.orchestration]
 base_url = "http://127.0.0.1:4000/v1"
-model = "tiktok2026-chatgpt"
+model = "tiktok2026-orchestration"
 api_key_env = "LITELLM_API_KEY"
 temperature = 0.0
 max_tokens = 4096
-timeout_seconds = 120.0
+timeout_seconds = 180.0
 
 [models.research]
 base_url = "http://127.0.0.1:4000/v1"
-model = "tiktok2026-chatgpt"
+model = "tiktok2026-research"
 api_key_env = "LITELLM_API_KEY"
 temperature = 0.0
-max_tokens = 4096
-timeout_seconds = 120.0
+max_tokens = 8192
+timeout_seconds = 600.0
 
 [models.implementor]
 base_url = "http://127.0.0.1:4000/v1"
-model = "tiktok2026-chatgpt"
+model = "tiktok2026-implementor"
 api_key_env = "LITELLM_API_KEY"
 temperature = 0.0
-max_tokens = 4096
-timeout_seconds = 120.0
+max_tokens = 8192
+timeout_seconds = 600.0
 
 [models.validator]
 base_url = "http://127.0.0.1:4000/v1"
-model = "tiktok2026-chatgpt"
+model = "tiktok2026-validator"
 api_key_env = "LITELLM_API_KEY"
 temperature = 0.0
-max_tokens = 4096
-timeout_seconds = 120.0
+max_tokens = 8192
+timeout_seconds = 600.0

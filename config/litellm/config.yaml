@@ -1,11 +1,49 @@
-# LiteLLM proxy configuration for the four TikTok2026 runtime agents.
-# ChatGPT subscription authentication is performed by LiteLLM's OAuth device flow.
+# config/litellm/config.yaml
+
 model_list:
-  - model_name: tiktok2026-chatgpt
+
+  # Cheap/fast controller decisions
+  - model_name: tiktok2026-orchestration
     model_info:
       mode: responses
     litellm_params:
-      model: chatgpt/gpt-5.4
+      model: chatgpt/gpt-5.6-terra
+      reasoning_effort: medium
+
+      # TikTok2026 currently always sends temperature=0.0.
+      # GPT-5.6 reasoning models should not receive it.
+      additional_drop_params:
+        - temperature
+
+  # Scientific/recommender-system reasoning
+  - model_name: tiktok2026-research
+    model_info:
+      mode: responses
+    litellm_params:
+      model: chatgpt/gpt-5.6-sol
+      reasoning_effort: high
+      additional_drop_params:
+        - temperature
+
+  # Code generation / experiment implementation
+  - model_name: tiktok2026-implementor
+    model_info:
+      mode: responses
+    litellm_params:
+      model: chatgpt/gpt-5.6-sol
+      reasoning_effort: high
+      additional_drop_params:
+        - temperature
+
+  # Adversarial review / validation
+  - model_name: tiktok2026-validator
+    model_info:
+      mode: responses
+    litellm_params:
+      model: chatgpt/gpt-5.6-sol
+      reasoning_effort: high
+      additional_drop_params:
+        - temperature
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
