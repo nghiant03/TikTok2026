@@ -10,6 +10,8 @@ from tiktok2026.contracts import (
     ArtifactRecord,
     AuditEvent,
     BlockerResolution,
+    CriterionAssessmentStatus,
+    CriterionResolutionClaim,
     EvaluatorIdentity,
     ExperimentRegistryEntry,
     ExperimentSpec,
@@ -17,6 +19,7 @@ from tiktok2026.contracts import (
     FinalTestAuthorizationRequest,
     FinalTestClaim,
     FinalTestRequest,
+    ImplementationCriterionAssessment,
     ImplementationValidationAuthority,
     ProvisionalFinalizationRequest,
     RunRecord,
@@ -441,6 +444,119 @@ class ApplicationRepository:
         )
         return f"resolution-{_content_hash(material)}"
 
+    @staticmethod
+    def _criterion_occurrence_id(report_id: str, criterion_id: str) -> str:
+        material = json.dumps(
+            {"report_id": report_id, "criterion_id": criterion_id},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return f"criterion-occurrence-{_content_hash(material)}"
+
+    @staticmethod
+    def _resolution_claim_id(report_id: str, criterion_id: str) -> str:
+        material = json.dumps(
+            {"report_id": report_id, "criterion_id": criterion_id},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return f"resolution-claim-{_content_hash(material)}"
+
+    @staticmethod
+    def _criterion_assessment_status(
+        assessment: ImplementationCriterionAssessment,
+    ) -> str:
+        return assessment.status.value
+
+    def _persist_criterion_occurrence(
+        self,
+        connection: sqlite3.Connection,
+        report: ValidationReport,
+        assessment: ImplementationCriterionAssessment,
+        blocker_ids: tuple[str, ...],
+        now: str,
+    ) -> None:
+        criterion_id = str(assessment.criterion_id)
+        assessment_payload = assessment.model_dump_json()
+        digest = _content_hash(assessment_payload)
+        occurrence_id = self._criterion_occurrence_id(report.report_id, criterion_id)
+        existing = connection.execute(
+            "SELECT assessment_json, content_sha256 FROM "
+            "authority_validation_criterion_occurrences WHERE occurrence_id = ?",
+            (occurrence_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing[1] != digest:
+                raise PersistenceConflictError(
+                    f"criterion occurrence {occurrence_id} content changed"
+                )
+        else:
+            connection.execute(
+                "INSERT INTO authority_validation_criterion_occurrences "
+                "(occurrence_id, report_id, experiment_id, stage, criterion_id, status, "
+                "assessment_json, content_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    occurrence_id,
+                    report.report_id,
+                    report.experiment_id,
+                    report.stage.value,
+                    criterion_id,
+                    self._criterion_assessment_status(assessment),
+                    assessment_payload,
+                    digest,
+                    now,
+                ),
+            )
+        for blocker_id in blocker_ids:
+            blocker = connection.execute(
+                "SELECT 1 FROM authority_validation_blockers WHERE blocker_id = ?",
+                (blocker_id,),
+            ).fetchone()
+            if blocker is None:
+                raise ValueError(f"validation blocker {blocker_id} does not exist")
+            connection.execute(
+                "INSERT OR IGNORE INTO authority_validation_criterion_occurrence_blockers "
+                "(occurrence_id, blocker_id) VALUES (?, ?)",
+                (occurrence_id, blocker_id),
+            )
+
+    def _persist_resolution_claim(
+        self,
+        connection: sqlite3.Connection,
+        report: ValidationReport,
+        claim: CriterionResolutionClaim,
+        now: str,
+    ) -> None:
+        criterion_id = str(claim.criterion_id)
+        payload = claim.model_dump_json()
+        digest = _content_hash(payload)
+        claim_id = self._resolution_claim_id(report.report_id, criterion_id)
+        existing = connection.execute(
+            "SELECT claim_json, content_sha256 FROM authority_validation_resolution_claims "
+            "WHERE claim_id = ?",
+            (claim_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing[1] != digest:
+                raise PersistenceConflictError(f"resolution claim {claim_id} content changed")
+        else:
+            connection.execute(
+                "INSERT INTO authority_validation_resolution_claims "
+                "(claim_id, report_id, experiment_id, stage, criterion_id, status, claim_json, "
+                "content_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    claim_id,
+                    report.report_id,
+                    report.experiment_id,
+                    report.stage.value,
+                    criterion_id,
+                    claim.status.value,
+                    payload,
+                    digest,
+                    now,
+                ),
+            )
+
     def _put_validation_operation(
         self,
         connection: sqlite3.Connection,
@@ -587,7 +703,14 @@ class ApplicationRepository:
                     (blocker.blocker_id,),
                 ).fetchone()
                 if blocker_row is not None:
-                    if blocker_row[1] != blocker_digest:
+                    existing_blocker = ValidationBlocker.model_validate_json(blocker_row[0])
+                    criterion_is_stable = (
+                        blocker.criterion_id is not None
+                        and existing_blocker.criterion_id == blocker.criterion_id
+                        and existing_blocker.experiment_id == blocker.experiment_id
+                        and existing_blocker.stage == blocker.stage
+                    )
+                    if not criterion_is_stable and blocker_row[1] != blocker_digest:
                         raise PersistenceConflictError(
                             f"validation blocker {blocker.blocker_id} content changed"
                         )
@@ -595,8 +718,8 @@ class ApplicationRepository:
                 connection.execute(
                     "INSERT INTO authority_validation_blockers "
                     "(blocker_id, report_id, experiment_id, stage, blocker_json, "
-                    "content_sha256, created_at, validation_operation_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "content_sha256, created_at, validation_operation_id, criterion_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         blocker.blocker_id,
                         report.report_id,
@@ -606,6 +729,7 @@ class ApplicationRepository:
                         blocker_digest,
                         now,
                         operation.operation_id,
+                        blocker.criterion_id,
                     ),
                 )
                 self._insert_audit(
@@ -633,73 +757,132 @@ class ApplicationRepository:
                         now,
                     ),
                 )
-            if report.resolves_blocker_ids:
-                if not report.evidence_refs:
-                    raise ValueError("blocker resolutions require validation evidence")
-                for blocker_id in report.resolves_blocker_ids:
-                    blocker_row = connection.execute(
-                        "SELECT blocker_json, experiment_id, report_id "
-                        "FROM authority_validation_blockers WHERE blocker_id = ?",
-                        (blocker_id,),
-                    ).fetchone()
-                    if blocker_row is None:
-                        raise ValueError(f"validation blocker {blocker_id} does not exist")
-                    blocker = ValidationBlocker.model_validate_json(blocker_row[0])
-                    if blocker.experiment_id != report.experiment_id:
-                        raise ValueError("blocker resolution experiment does not match report")
-                    resolution = BlockerResolution(
-                        resolution_id=self._resolution_id(
-                            report.report_id, blocker_id, report.evidence_refs
-                        ),
-                        blocker_id=blocker_id,
-                        report_id=report.report_id,
-                        experiment_id=report.experiment_id,
-                        evidence_refs=report.evidence_refs,
-                        validation_operation_id=operation.operation_id,
+            criterion_assessments = list(report.criterion_assessments)
+            assessment_ids = [str(assessment.criterion_id) for assessment in criterion_assessments]
+            if len(set(assessment_ids)) != len(assessment_ids):
+                raise ValueError("validation report cannot assess a criterion more than once")
+            assessment_by_criterion = {
+                str(assessment.criterion_id): assessment for assessment in criterion_assessments
+            }
+            for blocker in report.blockers:
+                if blocker.criterion_id is not None and str(blocker.criterion_id) not in (
+                    assessment_by_criterion
+                ):
+                    assessment = ImplementationCriterionAssessment(
+                        criterion_id=blocker.criterion_id,
+                        status=CriterionAssessmentStatus.FAIL,
+                        evidence_refs=blocker.evidence_refs,
+                        details=blocker.text,
                     )
-                    resolution_payload = resolution.model_dump_json()
-                    resolution_digest = _content_hash(resolution_payload)
-                    prior = connection.execute(
-                        "SELECT resolution_id, resolution_json, content_sha256 "
-                        "FROM authority_blocker_resolutions WHERE blocker_id = ?",
-                        (blocker_id,),
-                    ).fetchone()
-                    if prior is not None:
-                        if prior[2] != resolution_digest:
-                            raise PersistenceConflictError(
-                                f"blocker {blocker_id} already has a different resolution"
-                            )
-                        continue
-                    connection.execute(
-                        "INSERT INTO authority_blocker_resolutions "
-                        "(resolution_id, blocker_id, report_id, experiment_id, "
-                        "resolution_json, content_sha256, created_at, validation_operation_id) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            resolution.resolution_id,
-                            resolution.blocker_id,
-                            resolution.report_id,
-                            resolution.experiment_id,
-                            resolution_payload,
-                            resolution_digest,
-                            now,
-                            operation.operation_id,
-                        ),
-                    )
-                    self._insert_audit(
-                        connection,
-                        self._automatic_event(
-                            "validation_blocker_resolved",
-                            run_id,
-                            report.experiment_id,
-                            {
-                                "resolution_id": resolution.resolution_id,
-                                "blocker_id": blocker_id,
-                                "report_id": report.report_id,
-                            },
-                            now,
-                        ),
-                    )
+                    criterion_assessments.append(assessment)
+                    assessment_by_criterion[str(blocker.criterion_id)] = assessment
+            for assessment in criterion_assessments:
+                criterion = str(assessment.criterion_id)
+                blocker_ids = tuple(
+                    blocker.blocker_id
+                    for blocker in report.blockers
+                    if blocker.criterion_id is not None
+                    and str(blocker.criterion_id) == criterion
+                )
+                self._persist_criterion_occurrence(
+                    connection, report, assessment, blocker_ids, now
+                )
+
+            claim_ids = [str(claim.criterion_id) for claim in report.resolution_claims]
+            if len(set(claim_ids)) != len(claim_ids):
+                raise ValueError("validation report cannot claim a criterion more than once")
+            for claim in report.resolution_claims:
+                if not claim.evidence_refs:
+                    raise ValueError("criterion resolution claims require validation evidence")
+                if claim.status not in (
+                    CriterionAssessmentStatus.PASS,
+                    CriterionAssessmentStatus.PARTIAL,
+                ):
+                    raise ValueError("criterion resolution claims must be pass or partial")
+                self._persist_resolution_claim(connection, report, claim, now)
+
+            if report.resolves_blocker_ids and not report.evidence_refs:
+                raise ValueError("blocker resolutions require validation evidence")
+            resolutions: list[tuple[str, tuple[str, ...], str | None, str | None]] = [
+                (blocker_id, report.evidence_refs, None, None)
+                for blocker_id in report.resolves_blocker_ids
+            ]
+            resolutions.extend(
+                (blocker_id, claim.evidence_refs, str(claim.criterion_id), claim.status.value)
+                for claim in report.resolution_claims
+                for blocker_id in claim.blocker_ids
+                if claim.status == CriterionAssessmentStatus.PASS
+            )
+            for blocker_id, evidence_refs, criterion_id, status in resolutions:
+                blocker_row = connection.execute(
+                    "SELECT blocker_json, experiment_id, report_id "
+                    "FROM authority_validation_blockers WHERE blocker_id = ?",
+                    (blocker_id,),
+                ).fetchone()
+                if blocker_row is None:
+                    raise ValueError(f"validation blocker {blocker_id} does not exist")
+                blocker = ValidationBlocker.model_validate_json(blocker_row[0])
+                if blocker.experiment_id != report.experiment_id:
+                    raise ValueError("blocker resolution experiment does not match report")
+                if criterion_id is not None and str(blocker.criterion_id) != criterion_id:
+                    raise ValueError("criterion resolution claim does not match blocker")
+                resolution = BlockerResolution(
+                    resolution_id=self._resolution_id(
+                        report.report_id, blocker_id, evidence_refs
+                    ),
+                    blocker_id=blocker_id,
+                    report_id=report.report_id,
+                    experiment_id=report.experiment_id,
+                    evidence_refs=evidence_refs,
+                    validation_operation_id=operation.operation_id,
+                    criterion_id=blocker.criterion_id,
+                    status=(CriterionAssessmentStatus(status) if status is not None else None),
+                )
+                resolution_payload = resolution.model_dump_json()
+                resolution_digest = _content_hash(resolution_payload)
+                prior = connection.execute(
+                    "SELECT resolution_id, resolution_json, content_sha256 "
+                    "FROM authority_blocker_resolutions WHERE resolution_id = ?",
+                    (resolution.resolution_id,),
+                ).fetchone()
+                if prior is not None:
+                    if prior[2] != resolution_digest:
+                        raise PersistenceConflictError(
+                            f"blocker resolution {resolution.resolution_id} content changed"
+                        )
+                    continue
+                connection.execute(
+                    "INSERT INTO authority_blocker_resolutions "
+                    "(resolution_id, blocker_id, report_id, experiment_id, "
+                    "resolution_json, content_sha256, created_at, validation_operation_id, "
+                    "criterion_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        resolution.resolution_id,
+                        resolution.blocker_id,
+                        resolution.report_id,
+                        resolution.experiment_id,
+                        resolution_payload,
+                        resolution_digest,
+                        now,
+                        operation.operation_id,
+                        resolution.criterion_id,
+                        resolution.status,
+                    ),
+                )
+                self._insert_audit(
+                    connection,
+                    self._automatic_event(
+                        "validation_blocker_resolved",
+                        run_id,
+                        report.experiment_id,
+                        {
+                            "resolution_id": resolution.resolution_id,
+                            "blocker_id": blocker_id,
+                            "report_id": report.report_id,
+                        },
+                        now,
+                    ),
+                )
 
     def put_validation_blocker(self, blocker: ValidationBlocker, run_id: str) -> None:
         report = self.get_validation_report(blocker.report_id)
@@ -725,10 +908,27 @@ class ApplicationRepository:
         )
 
     def put_blocker_resolution(self, resolution: BlockerResolution, run_id: str) -> None:
+        if resolution.status == CriterionAssessmentStatus.PARTIAL:
+            raise ValueError("partial criterion claims do not resolve blockers")
         report = self.get_validation_report(resolution.report_id)
-        if report is None or report.verdict.value != "approved":
-            raise ValueError("blocker resolution requires an approved validation report")
-        if resolution.blocker_id not in report.resolves_blocker_ids:
+        if report is None or report.verdict.value not in {"approved", "repairable"}:
+            raise ValueError(
+                "blocker resolution requires an approved or repairable validation report"
+            )
+        claimed_ids = {
+            blocker_id
+            for claim in report.resolution_claims
+            for blocker_id in claim.blocker_ids
+        }
+        partially_claimed_ids = {
+            blocker_id
+            for claim in report.resolution_claims
+            if claim.status == CriterionAssessmentStatus.PARTIAL
+            for blocker_id in claim.blocker_ids
+        }
+        if resolution.blocker_id in partially_claimed_ids:
+            raise ValueError("partial criterion claims do not resolve blockers")
+        if resolution.blocker_id not in (*report.resolves_blocker_ids, *claimed_ids):
             raise ValueError("resolution is not authorized by its validation report")
         if (
             resolution.experiment_id != report.experiment_id
@@ -743,14 +943,20 @@ class ApplicationRepository:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             blocker = connection.execute(
-                "SELECT experiment_id, report_id FROM authority_validation_blockers "
+                "SELECT blocker_json, experiment_id, report_id FROM authority_validation_blockers "
                 "WHERE blocker_id = ?",
                 (resolution.blocker_id,),
             ).fetchone()
             if blocker is None:
                 raise ValueError("validation blocker does not exist")
-            if blocker[0] != report.experiment_id:
+            if blocker[1] != report.experiment_id:
                 raise ValueError("blocker resolution experiment does not match blocker")
+            blocker_model = ValidationBlocker.model_validate_json(blocker[0])
+            if (
+                resolution.criterion_id is not None
+                and resolution.criterion_id != blocker_model.criterion_id
+            ):
+                raise ValueError("blocker resolution criterion does not match blocker")
             same_id = connection.execute(
                 "SELECT resolution_json, content_sha256 FROM authority_blocker_resolutions "
                 "WHERE resolution_id = ?",
@@ -762,22 +968,11 @@ class ApplicationRepository:
                         f"blocker resolution {resolution.resolution_id} content changed"
                     )
                 return
-            existing = connection.execute(
-                "SELECT resolution_json, content_sha256 FROM authority_blocker_resolutions "
-                "WHERE blocker_id = ?",
-                (resolution.blocker_id,),
-            ).fetchone()
-            if existing is not None:
-                if existing[1] != digest:
-                    raise PersistenceConflictError(
-                        f"blocker {resolution.blocker_id} already has a different resolution"
-                    )
-                return
             connection.execute(
                 "INSERT INTO authority_blocker_resolutions "
                 "(resolution_id, blocker_id, report_id, experiment_id, resolution_json, "
-                "content_sha256, created_at, validation_operation_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "content_sha256, created_at, validation_operation_id, criterion_id, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     resolution.resolution_id,
                     resolution.blocker_id,
@@ -787,6 +982,8 @@ class ApplicationRepository:
                     digest,
                     now,
                     resolution.validation_operation_id,
+                    resolution.criterion_id,
+                    resolution.status,
                 ),
             )
             self._insert_audit(
@@ -909,20 +1106,96 @@ class ApplicationRepository:
     def get_unresolved_blockers(self, experiment_id: str) -> tuple[ValidationBlocker, ...]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT blocker.blocker_json FROM authority_validation_blockers AS blocker "
-                "LEFT JOIN authority_blocker_resolutions AS resolution "
-                "ON resolution.blocker_id = blocker.blocker_id "
-                "WHERE blocker.experiment_id = ? AND resolution.blocker_id IS NULL "
+                "SELECT blocker.blocker_json, blocker.blocker_id, blocker.stage, "
+                "blocker.criterion_id "
+                "FROM authority_validation_blockers AS blocker "
+                "WHERE blocker.experiment_id = ? "
                 "ORDER BY blocker.created_at, blocker.blocker_id",
                 (experiment_id,),
             ).fetchall()
-        return tuple(ValidationBlocker.model_validate_json(row[0]) for row in rows)
+            unresolved: list[ValidationBlocker] = []
+            for blocker_json, blocker_id, stage, criterion_id in rows:
+                if criterion_id is None:
+                    resolved = connection.execute(
+                        "SELECT 1 FROM authority_blocker_resolutions "
+                        "WHERE blocker_id = ? AND (status IS NULL OR status = 'pass') LIMIT 1",
+                        (blocker_id,),
+                    ).fetchone()
+                    if resolved is None:
+                        unresolved.append(ValidationBlocker.model_validate_json(blocker_json))
+                    continue
+
+                occurrence = connection.execute(
+                    "SELECT occurrence.report_id, occurrence.status, occurrence.assessment_json "
+                    "FROM authority_validation_criterion_occurrences AS occurrence "
+                    "WHERE occurrence.experiment_id = ? AND occurrence.stage = ? "
+                    "AND occurrence.criterion_id = ? "
+                    "ORDER BY occurrence.created_at DESC, occurrence.occurrence_id DESC LIMIT 1",
+                    (experiment_id, stage, criterion_id),
+                ).fetchone()
+                if occurrence is None:
+                    resolved = connection.execute(
+                        "SELECT 1 FROM authority_blocker_resolutions "
+                        "WHERE blocker_id = ? AND (status IS NULL OR status = 'pass') LIMIT 1",
+                        (blocker_id,),
+                    ).fetchone()
+                elif occurrence[1] != CriterionAssessmentStatus.PASS.value:
+                    # A newer failed or partial assessment reopens the stable
+                    # blocker, even when an older PASS resolution is retained.
+                    resolved = None
+                else:
+                    assessment = json.loads(occurrence[2])
+                    has_evidence = bool(assessment.get("evidence_refs"))
+                    resolved = connection.execute(
+                        "SELECT 1 FROM authority_blocker_resolutions "
+                        "WHERE blocker_id = ? AND report_id = ? "
+                        "AND (status IS NULL OR status = 'pass') LIMIT 1",
+                        (blocker_id, occurrence[0]),
+                    ).fetchone()
+                    if resolved is None:
+                        resolved = connection.execute(
+                            "SELECT 1 FROM authority_validation_resolution_claims "
+                            "WHERE report_id = ? AND criterion_id = ? AND status = 'pass' "
+                            "AND json_array_length(json_extract(claim_json, "
+                            "'$.evidence_refs')) > 0 "
+                            "LIMIT 1",
+                            (occurrence[0], criterion_id),
+                        ).fetchone()
+                    if resolved is None and has_evidence:
+                        # A PASS occurrence is itself an evidence-backed
+                        # resolution; claims remain available as the explicit
+                        # append-only audit record when supplied.
+                        resolved = (1,)
+                if resolved is None:
+                    unresolved.append(ValidationBlocker.model_validate_json(blocker_json))
+        return tuple(unresolved)
 
     def get_unresolved_blocker_ids(self, experiment_id: str) -> tuple[str, ...]:
         return tuple(blocker.blocker_id for blocker in self.get_unresolved_blockers(experiment_id))
 
     def list_unresolved_blockers(self, experiment_id: str) -> tuple[ValidationBlocker, ...]:
         return self.get_unresolved_blockers(experiment_id)
+
+    def get_criterion_repeat_count(
+        self,
+        experiment_id: str,
+        criterion_id: str,
+        stage: ValidationStage = ValidationStage.IMPLEMENTATION,
+    ) -> int:
+        """Return the number of failed or partial criterion occurrences.
+
+        Occurrences are keyed by report and criterion, so replaying an identical
+        report cannot inflate the count.  Passing assessments are deliberately not
+        escalation signals.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM authority_validation_criterion_occurrences "
+                "WHERE experiment_id = ? AND criterion_id = ? "
+                "AND stage = ? AND status IN ('fail', 'partial')",
+                (experiment_id, criterion_id, stage.value),
+            ).fetchone()
+        return int(row[0])
 
     def put_experiment(
         self,

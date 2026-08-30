@@ -1,6 +1,15 @@
-from tiktok2026.contracts import ExecutionResult, FailureKind, Fidelity, ResourceState
+import pytest
+
+from tiktok2026.contracts import (
+    ExecutionResult,
+    FailureKind,
+    Fidelity,
+    ImplementationResourceEstimate,
+    ResourceState,
+)
 from tiktok2026.policies.lifecycle import (
     can_repair,
+    check_implementation_resource_estimate,
     convergence_reason,
     valid_fidelity_transition,
 )
@@ -42,6 +51,55 @@ def test_repairs_and_fidelity_are_bounded() -> None:
     assert not can_repair(3).allowed
     assert valid_fidelity_transition(Fidelity.SMOKE, Fidelity.PROXY).allowed
     assert not valid_fidelity_transition(Fidelity.FULL, Fidelity.SMOKE).allowed
+
+
+def _resource_estimate(**updates: object) -> ImplementationResourceEstimate:
+    values: dict[str, object] = {
+        "predicted_wall_seconds": 10.0,
+        "predicted_peak_memory_bytes": 100,
+        "predicted_artifact_bytes": 100,
+        "dataset_passes": 1,
+    }
+    values.update(updates)
+    return ImplementationResourceEstimate.model_validate(values)
+
+
+def _resource_decision(estimate: ImplementationResourceEstimate):
+    return check_implementation_resource_estimate(
+        estimate,
+        execution_timeout_seconds=100,
+        execution_memory_bytes=1_000,
+        resource_state=ResourceState(
+            remaining_gpu_hours=1.0,
+            accumulated_gpu_hours=0.0,
+            remaining_wall_seconds=100.0,
+            used_tokens=0,
+            remaining_tokens=100,
+            disk_bytes_available=1_000,
+            reserved_final_gpu_hours=0.0,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    (
+        {"predicted_wall_seconds": 101.0},
+        {"predicted_peak_memory_bytes": 1_001},
+        {"predicted_artifact_bytes": 1_001},
+        {"dataset_passes": 5},
+        {"high_cardinality_nested_scans": True},
+        {"duplicate_full_materializations": True},
+    ),
+)
+def test_implementation_resource_admission_rejects_each_boundary(
+    updates: dict[str, object],
+) -> None:
+    assert not _resource_decision(_resource_estimate(**updates)).allowed
+
+
+def test_implementation_resource_admission_accepts_bounded_estimate() -> None:
+    assert _resource_decision(_resource_estimate()).allowed
 
 
 def test_smoke_feasibility_fails_closed_for_unknown_memory_and_gpu() -> None:

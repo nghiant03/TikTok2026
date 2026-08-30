@@ -7,8 +7,12 @@ import pytest
 from pydantic import ValidationError
 
 from tiktok2026.contracts import (
+    CriterionAssessmentStatus,
+    CriterionResolutionClaim,
     ExperimentSpec,
     Fidelity,
+    ImplementationCriterionAssessment,
+    ImplementationCriterionId,
     ImplementationRequest,
     RunPhase,
     ValidationBlockerContext,
@@ -199,6 +203,254 @@ def test_validation_ledger_is_idempotent_and_conflict_checked(tmp_path: Path) ->
 
     resolution = repository.list_blocker_resolutions("experiment-1")[0]
     repository.put_blocker_resolution(resolution, "run-1")
+
+
+def test_criterion_blockers_are_stable_and_occurrences_are_append_only(tmp_path: Path) -> None:
+    repository = ApplicationRepository(tmp_path / "application.sqlite3")
+    repository.initialize()
+    first = _report(
+        "report-1",
+        ValidationVerdict.REJECTED,
+        blockers=({"criterion_id": "leakage", "text": "first finding"},),
+        criterion_assessments=(
+            ImplementationCriterionAssessment(
+                criterion_id=ImplementationCriterionId.LEAKAGE,
+                status=CriterionAssessmentStatus.FAIL,
+                evidence_refs=("e1",),
+            ),
+        ),
+    )
+    second = _report(
+        "report-2",
+        ValidationVerdict.REJECTED,
+        blockers=({"criterion_id": "leakage", "text": "new finding"},),
+        criterion_assessments=(
+            ImplementationCriterionAssessment(
+                criterion_id=ImplementationCriterionId.LEAKAGE,
+                status=CriterionAssessmentStatus.PARTIAL,
+                evidence_refs=("e2",),
+            ),
+        ),
+    )
+    repository.put_validation_report(first, "run-1", _operation(first), _subject(first))
+    repository.put_validation_report(second, "run-1", _operation(second), _subject(second))
+
+    assert first.blockers[0].blocker_id == second.blockers[0].blocker_id
+    assert repository.list_validation_blockers("experiment-1")[0].text == "first finding"
+    assert repository.get_criterion_repeat_count("experiment-1", "leakage") == 2
+
+
+def test_repairable_claim_partially_resolves_a_criterion_and_replays_idempotently(
+    tmp_path: Path,
+) -> None:
+    repository = ApplicationRepository(tmp_path / "application.sqlite3")
+    repository.initialize()
+    rejected = _report(
+        "report-1",
+        ValidationVerdict.REJECTED,
+        blockers=({"criterion_id": "leakage", "text": "two issues"},),
+        criterion_assessments=(
+            ImplementationCriterionAssessment(
+                criterion_id=ImplementationCriterionId.LEAKAGE,
+                status=CriterionAssessmentStatus.FAIL,
+            ),
+        ),
+    )
+    repository.put_validation_report(rejected, "run-1", _operation(rejected), _subject(rejected))
+    claim = CriterionResolutionClaim(
+        criterion_id=ImplementationCriterionId.LEAKAGE,
+        status=CriterionAssessmentStatus.PARTIAL,
+        blocker_ids=(rejected.blockers[0].blocker_id,),
+        evidence_refs=("repair-evidence",),
+        claim="one part repaired",
+    )
+    repaired = _report(
+        "report-2",
+        ValidationVerdict.REPAIRABLE,
+        criterion_assessments=(
+            ImplementationCriterionAssessment(
+                criterion_id=ImplementationCriterionId.LEAKAGE,
+                status=CriterionAssessmentStatus.PARTIAL,
+            ),
+        ),
+        resolution_claims=(claim,),
+    )
+    repository.put_validation_report(repaired, "run-1", _operation(repaired), _subject(repaired))
+    repository.put_validation_report(repaired, "run-1", _operation(repaired), _subject(repaired))
+
+    assert repository.get_unresolved_blocker_ids("experiment-1") == (
+        rejected.blockers[0].blocker_id,
+    )
+    assert repository.list_blocker_resolutions("experiment-1") == ()
+    assert repository.get_criterion_repeat_count("experiment-1", "leakage") == 2
+
+
+def test_criterion_status_reopens_and_resolves_stable_blocker(tmp_path: Path) -> None:
+    repository = ApplicationRepository(tmp_path / "application.sqlite3")
+    repository.initialize()
+    rejected = _report(
+        "report-1",
+        ValidationVerdict.REJECTED,
+        blockers=({"criterion_id": "leakage", "text": "finding"},),
+        criterion_assessments=(
+            ImplementationCriterionAssessment(
+                criterion_id=ImplementationCriterionId.LEAKAGE,
+                status=CriterionAssessmentStatus.FAIL,
+            ),
+        ),
+    )
+    repository.put_validation_report(rejected, "run-1", _operation(rejected), _subject(rejected))
+    blocker_id = rejected.blockers[0].blocker_id
+
+    partial = _report(
+        "report-2",
+        ValidationVerdict.REPAIRABLE,
+        criterion_assessments=(
+            ImplementationCriterionAssessment(
+                criterion_id=ImplementationCriterionId.LEAKAGE,
+                status=CriterionAssessmentStatus.PARTIAL,
+            ),
+        ),
+        resolution_claims=(
+            CriterionResolutionClaim(
+                criterion_id=ImplementationCriterionId.LEAKAGE,
+                status=CriterionAssessmentStatus.PARTIAL,
+                blocker_ids=(blocker_id,),
+                evidence_refs=("partial-evidence",),
+            ),
+        ),
+    )
+    repository.put_validation_report(partial, "run-1", _operation(partial), _subject(partial))
+    assert repository.get_unresolved_blocker_ids("experiment-1") == (blocker_id,)
+    assert repository.list_blocker_resolutions("experiment-1") == ()
+
+    passed = _report(
+        "report-3",
+        ValidationVerdict.APPROVED,
+        criterion_assessments=(
+            ImplementationCriterionAssessment(
+                criterion_id=ImplementationCriterionId.LEAKAGE,
+                status=CriterionAssessmentStatus.PASS,
+                evidence_refs=("pass-evidence",),
+            ),
+        ),
+        resolution_claims=(
+            CriterionResolutionClaim(
+                criterion_id=ImplementationCriterionId.LEAKAGE,
+                status=CriterionAssessmentStatus.PASS,
+                blocker_ids=(blocker_id,),
+                evidence_refs=("pass-evidence",),
+            ),
+        ),
+    )
+    repository.put_validation_report(passed, "run-1", _operation(passed), _subject(passed))
+    assert repository.get_unresolved_blocker_ids("experiment-1") == ()
+    assert len(repository.list_blocker_resolutions("experiment-1")) == 1
+
+    failed_again = _report(
+        "report-4",
+        ValidationVerdict.REJECTED,
+        criterion_assessments=(
+            ImplementationCriterionAssessment(
+                criterion_id=ImplementationCriterionId.LEAKAGE,
+                status=CriterionAssessmentStatus.FAIL,
+            ),
+        ),
+    )
+    repository.put_validation_report(
+        failed_again, "run-1", _operation(failed_again), _subject(failed_again)
+    )
+    assert repository.get_unresolved_blocker_ids("experiment-1") == (blocker_id,)
+
+    passed_again = _report(
+        "report-5",
+        ValidationVerdict.APPROVED,
+        criterion_assessments=(
+            ImplementationCriterionAssessment(
+                criterion_id=ImplementationCriterionId.LEAKAGE,
+                status=CriterionAssessmentStatus.PASS,
+                evidence_refs=("pass-again-evidence",),
+            ),
+        ),
+        resolution_claims=(
+            CriterionResolutionClaim(
+                criterion_id=ImplementationCriterionId.LEAKAGE,
+                status=CriterionAssessmentStatus.PASS,
+                blocker_ids=(blocker_id,),
+                evidence_refs=("pass-again-evidence",),
+            ),
+        ),
+    )
+    repository.put_validation_report(
+        passed_again, "run-1", _operation(passed_again), _subject(passed_again)
+    )
+    assert repository.get_unresolved_blocker_ids("experiment-1") == ()
+    assert len(repository.list_blocker_resolutions("experiment-1")) == 2
+
+
+def test_proposal_criterion_occurrence_is_not_an_implementation_repeat(tmp_path: Path) -> None:
+    repository = ApplicationRepository(tmp_path / "application.sqlite3")
+    repository.initialize()
+    proposal = _report(
+        "proposal-report",
+        ValidationVerdict.REJECTED,
+        stage=ValidationStage.PROPOSAL,
+        criterion_assessments=(
+            ImplementationCriterionAssessment(
+                criterion_id=ImplementationCriterionId.RESOURCE_FEASIBILITY,
+                status=CriterionAssessmentStatus.FAIL,
+            ),
+        ),
+    )
+    repository.put_validation_report(proposal, "run-1", _operation(proposal), _subject(proposal))
+
+    assert (
+        repository.get_criterion_repeat_count(
+            "experiment-1", ImplementationCriterionId.RESOURCE_FEASIBILITY
+        )
+        == 0
+    )
+    assert (
+        repository.get_criterion_repeat_count(
+            "experiment-1",
+            ImplementationCriterionId.RESOURCE_FEASIBILITY,
+            ValidationStage.PROPOSAL,
+        )
+        == 1
+    )
+
+
+def test_criterion_occurrence_conflict_rolls_back_report_replay(tmp_path: Path) -> None:
+    repository = ApplicationRepository(tmp_path / "application.sqlite3")
+    repository.initialize()
+    report = _report(
+        "report-1",
+        ValidationVerdict.REJECTED,
+        criterion_assessments=(
+            ImplementationCriterionAssessment(
+                criterion_id=ImplementationCriterionId.LEAKAGE,
+                status=CriterionAssessmentStatus.FAIL,
+            ),
+        ),
+    )
+    repository.put_validation_report(report, "run-1", _operation(report), _subject(report))
+    with pytest.raises(PersistenceConflictError):
+        repository.put_validation_report(
+            report.model_copy(
+                update={
+                    "criterion_assessments": (
+                        ImplementationCriterionAssessment(
+                            criterion_id=ImplementationCriterionId.LEAKAGE,
+                            status=CriterionAssessmentStatus.PARTIAL,
+                        ),
+                    )
+                }
+            ),
+            "run-1",
+            _operation(report),
+            _subject(report),
+        )
+    assert repository.get_criterion_repeat_count("experiment-1", "leakage") == 1
 
 
 def test_approval_is_blocked_by_history_until_explicit_resolution() -> None:

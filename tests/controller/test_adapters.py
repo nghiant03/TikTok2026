@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,6 +17,10 @@ from tiktok2026.adapters import (
     ScopedWorktreeRepository,
 )
 from tiktok2026.contracts import (
+    ArtifactRecord,
+    ArtifactRetention,
+    ExecutionRequest,
+    ExecutionResult,
     ExperimentSpec,
     Fidelity,
     ImplementationEdit,
@@ -174,7 +181,11 @@ def test_scoped_implementor_capability_applies_real_bounded_diff(tmp_path: Path)
     target.mkdir(parents=True)
     (target / "__init__.py").write_text("\n", encoding="utf-8")
     subprocess.run(("git", "add", "."), cwd=repository, check=True)
-    subprocess.run(("git", "commit", "-qm", "base"), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "-c", "commit.gpgsign=false", "commit", "-qm", "base"),
+        cwd=repository,
+        check=True,
+    )
 
     capability = ScopedWorktreeRepository(
         repository, ("src/tiktok2026/experiment",)
@@ -189,6 +200,7 @@ def test_scoped_implementor_capability_applies_real_bounded_diff(tmp_path: Path)
 
     assert capability.changed_files() == ("src/tiktok2026/experiment/change.py",)
     assert "change.py" in capability.diff()
+    assert capability.diff(5) == capability.diff()[:5]
     with pytest.raises(PermissionError, match="protected"):
         ScopedWorktreeRepository(repository, ("baseline",)).write("baseline/data.py", "blocked")
 
@@ -206,15 +218,26 @@ def test_scoped_implementor_reads_current_and_committed_base_source(tmp_path: Pa
     train = target / "train.py"
     train.write_text("BASE = 1\n", encoding="utf-8")
     subprocess.run(("git", "add", "."), cwd=repository, check=True)
-    subprocess.run(("git", "commit", "-qm", "base"), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "-c", "commit.gpgsign=false", "commit", "-qm", "base"),
+        cwd=repository,
+        check=True,
+    )
     train.write_text("CURRENT = 2\n", encoding="utf-8")
+    sibling = repository / "src/tiktok2026/experiment/helper.py"
+    sibling.write_text("HELPER = 3\n", encoding="utf-8")
 
     capability = ScopedWorktreeRepository(
-        repository, ("src/tiktok2026/experiment/train.py",)
+        repository,
+        ("src/tiktok2026/experiment/train.py",),
+        read_scopes=("src/tiktok2026/experiment",),
     )
 
     assert capability.read("src/tiktok2026/experiment/train.py") == "CURRENT = 2\n"
     assert capability.read_base("src/tiktok2026/experiment/train.py") == "BASE = 1\n"
+    assert capability.read("src/tiktok2026/experiment/helper.py") == "HELPER = 3\n"
+    with pytest.raises(PermissionError, match="approved repository scope"):
+        capability.write("src/tiktok2026/experiment/helper.py", "blocked\n")
 
 
 def test_scoped_implementor_prevalidates_all_edits(tmp_path: Path) -> None:
@@ -241,11 +264,37 @@ def test_scoped_implementor_prevalidates_all_edits(tmp_path: Path) -> None:
 def test_implementor_checks_are_controller_owned_names() -> None:
     assert IMPLEMENTOR_CHECK_NAMES == (
         "compile_entrypoint",
-        "import_entrypoint",
         "ruff_entrypoint",
         "pyright_entrypoint",
         "diff_check",
+        "contract_smoke",
     )
+
+
+def test_static_contract_check_never_executes_candidate_top_level_code(
+    tmp_path: Path,
+) -> None:
+    import tiktok2026.adapters as adapters
+
+    repository = tmp_path / "repo"
+    entrypoint = repository / "src/tiktok2026/experiment/train.py"
+    entrypoint.parent.mkdir(parents=True)
+    source = (Path(__file__).parents[2] / "src/tiktok2026/experiment/train.py").read_text(
+        encoding="utf-8"
+    )
+    marker = tmp_path / "executed"
+    entrypoint.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n" + source,
+        encoding="utf-8",
+    )
+    capability = ScopedWorktreeRepository(
+        repository, ("src/tiktok2026/experiment",)
+    )
+
+    output = capability.run_check(adapters._static_contract_check_command(), 30)
+
+    assert "static contract check passed" in output
+    assert not marker.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +471,155 @@ async def test_run_bound_executor_classifies_missing_output_contract(
     assert result.exit_code == 1
     assert result.failure_kind == FailureKind.MISSING_PATH
     assert result.failure_message == "execution did not produce prediction and checkpoint artifacts"
+
+
+def _training_artifact_fixture(
+    tmp_path: Path, view_sha256: str, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, ExecutionRequest, ExecutionResult, list[tuple[str, str | None]]]:
+    from tiktok2026.bootstrap import _RunBoundDockerExecutor
+    from tiktok2026.contracts import DatasetManifestIdentity
+
+    output = tmp_path / "output"
+    output.mkdir()
+    prediction_payload = {
+        "schema_version": "1",
+        "manifest_id": "manifest-1",
+        "manifest_sha256": "a" * 64,
+        "dataset_view_sha256": view_sha256,
+        "source_commit": "b" * 40,
+        "execution_id": "execution-1",
+        "split": "valid",
+        "rows": [],
+    }
+    prediction_bytes = (json.dumps(prediction_payload, separators=(",", ":")) + "\n").encode()
+    (output / "predictions.json").write_bytes(prediction_bytes)
+    prediction_sha256 = hashlib.sha256(prediction_bytes).hexdigest()
+    checkpoint_payload = {
+        "checkpoint_id": "checkpoint-1",
+        "data_manifest_id": "manifest-1",
+        "source_commit": "b" * 40,
+        "execution_id": "execution-1",
+        "prediction_artifact": "predictions.json",
+        "prediction_sha256": prediction_sha256,
+        "dataset_view_sha256": view_sha256,
+    }
+    (output / "checkpoint_bundle.json").write_text(
+        json.dumps(checkpoint_payload, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+
+    events: list[tuple[str, str | None]] = []
+
+    class FakeRepository:
+        def put_json(self, kind: str, record_id: str, payload_json: str) -> None:
+            del record_id
+            events.append((kind, payload_json))
+
+    class FakeRunStore:
+        def __init__(self, repository: object) -> None:
+            del repository
+
+        def get_dataset_manifest_identity(self) -> DatasetManifestIdentity:
+            return DatasetManifestIdentity(manifest_id="manifest-1", manifest_sha256="a" * 64)
+
+    class FakeArtifactStore:
+        def publish_bytes(
+            self,
+            run_id: str,
+            experiment_id: str,
+            kind: str,
+            filename: str,
+            content: bytes,
+            producer: str,
+            retention: object,
+        ) -> ArtifactRecord:
+            del run_id, experiment_id, producer, retention
+            events.append((kind, None))
+            path = tmp_path / f"published-{kind}-{filename}"
+            path.write_bytes(content)
+            return ArtifactRecord(
+                artifact_id=f"{kind}-artifact",
+                run_id="run-1",
+                experiment_id="exp-1",
+                kind=kind,
+                uri=path.as_uri(),
+                sha256=hashlib.sha256(content).hexdigest(),
+                size_bytes=len(content),
+                producer="test",
+                retention=ArtifactRetention.RUN,
+            )
+
+    import tiktok2026.bootstrap as bootstrap
+
+    monkeypatch.setattr(bootstrap, "RepositoryRunStore", FakeRunStore)
+    repository = FakeRepository()
+    executor = _RunBoundDockerExecutor(
+        repository=repository,
+        artifact_store=FakeArtifactStore(),
+        policy=object(),
+        dataset_provider=object(),
+    )
+    request = ExecutionRequest(
+        run_id="run-1",
+        execution_id="execution-1",
+        experiment_id="exp-1",
+        source_commit="b" * 40,
+        command=("python", "-m", "tiktok2026.experiment.train"),
+        image="image@sha256:" + "0" * 64,
+        source_path=tmp_path,
+        dataset_path=tmp_path,
+        dataset_manifest_sha256="a" * 64,
+        output_path=output,
+        timeout_seconds=60,
+        memory_bytes=1 << 20,
+        cpus=1.0,
+    )
+    result = ExecutionResult(
+        execution_id="execution-1",
+        experiment_id="exp-1",
+        source_commit="b" * 40,
+        command=request.command,
+        exit_code=0,
+        elapsed_seconds=0.1,
+        gpu_hours=0.0,
+        dataset_view_sha256=view_sha256,
+    )
+    return executor, request, result, events
+
+
+def test_training_registration_persists_authoritative_view_hash_and_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executor, request, result, events = _training_artifact_fixture(
+        tmp_path, "c" * 64, monkeypatch
+    )
+
+    registered = executor._register_training_artifacts(request, result)  # type: ignore[attr-defined]
+
+    assert registered.artifact_ids == ("prediction-artifact", "checkpoint-artifact")
+    assert [kind for kind, _payload in events] == [
+        "prediction",
+        "checkpoint",
+        "prediction_artifact",
+    ]
+    registration_payload = json.loads(events[-1][1] or "{}")
+    assert registration_payload["dataset_view_sha256"] == "c" * 64
+
+
+def test_training_registration_rejects_artifact_view_hash_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executor, request, result, _events = _training_artifact_fixture(
+        tmp_path, "c" * 64, monkeypatch
+    )
+    prediction_path = request.output_path / "predictions.json"
+    prediction_payload = json.loads(prediction_path.read_text(encoding="utf-8"))
+    prediction_payload["dataset_view_sha256"] = "d" * 64
+    prediction_path.write_text(
+        json.dumps(prediction_payload, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="provenance does not match execution"):
+        executor._register_training_artifacts(request, result)  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------

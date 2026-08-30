@@ -109,10 +109,10 @@ _RUN_CHECK_TOOL = _tool(
             "type": "string",
             "enum": [
                 "compile_entrypoint",
-                "import_entrypoint",
                 "ruff_entrypoint",
                 "pyright_entrypoint",
                 "diff_check",
+                "contract_smoke",
             ],
         },
     },
@@ -127,7 +127,6 @@ _VALIDATOR_CHECK_TOOL = _tool(
             "type": "string",
             "enum": [
                 "compile_entrypoint",
-                "import_entrypoint",
                 "ruff_entrypoint",
                 "pyright_entrypoint",
             ],
@@ -144,9 +143,29 @@ _VALIDATOR_CHECK_TOOL = _tool(
 _DIFF_TOOL = _tool(
     "diff",
     "Return the current git diff of all changes in the worktree.",
-    {},
+    {
+        "max_characters": {
+            "type": "integer",
+            "description": "Maximum characters to return (default 20000)",
+            "default": 20_000,
+        }
+    },
 )
 
+
+
+def _static_contract_check_command() -> tuple[str, ...]:
+    entrypoint = "src/tiktok2026/experiment/train.py"
+    code = (
+        "import sys; "
+        "from pathlib import Path; "
+        "sys.path.insert(0, 'src'); "
+        "from tiktok2026.policies.implementation import check_static_training_contract; "
+        f"diagnostic=check_static_training_contract("
+        f"Path({entrypoint!r}).read_text(encoding='utf-8')); "
+        "sys.exit(diagnostic) if diagnostic else print('static contract check passed')"
+    )
+    return ("python", "-c", code)
 
 def _implementation_check_commands() -> dict[str, tuple[str, ...]]:
     entrypoint = "src/tiktok2026/experiment/train.py"
@@ -160,15 +179,13 @@ def _implementation_check_commands() -> dict[str, tuple[str, ...]]:
                 f"compile(source, '{entrypoint}', 'exec')"
             ),
         ),
-        "import_entrypoint": (
-            "python",
-            "-c",
-            "import sys; sys.path.insert(0, 'src'); import tiktok2026.experiment.train",
-        ),
         "ruff_entrypoint": ("ruff", "check", entrypoint),
         "pyright_entrypoint": ("pyright", entrypoint),
     }
     commands["diff_check"] = ("git", "diff", "--check", "--", entrypoint)
+    # Compatibility name retained for callers, but this command only parses
+    # candidate source with a trusted AST checker.  It never imports train.py.
+    commands["contract_smoke"] = _static_contract_check_command()
     return commands
 
 
@@ -178,7 +195,29 @@ IMPLEMENTOR_CHECK_NAMES = tuple(_implementation_check_commands())
 def _validator_check_commands() -> dict[str, tuple[str, ...]]:
     commands = _implementation_check_commands()
     commands.pop("diff_check")
+    commands.pop("contract_smoke")
     return commands
+
+
+def _implementation_submission_failure(
+    repository: ScopedWorktreeRepository,
+    check_commands: Mapping[str, tuple[str, ...]],
+) -> str | None:
+    """Return a controller-owned submission diagnostic, if one exists."""
+    try:
+        changed_files = repository.changed_files()
+        if not changed_files or not repository.diff():
+            return "implementor produced no real diff"
+        for check in IMPLEMENTOR_CHECK_NAMES:
+            command = check_commands[check]
+            try:
+                repository.run_check(command, 30)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                label = "static contract check" if check == "contract_smoke" else check
+                return f"controller-owned check failed: {label}: {error}"
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return str(error)
+    return None
 
 
 def _submit_tool(model_type: type[ContractModel]) -> dict[str, object]:
@@ -233,9 +272,30 @@ class RoleSpecificAgentClient:
         self.capabilities = capabilities
         self.scoped_repository = scoped_repository
 
-    def bind_worktree(self, path: Path, allowed_scopes: tuple[str, ...]) -> None:
-        if self.role in {AgentRole.IMPLEMENTOR, AgentRole.VALIDATOR}:
-            self.scoped_repository = ScopedWorktreeRepository(path, allowed_scopes)
+    def bind_worktree(
+        self,
+        path: Path,
+        allowed_scopes: tuple[str, ...],
+        read_scopes: tuple[str, ...] | None = None,
+    ) -> None:
+        if self.role == AgentRole.IMPLEMENTOR:
+            self.scoped_repository = ScopedWorktreeRepository(
+                path, allowed_scopes, read_scopes=read_scopes
+            )
+        elif self.role == AgentRole.VALIDATOR:
+            # A validator may inspect the assigned source, but never receives a
+            # writable repository capability, even when an old caller passes
+            # implementation scopes to this method.
+            self.scoped_repository = ScopedWorktreeRepository(
+                path,
+                read_scopes=self._merge_scopes(allowed_scopes, read_scopes or ()),
+                write_scopes=(),
+                inspection_scopes=allowed_scopes,
+            )
+
+    @staticmethod
+    def _merge_scopes(*scope_sets: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(scope for scopes in scope_sets for scope in scopes))
 
     async def invoke(self, request: ContractModel) -> ContractModel:
         request_id = str(getattr(request, "request_id", ""))
@@ -423,8 +483,12 @@ class RoleSpecificAgentClient:
                     raise ValueError(f"unsupported implementor check: {check}")
                 return repository.run_check(command, 30)
             if tool_name == "diff":
-                return repository.diff()
+                max_chars = int(str(arguments.get("max_characters", "20000")))
+                return repository.diff(max_chars)
             return f"error: unknown tool {tool_name!r}"
+
+        def _guard(_submission: ImplementationSubmission) -> str | None:
+            return _implementation_submission_failure(repository, check_commands)
 
         result = await invoke_agentic(
             self._client,
@@ -437,31 +501,23 @@ class RoleSpecificAgentClient:
             _handle,
             max_turns=32,
             terminal_tool="submit_result",
+            terminal_guard=_guard,
         )
         if isinstance(result, AgentFailure):
             return result
         # The model has already written files via tools; skip re-applying edits.
-        # Verify a real diff exists.
-        changed_files = repository.changed_files()
-        if not changed_files or not repository.diff():
+        # Re-check after the loop: terminal guards are useful for repair, but
+        # the controller must retain the final acceptance authority.
+        diagnostic = _implementation_submission_failure(repository, check_commands)
+        if diagnostic is not None:
             return AgentFailure(
                 request_id=request_id,
                 role=self.role,
                 kind="policy",
-                message="implementor produced no real diff",
+                message=diagnostic,
                 repair_attempts=0,
             )
-        for check in IMPLEMENTOR_CHECK_NAMES:
-            try:
-                repository.run_check(check_commands[check], 30)
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
-                return AgentFailure(
-                    request_id=request_id,
-                    role=AgentRole.IMPLEMENTOR,
-                    kind="policy",
-                    message=f"controller-owned check failed: {check}: {error}",
-                    repair_attempts=0,
-                )
+        changed_files = repository.changed_files()
         return ImplementationResult(
             experiment_id=result.experiment_id,
             patch_artifact_id=result.patch_artifact_id,
@@ -510,7 +566,8 @@ class RoleSpecificAgentClient:
                     raise ValueError(f"unsupported validator check: {check}")
                 return repository.run_check(command, timeout)
             if tool_name == "diff":
-                return repository.diff()
+                max_chars = int(str(arguments.get("max_characters", "20000")))
+                return repository.diff(max_chars)
             return f"error: unknown tool {tool_name!r}"
 
         subject = request.model_dump(mode="json")
@@ -571,34 +628,66 @@ class OpenAICompatibleAgentClient(RoleSpecificAgentClient):
 class ScopedWorktreeRepository:
     """Least-privilege repository capability bound to one experiment worktree."""
 
-    def __init__(self, root: Path, allowed_scopes: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        root: Path,
+        allowed_scopes: tuple[str, ...] = (),
+        *,
+        read_scopes: tuple[str, ...] | None = None,
+        write_scopes: tuple[str, ...] | None = None,
+        inspection_scopes: tuple[str, ...] | None = None,
+    ) -> None:
         self.root = root.resolve()
-        self.allowed_scopes = tuple(scope.rstrip("/") for scope in allowed_scopes)
+        # ``allowed_scopes`` is the pre-split constructor argument.  Preserve
+        # its meaning for existing callers while allowing the controller to
+        # grant broader read access than write access.
+        effective_write_scopes = allowed_scopes if write_scopes is None else write_scopes
+        effective_read_scopes = (
+            effective_write_scopes
+            if read_scopes is None
+            else (*effective_write_scopes, *read_scopes)
+        )
+        self.write_scopes = self._normalize_scopes(effective_write_scopes)
+        self.read_scopes = self._normalize_scopes(effective_read_scopes)
+        effective_inspection_scopes = (
+            effective_write_scopes if inspection_scopes is None else inspection_scopes
+        )
+        self.inspection_scopes = self._normalize_scopes(effective_inspection_scopes)
+        # Compatibility for callers that inspect the old public attribute.
+        self.allowed_scopes = self.write_scopes
 
-    def _path(self, relative_path: str) -> Path:
+    @staticmethod
+    def _normalize_scopes(scopes: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(scope.rstrip("/") for scope in scopes)
+
+    def _path(
+        self, relative_path: str, scopes: tuple[str, ...], *, writable: bool = False
+    ) -> Path:
         path = (self.root / relative_path).resolve()
         try:
             relative = path.relative_to(self.root).as_posix()
         except ValueError as error:
             raise PermissionError("path escapes the assigned worktree") from error
-        if not any(
-            relative == scope or relative.startswith(scope + "/") for scope in self.allowed_scopes
-        ):
-            raise PermissionError(
-                f"path is outside the approved implementation scope: {relative}"
-            )
-        if relative.startswith("baseline/"):
+        if not any(relative == scope or relative.startswith(scope + "/") for scope in scopes):
+            raise PermissionError(f"path is outside the approved repository scope: {relative}")
+        if writable and relative.startswith("baseline/"):
             raise PermissionError("protected path cannot be modified")
         return path
 
+    def _write_path(self, relative_path: str) -> Path:
+        return self._path(relative_path, self.write_scopes, writable=True)
+
+    def _read_path(self, relative_path: str) -> Path:
+        return self._path(relative_path, self.read_scopes)
+
     def read(self, relative_path: str, max_characters: int = 20_000) -> str:
-        content = self._path(relative_path).read_text(encoding="utf-8")
+        content = self._read_path(relative_path).read_text(encoding="utf-8")
         if len(content) > max_characters:
             raise ValueError(f"scoped source exceeds {max_characters} characters")
         return content
 
     def read_base(self, relative_path: str, max_characters: int = 20_000) -> str:
-        path = self._path(relative_path)
+        path = self._read_path(relative_path)
         relative = path.relative_to(self.root).as_posix()
         content = subprocess.run(
             ("git", "show", f"HEAD:{relative}"),
@@ -620,7 +709,7 @@ class ScopedWorktreeRepository:
                 relative = path.relative_to(self.root).as_posix()
                 if not any(
                     relative == scope or relative.startswith(scope + "/")
-                    for scope in self.allowed_scopes
+                    for scope in self.read_scopes
                 ):
                     continue
                 if query in path.read_text(encoding="utf-8"):
@@ -632,17 +721,30 @@ class ScopedWorktreeRepository:
         return tuple(matches)
 
     def write(self, relative_path: str, content: str) -> None:
-        path = self._path(relative_path)
+        path = self._write_path(relative_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
     def apply_edits(self, edits: tuple[ImplementationEdit, ...]) -> None:
-        paths = tuple(self._path(edit.relative_path) for edit in edits)
+        paths = tuple(self._write_path(edit.relative_path) for edit in edits)
         for edit, path in zip(edits, paths, strict=True):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(edit.content, encoding="utf-8")
 
     def changed_files(self) -> tuple[str, ...]:
+        output = self._status_paths()
+        paths: list[str] = []
+        for path in output:
+            if path.startswith("baseline/"):
+                raise PermissionError("protected path cannot be modified")
+            if not any(
+                path == scope or path.startswith(scope + "/") for scope in self.write_scopes
+            ):
+                raise PermissionError(f"changed path is outside write scope: {path}")
+            paths.append(path)
+        return tuple(paths)
+
+    def _status_paths(self) -> tuple[str, ...]:
         output = subprocess.run(
             ["git", "status", "--porcelain", "--untracked-files=all"],
             cwd=self.root,
@@ -652,26 +754,42 @@ class ScopedWorktreeRepository:
         ).stdout.splitlines()
         paths: list[str] = []
         for line in output:
-            if len(line) < 4:
-                continue
-            path = line[3:]
-            if " -> " in path:
-                path = path.split(" -> ", 1)[1]
-            paths.append(path)
+            if len(line) >= 4:
+                path = line[3:]
+                if " -> " in path:
+                    path = path.split(" -> ", 1)[1]
+                paths.append(path)
         return tuple(paths)
 
-    def diff(self) -> str:
+    def diff(self, max_characters: int | None = None) -> str:
+        """Return the authoritative diff, optionally bounded for an agent tool."""
+        value = self._full_diff()
+        if max_characters is not None:
+            if max_characters < 0:
+                raise ValueError("maximum diff characters cannot be negative")
+            return value[:max_characters]
+        return value
+
+    def _full_diff(self) -> str:
+        if not self.inspection_scopes:
+            return ""
         tracked = subprocess.run(
-            ["git", "diff", "--", *self.allowed_scopes],
+            ["git", "diff", "--", *self.inspection_scopes],
             cwd=self.root,
             check=True,
             capture_output=True,
             text=True,
         ).stdout
         untracked_parts: list[str] = []
-        tracked_files = self._tracked_files()
-        for relative_path in self.changed_files():
-            path = self._path(relative_path)
+        tracked_files = self._tracked_files(self.inspection_scopes)
+        for relative_path in self._status_paths():
+            if not any(
+                relative_path == scope
+                or relative_path.startswith(scope + "/")
+                for scope in self.inspection_scopes
+            ):
+                continue
+            path = self._path(relative_path, self.inspection_scopes)
             if not path.is_file() or path.relative_to(self.root).as_posix() not in tracked_files:
                 result = subprocess.run(
                     ["git", "diff", "--no-index", "--no-ext-diff", "/dev/null", str(path)],
@@ -683,11 +801,11 @@ class ScopedWorktreeRepository:
                 untracked_parts.append(result.stdout)
         return tracked + "".join(untracked_parts)
 
-    def _tracked_files(self) -> tuple[str, ...]:
+    def _tracked_files(self, scopes: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(
             path
             for path in subprocess.run(
-                ["git", "ls-files", "--", *self.allowed_scopes],
+                ["git", "ls-files", "--", *scopes],
                 cwd=self.root,
                 check=True,
                 capture_output=True,

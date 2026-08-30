@@ -560,6 +560,92 @@ async def test_agentic_terminal_tool_validates_and_returns_result(
     assert "result rejected" in str(messages)
 
 
+async def test_agentic_terminal_tool_does_not_duplicate_response_schema(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    transport = RecordingTransport([_tool_calls_response("submit_result", {"message": "done"})])
+
+    result = await invoke_agentic(
+        OpenAICompatibleClient(ModelSettings(), transport),
+        AgentRole.IMPLEMENTOR,
+        "test-terminal-schema",
+        _FakeResult,
+        "system prompt",
+        {"request_id": "test-terminal-schema"},
+        [],
+        lambda _name, _arguments: "ok",
+        terminal_tool="submit_result",
+    )
+
+    assert isinstance(result, _FakeResult)
+    user_message = transport.requests[0][1]["messages"][1]  # type: ignore[index]
+    assert "response_json_schema" not in str(user_message)
+
+
+async def test_agentic_terminal_guard_rejects_then_accepts(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    transport = RecordingTransport(
+        [
+            _tool_calls_response("submit_result", {"message": "first"}),
+            _tool_calls_response("submit_result", {"message": "repaired"}),
+        ]
+    )
+    guard_calls = 0
+
+    def guard(_result: _FakeResult) -> str | None:
+        nonlocal guard_calls
+        guard_calls += 1
+        return "controller check failed" if guard_calls == 1 else None
+
+    result = await invoke_agentic(
+        OpenAICompatibleClient(ModelSettings(), transport),
+        AgentRole.IMPLEMENTOR,
+        "test-guard",
+        _FakeResult,
+        "system prompt",
+        {},
+        [],
+        lambda _name, _arguments: "ok",
+        terminal_tool="submit_result",
+        terminal_guard=guard,
+    )
+
+    assert isinstance(result, _FakeResult)
+    assert result.message == "repaired"
+    assert guard_calls == 2
+    assert "controller check failed" in str(transport.requests[1][1]["messages"])
+
+
+async def test_agentic_terminal_guard_exhaustion_returns_failure(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    transport = RecordingTransport(
+        [_tool_calls_response("submit_result", {"message": "still broken"}) for _ in range(2)]
+    )
+
+    result = await invoke_agentic(
+        OpenAICompatibleClient(ModelSettings(), transport),
+        AgentRole.IMPLEMENTOR,
+        "test-guard-exhaustion",
+        _FakeResult,
+        "system prompt",
+        {},
+        [],
+        lambda _name, _arguments: "ok",
+        max_turns=2,
+        terminal_tool="submit_result",
+        terminal_guard=lambda _result: "permanent controller failure",
+    )
+
+    assert isinstance(result, AgentFailure)
+    assert "exceeded 2 turns" in result.message
+    assert len(transport.requests) == 2
+
+
 async def test_validator_agentic_tools_are_read_only_and_can_run_checks(
     monkeypatch: MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -580,7 +666,11 @@ async def test_validator_agentic_tools_are_read_only_and_can_run_checks(
     train = target / "train.py"
     train.write_text("VALUE = 1\n", encoding="utf-8")
     subprocess.run(("git", "add", "."), cwd=repository, check=True)
-    subprocess.run(("git", "commit", "-qm", "base"), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "-c", "commit.gpgsign=false", "commit", "-qm", "base"),
+        cwd=repository,
+        check=True,
+    )
     train.write_text("VALUE = 2\n", encoding="utf-8")
 
     report = ValidationReport(
@@ -618,6 +708,10 @@ async def test_validator_agentic_tools_are_read_only_and_can_run_checks(
     )
     assert isinstance(result, ValidationReport)
     assert result.verdict == ValidationVerdict.APPROVED
+    assert validator.scoped_repository is not None
+    assert "VALUE = 2" in validator.scoped_repository.diff()
+    with raises(PermissionError):
+        validator.scoped_repository.write("src/tiktok2026/experiment/blocked.py", "blocked\n")
     first_tools = transport.requests[0][1]["tools"]
     tool_names = {
         tool["function"]["name"]  # type: ignore[index]

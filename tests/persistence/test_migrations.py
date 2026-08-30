@@ -3,7 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from tiktok2026.persistence.migrations import MigrationChecksumError, MigrationRunner
+from tiktok2026.persistence.migrations import (
+    MigrationChecksumError,
+    MigrationRunner,
+    application_migrations_path,
+)
 
 
 def test_changed_applied_migration_is_rejected(tmp_path: Path) -> None:
@@ -49,3 +53,26 @@ def test_failed_migration_rolls_back_all_schema_changes(tmp_path: Path) -> None:
         applied = connection.execute("SELECT version FROM schema_migrations").fetchall()
     assert table is None
     assert applied == []
+
+
+def test_criterion_history_migration_is_tracked_and_idempotent(tmp_path: Path) -> None:
+    database = tmp_path / "app.sqlite3"
+    runner = MigrationRunner(database, application_migrations_path())
+    runner.apply()
+    runner.apply()
+
+    with sqlite3.connect(database) as connection:
+        applied = connection.execute(
+            "SELECT version FROM schema_migrations WHERE version = 8"
+        ).fetchall()
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert applied == [(8,)]
+    assert {
+        "authority_validation_criterion_occurrences",
+        "authority_validation_resolution_claims",
+    } <= tables

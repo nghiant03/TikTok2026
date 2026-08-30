@@ -23,6 +23,7 @@ from tiktok2026.contracts import (
     Fidelity,
     ImplementationEdit,
     ImplementationRequest,
+    ImplementationResourceEstimate,
     ImplementationResult,
     ImplementationSubmission,
     OrchestrationDecision,
@@ -196,6 +197,12 @@ async def test_proposal_request_repairs_evidence_request(monkeypatch: MonkeyPatc
         expected_signal="test signal",
         implementation_scope=("src/tiktok2026/experiment",),
         fidelity=Fidelity.SMOKE,
+        implementation_resource_estimate=ImplementationResourceEstimate(
+            predicted_wall_seconds=10.0,
+            predicted_peak_memory_bytes=100,
+            predicted_artifact_bytes=100,
+            dataset_passes=1,
+        ),
         success_criteria="test success",
         failure_criteria="test failure",
     )
@@ -237,30 +244,19 @@ async def test_proposal_request_repairs_evidence_request(monkeypatch: MonkeyPatc
     assert len(transport.requests) == 2
 
 
-async def test_production_implementor_repairs_empty_edits(monkeypatch: MonkeyPatch) -> None:
+async def test_production_implementor_uses_repository_diff_as_authority(
+    monkeypatch: MonkeyPatch,
+) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
-    invalid = ImplementationResult(
-        experiment_id="exp-1",
-        patch_artifact_id="inline-patch",
-        changed_files=(),
-    ).model_dump(mode="json")
     valid = ImplementationResult(
         experiment_id="exp-1",
         patch_artifact_id="inline-patch",
-        changed_files=("src/tiktok2026/experiment/model.py",),
-        edits=(
-            ImplementationEdit(
-                relative_path="src/tiktok2026/experiment/model.py", content="VALUE = 1\n"
-            ),
-        ),
+        changed_files=(),
+        edits=(),
     ).model_dump(mode="json")
-    transport = RecordingTransport(
-        [
-            {"choices": [{"message": {"content": json.dumps(invalid)}}]},
-            {"choices": [{"message": {"content": json.dumps(valid)}}]},
-        ]
-    )
+    transport = RecordingTransport([{"choices": [{"message": {"content": json.dumps(valid)}}]}])
     repository = ScopedRepository()
+    repository.write("src/tiktok2026/experiment/model.py", "VALUE = 1\n")
     agent = RoleSpecificAgentClient(
         OpenAICompatibleClient(ModelSettings(), transport),
         AgentRole.IMPLEMENTOR,
@@ -291,7 +287,7 @@ async def test_production_implementor_repairs_empty_edits(monkeypatch: MonkeyPat
 
     assert isinstance(result, ImplementationResult)
     assert result.changed_files == ("src/tiktok2026/experiment/model.py",)
-    assert len(transport.requests) == 2
+    assert len(transport.requests) == 1
 
 
 def _git_repo_with_entrypoint(tmp_path: Path) -> Path:
@@ -310,7 +306,11 @@ def _git_repo_with_entrypoint(tmp_path: Path) -> Path:
     (package / "__init__.py").write_text("\n", encoding="utf-8")
     (package / "train.py").write_text("VALUE = 1\n", encoding="utf-8")
     subprocess.run(("git", "add", "."), cwd=repository, check=True)
-    subprocess.run(("git", "commit", "-qm", "base"), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "-c", "commit.gpgsign=false", "commit", "-qm", "base"),
+        cwd=repository,
+        check=True,
+    )
     return repository
 
 
@@ -442,7 +442,141 @@ async def test_agentic_implementor_check_failure_blocks_submission(
     assert isinstance(result, AgentFailure)
     assert result.role == AgentRole.IMPLEMENTOR
     assert failed_check in result.message
-    assert calls == list(IMPLEMENTOR_CHECK_NAMES[:3])
+    failed_index = IMPLEMENTOR_CHECK_NAMES.index(failed_check)
+    assert calls == list(IMPLEMENTOR_CHECK_NAMES[: failed_index + 1])
+
+
+async def test_agentic_implementor_repairs_after_guarded_submission(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    repository = _git_repo_with_entrypoint(tmp_path)
+    submission = ImplementationSubmission(
+        experiment_id="exp-1",
+        patch_artifact_id="patch-1",
+        changed_files=("src/tiktok2026/experiment/train.py",),
+        edits=(
+            ImplementationEdit(
+                relative_path="src/tiktok2026/experiment/train.py", content="VALUE = 2\n"
+            ),
+        ),
+    ).model_dump(mode="json")
+    transport = RecordingTransport(
+        [
+            {"choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "write-1", "type": "function", "function": {
+                    "name": "write_file", "arguments": json.dumps({
+                        "path": "src/tiktok2026/experiment/train.py", "content": "def broken(:\n"
+                    })
+                }}
+            ]}}]},
+            {"choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "submit-1", "type": "function", "function": {
+                    "name": "submit_result", "arguments": json.dumps(submission)
+                }}
+            ]}}]},
+            {"choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "write-2", "type": "function", "function": {
+                    "name": "write_file", "arguments": json.dumps({
+                        "path": "src/tiktok2026/experiment/train.py", "content": "VALUE = 2\n"
+                    })
+                }}
+            ]}}]},
+            {"choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "submit-2", "type": "function", "function": {
+                    "name": "submit_result", "arguments": json.dumps(submission)
+                }}
+            ]}}]},
+        ]
+    )
+    checks: list[str] = []
+
+    def run_check(
+        _repository: ScopedWorktreeRepository,
+        command: tuple[str, ...],
+        timeout_seconds: int,
+    ) -> str:
+        del timeout_seconds
+        checks.append(command[0] if command[0] != "git" else command[1])
+        if len(checks) == 1:
+            raise ValueError("synthetic compile failure")
+        return "passed"
+
+    monkeypatch.setattr(ScopedWorktreeRepository, "run_check", run_check)
+    agent = RoleSpecificAgentClient(
+        OpenAICompatibleClient(ModelSettings(), transport),
+        AgentRole.IMPLEMENTOR,
+        "implement",
+        scoped_repository=ScopedWorktreeRepository(
+            repository, ("src/tiktok2026/experiment",)
+        ),
+    )
+
+    result = await agent.invoke(_implementation_request())
+
+    assert isinstance(result, ImplementationResult)
+    assert len(transport.requests) == 4
+    assert "compile_entrypoint" in str(transport.requests[2][1]["messages"])
+    assert len(checks) == 1 + len(IMPLEMENTOR_CHECK_NAMES) * 2
+
+
+async def test_agentic_implementor_permanent_guard_failure_exhausts_loop(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    repository = _git_repo_with_entrypoint(tmp_path)
+    submission = ImplementationSubmission(
+        experiment_id="exp-1",
+        patch_artifact_id="patch-1",
+        changed_files=("src/tiktok2026/experiment/train.py",),
+        edits=(
+            ImplementationEdit(
+                relative_path="src/tiktok2026/experiment/train.py", content="VALUE = 2\n"
+            ),
+        ),
+    ).model_dump(mode="json")
+    transport = RecordingTransport(
+        [
+            {"choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "write-1", "type": "function", "function": {
+                    "name": "write_file", "arguments": json.dumps({
+                        "path": "src/tiktok2026/experiment/train.py", "content": "VALUE = 2\n"
+                    })
+                }}
+            ]}}]},
+            *[
+                {"choices": [{"message": {"content": None, "tool_calls": [
+                    {"id": f"submit-{index}", "type": "function", "function": {
+                        "name": "submit_result", "arguments": json.dumps(submission)
+                    }}
+                ]}}]}
+                for index in range(31)
+            ],
+        ]
+    )
+
+    def run_check(
+        _repository: ScopedWorktreeRepository,
+        _command: tuple[str, ...],
+        _timeout_seconds: int,
+    ) -> str:
+        raise ValueError("permanent check failure")
+
+    monkeypatch.setattr(ScopedWorktreeRepository, "run_check", run_check)
+    agent = RoleSpecificAgentClient(
+        OpenAICompatibleClient(ModelSettings(), transport),
+        AgentRole.IMPLEMENTOR,
+        "implement",
+        scoped_repository=ScopedWorktreeRepository(
+            repository, ("src/tiktok2026/experiment",)
+        ),
+    )
+
+    result = await agent.invoke(_implementation_request())
+
+    assert isinstance(result, AgentFailure)
+    assert "exceeded 32 turns" in result.message
+    assert len(transport.requests) == 32
 
 
 async def test_validator_returns_read_only_report(monkeypatch: MonkeyPatch) -> None:

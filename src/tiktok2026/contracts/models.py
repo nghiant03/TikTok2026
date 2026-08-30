@@ -7,7 +7,7 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{7,64}$")]
@@ -66,13 +66,88 @@ class ValidationVerdict(StrEnum):
     INCONCLUSIVE = "inconclusive"
 
 
-def validation_blocker_id(report_id: str, stage: ValidationStage, text: str) -> str:
-    """Return the stable identity used when importing a legacy text blocker."""
-    material = json.dumps(
-        {"report_id": report_id, "stage": stage.value, "text": text},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+class ImplementationCriterionId(StrEnum):
+    """Stable IDs for independently assessable implementation checks.
+
+    The first five values are the original broad criteria.  The remaining values
+    split out recurring contract failures so that a repair can target one
+    independently verifiable concern without changing the older spellings.
+    """
+
+    SCIENTIFIC_FIDELITY = "scientific_fidelity"
+    CHANGED_PATH_SCOPE = "changed_path_scope"
+    LEAKAGE = "leakage"
+    UNRELATED_CHANGES = "unrelated_changes"
+    EXECUTION_WIRING = "execution_wiring"
+    STATIC_CHECKS = "static_checks"
+    CLI_ARTIFACT_CONTRACT = "cli_artifact_contract"
+    PROVENANCE = "provenance"
+    STRICT_JSON_TYPES = "strict_json_types"
+    ROW_COVERAGE_ORDER = "row_coverage_order"
+    DETERMINISTIC_RANKING_TIE_POLICY = "deterministic_ranking_tie_policy"
+    EXPERIMENT_SPECIFIC_RECONSTRUCTION = "experiment_specific_reconstruction"
+    RESOURCE_FEASIBILITY = "resource_feasibility"
+
+    # These spellings are useful to older clients without adding new criteria.
+    SCOPE = "changed_path_scope"
+    PATH_SCOPE = "changed_path_scope"
+    LEAKAGE_SAFETY = "leakage"
+    LEAKAGE_FREE = "leakage"
+    EXECUTION_ENTRYPOINT = "execution_wiring"
+    ENTRYPOINT_WIRING = "execution_wiring"
+
+
+ImplementationCriterionType = ImplementationCriterionId
+
+# This is intentionally bounded and controller-owned.  Requests may narrow the
+# set only when the controller has an explicit reason; an omitted field must not
+# silently produce an unvalidated implementation.
+DEFAULT_IMPLEMENTATION_CRITERIA: tuple[ImplementationCriterionId, ...] = tuple(
+    ImplementationCriterionId(member.value) for member in ImplementationCriterionId
+)
+IMPLEMENTATION_CRITERIA = DEFAULT_IMPLEMENTATION_CRITERIA
+
+
+class CriterionAssessmentStatus(StrEnum):
+    PASS = "pass"
+    PARTIAL = "partial"
+    FAIL = "fail"
+    NOT_APPLICABLE = "not_applicable"
+
+
+ImplementationCriterionStatus = CriterionAssessmentStatus
+
+
+def validation_blocker_id(
+    report_id: str,
+    stage: ValidationStage,
+    text: str,
+    criterion_id: ImplementationCriterionId | str | None = None,
+    experiment_id: str | None = None,
+) -> str:
+    """Return a stable blocker identity, using the legacy text form when needed.
+
+    Reports produced before criterion identities existed remain addressable by their
+    report/stage/text identity.  New criterion-bearing blockers intentionally omit
+    the report and text so that the same failed criterion remains addressable across
+    validation reports.
+    """
+    if criterion_id is not None:
+        material = json.dumps(
+            {
+                "experiment_id": experiment_id or report_id,
+                "stage": stage.value,
+                "criterion_id": str(criterion_id),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    else:
+        material = json.dumps(
+            {"report_id": report_id, "stage": stage.value, "text": text},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     return f"blocker-{hashlib.sha256(material.encode()).hexdigest()}"
 
 
@@ -161,6 +236,17 @@ class Hypothesis(ContractModel):
     evidence_refs: tuple[str, ...] = ()
 
 
+class ImplementationResourceEstimate(ContractModel):
+    """Technique-neutral resource estimates supplied with an implementation proposal."""
+
+    predicted_wall_seconds: Annotated[float, Field(ge=0.0)]
+    predicted_peak_memory_bytes: Annotated[int, Field(ge=0)]
+    predicted_artifact_bytes: Annotated[int, Field(ge=0)]
+    dataset_passes: Annotated[int, Field(ge=0, le=16)]
+    high_cardinality_nested_scans: bool = False
+    duplicate_full_materializations: bool = False
+
+
 class ExperimentSpec(ContractModel):
     schema_version: Literal["1"] = "1"
     experiment_id: str
@@ -174,6 +260,7 @@ class ExperimentSpec(ContractModel):
     implementation_scope: Annotated[tuple[str, ...], Field(min_length=1)]
     fidelity: Fidelity
     predicted_gpu_hours: Annotated[float, Field(ge=0.0)] = 0.0
+    implementation_resource_estimate: ImplementationResourceEstimate | None = None
     success_criteria: str
     failure_criteria: str
     leakage_risks: tuple[str, ...] = ()
@@ -216,15 +303,35 @@ class ResearchDecision(ContractModel):
     message: str
     evidence_refs: tuple[str, ...] = ()
 
+    @model_validator(mode="after")
+    def validate_proposal(self) -> ResearchDecision:
+        if self.kind == "proposal":
+            if self.experiment_spec is None:
+                raise ValueError("proposal decisions require experiment_spec")
+            if self.experiment_spec.implementation_resource_estimate is None:
+                raise ValueError("proposal decisions require implementation_resource_estimate")
+        return self
+
 
 class ExperimentProposalDecision(ContractModel):
-    """Research response required when the controller requests an experiment."""
+    """Research response required when the controller requests an experiment.
+
+    Unlike standalone ``ExperimentSpec`` records, a newly proposed experiment
+    must include a resource estimate so the controller can assess feasibility
+    before accepting it.
+    """
 
     request_id: str
     kind: Literal["proposal"]
     experiment_spec: ExperimentSpec
     message: str
     evidence_refs: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def require_resource_estimate(self) -> ExperimentProposalDecision:
+        if self.experiment_spec.implementation_resource_estimate is None:
+            raise ValueError("experiment proposals require implementation_resource_estimate")
+        return self
 
 
 class OrchestrationDecision(ContractModel):
@@ -250,6 +357,47 @@ class ImplementationEdit(ContractModel):
     content: str
 
 
+class ImplementationCriterion(ContractModel):
+    """One controller-selected atomic implementation requirement."""
+
+    criterion_id: ImplementationCriterionId
+    description: str = ""
+
+
+class ImplementationCriterionAssessment(ContractModel):
+    """Typed validator assessment of one requested implementation criterion."""
+
+    criterion_id: ImplementationCriterionId
+    status: CriterionAssessmentStatus
+    evidence_refs: tuple[str, ...] = ()
+    details: str = ""
+
+
+class CriterionResolutionClaim(ContractModel):
+    """A possibly partial, evidence-backed resolution of a criterion's blockers."""
+
+    criterion_id: ImplementationCriterionId
+    status: CriterionAssessmentStatus
+    blocker_ids: tuple[str, ...] = ()
+    # Singular spelling keeps hand-authored/early agent payloads convenient.
+    blocker_id: str | None = None
+    evidence_refs: tuple[str, ...] = ()
+    claim: str = ""
+
+    @model_validator(mode="after")
+    def normalize_blocker_ids(self) -> CriterionResolutionClaim:
+        if self.status == CriterionAssessmentStatus.FAIL:
+            raise ValueError("failed criteria cannot claim resolution")
+        if self.status in (
+            CriterionAssessmentStatus.PASS,
+            CriterionAssessmentStatus.PARTIAL,
+        ) and not self.evidence_refs:
+            raise ValueError("pass or partial resolution claims require evidence_refs")
+        if self.blocker_id is not None and self.blocker_id not in self.blocker_ids:
+            return self.model_copy(update={"blocker_ids": (self.blocker_id, *self.blocker_ids)})
+        return self
+
+
 class ImplementationResult(ContractModel):
     schema_version: Literal["1"] = "1"
     experiment_id: str
@@ -263,13 +411,13 @@ class ImplementationResult(ContractModel):
 
 
 class ImplementationSubmission(ContractModel):
-    """Production implementor response requiring at least one bounded edit."""
+    """Production implementor response; edits may be metadata-only."""
 
     schema_version: Literal["1"] = "1"
     experiment_id: str
     patch_artifact_id: str
     changed_files: tuple[str, ...]
-    edits: Annotated[tuple[ImplementationEdit, ...], Field(min_length=1)]
+    edits: tuple[ImplementationEdit, ...] = ()
     changed_symbols: tuple[str, ...] = ()
     checks: tuple[str, ...] = ()
     assumptions: tuple[str, ...] = ()
@@ -299,6 +447,12 @@ class ImplementationRequest(ContractModel):
     experiment_id: str
     experiment_spec: ExperimentSpec
     allowed_scopes: tuple[str, ...]
+    # Write scopes and controller-derived read scopes are intentionally separate.
+    read_scopes: tuple[str, ...] = ()
+    implementation_criteria: tuple[ImplementationCriterionId, ...] = (
+        DEFAULT_IMPLEMENTATION_CRITERIA
+    )
+    criterion_requirements: tuple[ImplementationCriterion, ...] = ()
     capabilities: tuple[str, ...] = ()
     repair_feedback: str | None = None
     unresolved_blocker_ids: tuple[str, ...] = ()
@@ -316,6 +470,24 @@ class ImplementationRequest(ContractModel):
     execution_cpus: Annotated[float, Field(gt=0)] = 1.0
     execution_gpu_count: Annotated[int, Field(ge=0)] = 0
     prior_diff_sha256: Sha256 | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_read_scope_alias(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        data = dict(cast(dict[str, object], value))
+        if "read_scopes" not in data and "controller_read_scopes" in data:
+            data["read_scopes"] = data.pop("controller_read_scopes")
+        return data
+
+    @property
+    def controller_read_scopes(self) -> tuple[str, ...]:
+        return self.read_scopes
+
+    @property
+    def required_implementation_criteria(self) -> tuple[ImplementationCriterionId, ...]:
+        return self.implementation_criteria
 
 
 class ImplementationValidationAuthority(ContractModel):
@@ -354,6 +526,7 @@ class ValidationBlockerContext(ContractModel):
 
     blocker_id: str
     text: Annotated[str, Field(max_length=2_000)]
+    criterion_id: ImplementationCriterionId | None = None
     evidence_refs: Annotated[
         tuple[Annotated[str, Field(max_length=256)], ...], Field(max_length=8)
     ] = ()
@@ -379,6 +552,39 @@ class ValidationBlocker(ContractModel):
     text: str
     report_id: str = ""
     evidence_refs: tuple[str, ...] = ()
+    criterion_id: ImplementationCriterionId | None = None
+    _supplied_blocker_id: str | None = PrivateAttr(default=None)
+
+    def __init__(self, **data: object) -> None:
+        supplied_id = data.get("blocker_id")
+        super().__init__(**data)
+        if isinstance(supplied_id, str):
+            object.__setattr__(self, "_supplied_blocker_id", supplied_id)
+
+    @property
+    def supplied_blocker_id(self) -> str | None:
+        """Return an input ID retained for report safety checks."""
+        return self._supplied_blocker_id
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_criterion_identity(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        data = dict(cast(dict[str, object], value))
+        criterion = data.get("criterion_id")
+        if criterion is None:
+            return data
+        raw_stage = data.get("stage", ValidationStage.RESULT)
+        stage = raw_stage if isinstance(raw_stage, ValidationStage) else ValidationStage(raw_stage)
+        data["blocker_id"] = validation_blocker_id(
+            str(data.get("report_id", "")),
+            stage,
+            str(data.get("text", data.get("message", ""))),
+            criterion_id=str(criterion),
+            experiment_id=str(data.get("experiment_id", "")),
+        )
+        return data
 
     def __str__(self) -> str:
         # This keeps diagnostics produced by older callers readable while the
@@ -403,6 +609,8 @@ class BlockerResolution(ContractModel):
     experiment_id: str
     evidence_refs: Annotated[tuple[str, ...], Field(min_length=1)]
     validation_operation_id: str = ""
+    criterion_id: ImplementationCriterionId | None = None
+    status: CriterionAssessmentStatus | None = None
 
 
 class ValidationReport(ContractModel):
@@ -412,6 +620,8 @@ class ValidationReport(ContractModel):
     stage: ValidationStage
     verdict: ValidationVerdict
     blockers: tuple[ValidationBlocker, ...] = ()
+    criterion_assessments: tuple[ImplementationCriterionAssessment, ...] = ()
+    resolution_claims: tuple[CriterionResolutionClaim, ...] = ()
     resolves_blocker_ids: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
@@ -426,12 +636,30 @@ class ValidationReport(ContractModel):
         if not isinstance(value, dict):
             return value
         data = dict(cast(dict[str, object], value))
+        if "resolution_claims" not in data and "criterion_resolution_claims" in data:
+            data["resolution_claims"] = data.pop("criterion_resolution_claims")
         report_id = str(data.get("report_id", ""))
         experiment_id = str(data.get("experiment_id", ""))
         report_evidence = tuple(cast(tuple[str, ...] | list[str], data.get("evidence_refs", ())))
         raw_stage = data.get("stage", ValidationStage.RESULT)
         stage = raw_stage if isinstance(raw_stage, ValidationStage) else ValidationStage(raw_stage)
+        resolution_ids = set(
+            cast(tuple[str, ...] | list[str], data.get("resolves_blocker_ids", ()))
+        )
+        raw_claims = data.get("resolution_claims", ())
+        for raw_claim in cast(tuple[object, ...] | list[object], raw_claims):
+            if isinstance(raw_claim, CriterionResolutionClaim):
+                resolution_ids.update(raw_claim.blocker_ids)
+            elif isinstance(raw_claim, dict):
+                claim = cast(dict[str, object], raw_claim)
+                resolution_ids.update(
+                    cast(tuple[str, ...] | list[str], claim.get("blocker_ids", ()))
+                )
+                blocker_id = claim.get("blocker_id")
+                if isinstance(blocker_id, str):
+                    resolution_ids.add(blocker_id)
         normalized: list[object] = []
+        supplied_ids: set[str] = set()
         for raw in cast(tuple[object, ...] | list[object], data.get("blockers", ())):
             if isinstance(raw, str):
                 normalized.append(
@@ -445,27 +673,61 @@ class ValidationReport(ContractModel):
                     }
                 )
             elif isinstance(raw, ValidationBlocker):
+                supplied_id = raw.supplied_blocker_id
+                if supplied_id is not None:
+                    supplied_ids.add(supplied_id)
                 blocker = raw.model_dump(mode="json")
                 blocker["report_id"] = blocker.get("report_id") or report_id
                 blocker["evidence_refs"] = blocker.get("evidence_refs") or report_evidence
+                criterion = blocker.get("criterion_id")
+                if criterion is not None:
+                    blocker["blocker_id"] = validation_blocker_id(
+                        report_id,
+                        stage,
+                        str(blocker.get("text", "")),
+                        criterion_id=str(criterion),
+                        experiment_id=experiment_id,
+                    )
                 normalized.append(blocker)
             elif isinstance(raw, dict):
                 blocker = dict(cast(dict[str, object], raw))
+                supplied_id = blocker.get("blocker_id")
+                if isinstance(supplied_id, str):
+                    supplied_ids.add(supplied_id)
                 text = str(blocker.get("text", blocker.get("message", "")))
                 blocker["text"] = text
-                blocker.setdefault("blocker_id", validation_blocker_id(report_id, stage, text))
                 blocker.setdefault("experiment_id", experiment_id)
                 blocker.setdefault("stage", stage)
                 blocker["report_id"] = blocker.get("report_id") or report_id
                 blocker["evidence_refs"] = blocker.get("evidence_refs") or report_evidence
+                criterion = blocker.get("criterion_id")
+                if criterion is not None:
+                    # Criterion identity is authoritative, but the supplied ID
+                    # still participates in the introduced-blocker safety check.
+                    blocker["blocker_id"] = validation_blocker_id(
+                        report_id,
+                        stage,
+                        text,
+                        criterion_id=str(criterion),
+                        experiment_id=experiment_id,
+                    )
+                else:
+                    blocker.setdefault("blocker_id", validation_blocker_id(report_id, stage, text))
                 normalized.append(blocker)
             else:
                 normalized.append(raw)
+        if supplied_ids & resolution_ids:
+            raise ValueError("a validation report cannot resolve a blocker it introduces")
         data["blockers"] = tuple(normalized)
         return data
 
     @model_validator(mode="after")
     def validate_blockers(self) -> ValidationReport:
+        criterion_ids = tuple(
+            assessment.criterion_id for assessment in self.criterion_assessments
+        )
+        if len(set(criterion_ids)) != len(criterion_ids):
+            raise ValueError("criterion_assessments must contain unique criterion IDs")
         if len(set(self.resolves_blocker_ids)) != len(self.resolves_blocker_ids):
             raise ValueError("resolves_blocker_ids must be unique")
         if self.resolves_blocker_ids and self.verdict != ValidationVerdict.APPROVED:
@@ -477,9 +739,26 @@ class ValidationReport(ContractModel):
                 or blocker.stage != self.stage
             ):
                 raise ValueError("validation blocker identity does not match its report")
-        if set(self.resolves_blocker_ids) & {blocker.blocker_id for blocker in self.blockers}:
+        claimed_ids = tuple(
+            blocker_id
+            for claim in self.resolution_claims
+            for blocker_id in claim.blocker_ids
+        )
+        all_resolved_ids = (*self.resolves_blocker_ids, *claimed_ids)
+        if len(set(all_resolved_ids)) != len(all_resolved_ids):
+            raise ValueError("resolution blocker IDs must be unique")
+        if self.resolution_claims and self.verdict not in (
+            ValidationVerdict.APPROVED,
+            ValidationVerdict.REPAIRABLE,
+        ):
+            raise ValueError("only approved or repairable reports may claim resolutions")
+        if set(all_resolved_ids) & {blocker.blocker_id for blocker in self.blockers}:
             raise ValueError("a validation report cannot resolve a blocker it introduces")
         return self
+
+    @property
+    def criterion_resolution_claims(self) -> tuple[CriterionResolutionClaim, ...]:
+        return self.resolution_claims
 
 
 class DatasetViewRow(ContractModel):
@@ -639,6 +918,7 @@ class PredictionArtifactRegistration(ContractModel):
     execution_id: str
     dataset_manifest_id: str
     dataset_manifest_sha256: Sha256
+    dataset_view_sha256: Sha256 | None = None
     split: Literal["valid", "test"]
 
 
@@ -659,6 +939,133 @@ class PredictionRow(ContractModel):
     item_id: str
     score: float
     row_identity: tuple[str, ...]
+
+
+class PredictionRowRequirement(ContractModel):
+    """Schema and ordering requirements for rows in the prediction envelope."""
+
+    row_type: Literal["prediction"] = "prediction"
+    required_fields: tuple[
+        Literal["row_id", "row_identity", "user_id", "item_id", "score"], ...
+    ] = ("row_id", "row_identity", "user_id", "item_id", "score")
+    order: Literal["exact_valid_manifest_rows_in_manifest_order"] = (
+        "exact_valid_manifest_rows_in_manifest_order"
+    )
+
+
+class CheckpointRowRequirement(ContractModel):
+    """Required metadata fields for the single checkpoint bundle envelope.
+
+    ``dataset_view_sha256`` is a required envelope key.  Its value is nullable
+    for legacy/non-smoke records; smoke execution requires a non-null digest.
+    """
+
+    row_type: Literal["checkpoint"] = "checkpoint"
+    required_fields: tuple[
+        Literal[
+            "checkpoint_id",
+            "data_manifest_id",
+            "seed",
+            "source_commit",
+            "execution_id",
+            "fidelity",
+            "prediction_artifact_id",
+            "prediction_artifact",
+            "prediction_sha256",
+            "dataset_view_sha256",
+        ],
+        ...,
+    ] = (
+        "checkpoint_id",
+        "data_manifest_id",
+        "seed",
+        "source_commit",
+        "execution_id",
+        "fidelity",
+        "prediction_artifact_id",
+        "prediction_artifact",
+        "prediction_sha256",
+        "dataset_view_sha256",
+    )
+
+
+class PredictionArtifactEnvelope(ContractModel):
+    """Typed requirements for the JSON prediction artifact envelope.
+
+    ``dataset_view_sha256`` is a required envelope key.  Its value is nullable
+    for legacy/non-smoke records; smoke execution requires a non-null digest.
+    """
+
+    artifact_name: Literal["predictions.json"] = "predictions.json"
+    schema_version: Literal["1"] = "1"
+    required_fields: tuple[
+        Literal[
+            "schema_version",
+            "manifest_id",
+            "manifest_sha256",
+            "dataset_view_sha256",
+            "source_commit",
+            "execution_id",
+            "split",
+            "rows",
+        ],
+        ...,
+    ] = (
+        "schema_version",
+        "manifest_id",
+        "manifest_sha256",
+        "dataset_view_sha256",
+        "source_commit",
+        "execution_id",
+        "split",
+        "rows",
+    )
+    row_requirements: PredictionRowRequirement = PredictionRowRequirement()
+
+
+class CheckpointArtifactEnvelope(ContractModel):
+    """Typed requirements for the JSON checkpoint bundle envelope.
+
+    ``dataset_view_sha256`` is a required envelope key.  Its value is nullable
+    for legacy/non-smoke records; smoke execution requires a non-null digest.
+    """
+
+    artifact_name: Literal["checkpoint_bundle.json"] = "checkpoint_bundle.json"
+    schema_version: Literal["1"] = "1"
+    required_fields: tuple[
+        Literal[
+            "schema_version",
+            "checkpoint_id",
+            "data_manifest_id",
+            "seed",
+            "source_commit",
+            "execution_id",
+            "fidelity",
+            "prediction_artifact_id",
+            "prediction_artifact",
+            "prediction_sha256",
+            "dataset_view_sha256",
+        ],
+        ...,
+    ] = (
+        "schema_version",
+        "checkpoint_id",
+        "data_manifest_id",
+        "seed",
+        "source_commit",
+        "execution_id",
+        "fidelity",
+        "prediction_artifact_id",
+        "prediction_artifact",
+        "prediction_sha256",
+        "dataset_view_sha256",
+    )
+    row_requirements: CheckpointRowRequirement = CheckpointRowRequirement()
+
+
+# Requirement is the more explicit spelling used by newer callers.
+PredictionArtifactRequirement = PredictionArtifactEnvelope
+CheckpointArtifactRequirement = CheckpointArtifactEnvelope
 
 
 class FinalTestAuthorizationRequest(ContractModel):
@@ -870,8 +1277,15 @@ class ExperimentExecutionContract(ContractModel):
         "--data-manifest",
         "--source-commit",
         "--execution-id",
+        "--dataset-manifest-sha256",
         "--data-root",
     )
+    required_dataset_hash_arguments: tuple[
+        Literal["--dataset-manifest-sha256"], ...
+    ] = ("--dataset-manifest-sha256",)
+    optional_dataset_hash_arguments: tuple[
+        Literal["--dataset-view-sha256"], ...
+    ] = ("--dataset-view-sha256",)
     available_splits: tuple[Literal["train", "valid"], ...] = ("train", "valid")
     prediction_split: Literal["valid"] = "valid"
     prediction_rows: Literal["exact_valid_manifest_rows_in_manifest_order"] = (
@@ -888,12 +1302,24 @@ class ExperimentExecutionContract(ContractModel):
         "predictions.json",
         "checkpoint_bundle.json",
     )
+    prediction_artifact_envelope: PredictionArtifactEnvelope = PredictionArtifactEnvelope()
+    prediction_row_requirements: PredictionRowRequirement = PredictionRowRequirement()
+    checkpoint_artifact_envelope: CheckpointArtifactEnvelope = CheckpointArtifactEnvelope()
+    checkpoint_row_requirements: CheckpointRowRequirement = CheckpointRowRequirement()
     output_visibility: Literal["private_until_controller_validation"] = (
         "private_until_controller_validation"
     )
     artifact_publication_owner: Literal["controller"] = "controller"
     separate_candidate_input: Literal[False] = False
     valid_labels_may_influence_scores: Literal[False] = False
+
+    @property
+    def required_injected_dataset_hash_arguments(self) -> tuple[str, ...]:
+        return self.required_dataset_hash_arguments
+
+    @property
+    def optional_injected_dataset_hash_arguments(self) -> tuple[str, ...]:
+        return self.optional_dataset_hash_arguments
 
 
 class ControllerContext(ContractModel):

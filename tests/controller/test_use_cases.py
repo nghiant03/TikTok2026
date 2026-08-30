@@ -8,11 +8,14 @@ import pytest
 
 from tiktok2026.adapters import DeterministicPolicyGate
 from tiktok2026.contracts import (
+    DEFAULT_IMPLEMENTATION_CRITERIA,
     AgentFailure,
     AgentRole,
     BaselineCalibrationRecord,
     BlockerResolution,
     ContractModel,
+    CriterionAssessmentStatus,
+    CriterionResolutionClaim,
     DatasetManifestIdentity,
     DatasetViewProvenance,
     DatasetViewRow,
@@ -27,7 +30,10 @@ from tiktok2026.contracts import (
     FailureKind,
     Fidelity,
     ImplementationAttemptRecord,
+    ImplementationCriterionAssessment,
+    ImplementationCriterionId,
     ImplementationRequest,
+    ImplementationResourceEstimate,
     ImplementationResult,
     MetricValue,
     OrchestrationDecision,
@@ -105,6 +111,7 @@ class _FakeStore:
         self.validation_operations: dict[str, ValidationOperationIdentity] = {}
         self.validation_blockers: dict[str, ValidationBlocker] = {}
         self.validation_resolutions: dict[str, BlockerResolution] = {}
+        self.criterion_occurrences: list[tuple[str, str, CriterionAssessmentStatus]] = []
 
     def persist_transition(
         self, run_id: str, operation: str, state_version: int, updates: dict[str, object]
@@ -208,6 +215,12 @@ class _FakeStore:
             raise ValueError("operation is required")
         self.validation_reports[report.report_id] = report
         self.validation_operations[operation.operation_id] = operation
+        self.criterion_occurrences.extend(
+            (report.experiment_id, str(assessment.criterion_id), assessment.status)
+            for assessment in report.criterion_assessments
+            if assessment.status
+            in (CriterionAssessmentStatus.FAIL, CriterionAssessmentStatus.PARTIAL)
+        )
         self.validation_blockers.update(
             {blocker.blocker_id: blocker for blocker in report.blockers}
         )
@@ -264,6 +277,18 @@ class _FakeStore:
             and blocker.blocker_id not in self.validation_resolutions
         )
 
+    def get_criterion_repeat_count(
+        self, experiment_id: str, criterion_id: ImplementationCriterionId | str
+    ) -> int:
+        return sum(
+            occurrence_experiment_id == experiment_id
+            and occurrence_criterion_id == str(criterion_id)
+            and status in (CriterionAssessmentStatus.FAIL, CriterionAssessmentStatus.PARTIAL)
+            for occurrence_experiment_id, occurrence_criterion_id, status in (
+                self.criterion_occurrences
+            )
+        )
+
     def put_execution_result(self, result: ExecutionResult) -> None:
         self.executions[result.execution_id] = result
 
@@ -318,6 +343,29 @@ def _experiment(scope: tuple[str, ...]) -> ExperimentSpec:
     )
 
 
+def _estimated_experiment(scope: tuple[str, ...]) -> ExperimentSpec:
+    return _experiment(scope).model_copy(
+        update={
+            "implementation_resource_estimate": ImplementationResourceEstimate(
+                predicted_wall_seconds=1.0,
+                predicted_peak_memory_bytes=1 << 20,
+                predicted_artifact_bytes=1 << 20,
+                dataset_passes=1,
+            )
+        }
+    )
+
+
+def _passing_implementation_assessments() -> tuple[ImplementationCriterionAssessment, ...]:
+    return tuple(
+        ImplementationCriterionAssessment(
+            criterion_id=criterion,
+            status=CriterionAssessmentStatus.PASS,
+        )
+        for criterion in DEFAULT_IMPLEMENTATION_CRITERIA
+    )
+
+
 async def test_proposal_policy_allows_seeded_spec() -> None:
     """proposal_policy allows a persisted spec with an allowed scope."""
     store = _FakeStore()
@@ -364,6 +412,132 @@ async def test_proposal_policy_rejects_scope_outside_experiment_root() -> None:
 
     assert result["pending_route"] == "persist_failure"
     assert "outside_implementation_scope" in str(result["terminal_reason"])
+
+
+async def test_proposal_policy_rejects_infeasible_implementation_resources() -> None:
+    store = _FakeStore()
+    store.experiments["exp-1"] = _experiment(("src/tiktok2026/experiment",)).model_copy(
+        update={
+            "implementation_resource_estimate": ImplementationResourceEstimate(
+                predicted_wall_seconds=301,
+                predicted_peak_memory_bytes=1,
+                predicted_artifact_bytes=1,
+                dataset_passes=1,
+            )
+        }
+    )
+    controller = ProductionController(
+        _make_services(store=store, resource_accountant=_FakeResourceAccountant())
+    )
+
+    result = await controller.proposal_policy(
+        minimal_state(current_experiment_id="exp-1")
+    )
+
+    assert result["pending_route"] == "persist_failure"
+    assert "implementation_resource_timeout_exceeded" in str(result["terminal_reason"])
+
+
+def test_missing_implementation_criterion_creates_a_blocker() -> None:
+    from tiktok2026 import use_cases
+
+    missing = ImplementationCriterionId.RESOURCE_FEASIBILITY
+    report = ValidationReport(
+        report_id="implementation-report",
+        experiment_id="exp-1",
+        stage=ValidationStage.IMPLEMENTATION,
+        verdict=ValidationVerdict.APPROVED,
+        criterion_assessments=tuple(
+            assessment
+            for assessment in _passing_implementation_assessments()
+            if assessment.criterion_id != missing
+        ),
+        leakage_risk="none",
+    )
+
+    completed = use_cases._complete_implementation_validation(report, ())
+
+    assessment = next(
+        item for item in completed.criterion_assessments if item.criterion_id == missing
+    )
+    assert assessment.status == CriterionAssessmentStatus.FAIL
+    assert any(blocker.criterion_id == missing for blocker in completed.blockers)
+
+
+def test_partial_criterion_resolution_does_not_create_a_duplicate_blocker() -> None:
+    from tiktok2026 import use_cases
+
+    criterion = ImplementationCriterionId.LEAKAGE
+    prior = ValidationBlocker(
+        blocker_id="prior-resource-blocker",
+        experiment_id="exp-1",
+        stage=ValidationStage.IMPLEMENTATION,
+        text="prior leakage issue",
+        report_id="prior-report",
+        criterion_id=criterion,
+    )
+    claim = CriterionResolutionClaim(
+        criterion_id=criterion,
+        status=CriterionAssessmentStatus.PARTIAL,
+        blocker_ids=(prior.blocker_id,),
+        evidence_refs=("repair-evidence",),
+    )
+    report = ValidationReport(
+        report_id="repair-report",
+        experiment_id="exp-1",
+        stage=ValidationStage.IMPLEMENTATION,
+        verdict=ValidationVerdict.REPAIRABLE,
+        criterion_assessments=tuple(
+            assessment.model_copy(
+                update={"status": CriterionAssessmentStatus.PARTIAL}
+            )
+            if assessment.criterion_id == criterion
+            else assessment
+            for assessment in _passing_implementation_assessments()
+        ),
+        resolution_claims=(claim,),
+        leakage_risk="none",
+    )
+
+    completed = use_cases._complete_implementation_validation(report, (prior,))
+
+    assert not any(blocker.criterion_id == criterion for blocker in completed.blockers)
+
+
+def test_second_resource_feasibility_failure_escalates_to_orchestration() -> None:
+    from tiktok2026 import use_cases
+
+    store = _FakeStore()
+    criterion = ImplementationCriterionId.RESOURCE_FEASIBILITY
+    blocker = ValidationBlocker(
+        blocker_id="resource-blocker",
+        experiment_id="exp-1",
+        stage=ValidationStage.IMPLEMENTATION,
+        text="resource estimate remains infeasible",
+        report_id="implementation-report",
+        criterion_id=criterion,
+    )
+    store.validation_blockers[blocker.blocker_id] = blocker
+    store.criterion_occurrences = [
+        ("exp-1", str(criterion), CriterionAssessmentStatus.FAIL),
+        ("exp-1", str(criterion), CriterionAssessmentStatus.FAIL),
+    ]
+    report = ValidationReport(
+        report_id="implementation-report",
+        experiment_id="exp-1",
+        stage=ValidationStage.IMPLEMENTATION,
+        verdict=ValidationVerdict.APPROVED,
+        blockers=(blocker,),
+        leakage_risk="none",
+    )
+
+    updates = use_cases._replayed_validation_updates(
+        ServiceTransitions(run_store=store),
+        minimal_state(phase=RunPhase.IMPLEMENT, current_experiment_id="exp-1"),
+        report,
+    )
+
+    assert updates["pending_route"] == "orchestrate"
 
 
 async def test_rejected_validation_carries_blockers_into_failure() -> None:
@@ -472,7 +646,7 @@ async def test_proposal_repair_passes_authoritative_blocker_context_to_research(
             ResearchDecision(
                 request_id="research-1",
                 kind="proposal",
-                experiment_spec=_experiment(("src/tiktok2026/experiment",)),
+                experiment_spec=_estimated_experiment(("src/tiktok2026/experiment",)),
                 message="repaired proposal",
             )
         ]
@@ -498,7 +672,6 @@ async def test_validation_replay_reuses_bound_report_without_invoking_validator(
                 experiment_id="exp-1",
                 stage=ValidationStage.PROPOSAL,
                 verdict=ValidationVerdict.REJECTED,
-                blockers=("first result",),
                 leakage_risk="none",
             ),
             ValidationReport(
@@ -506,7 +679,6 @@ async def test_validation_replay_reuses_bound_report_without_invoking_validator(
                 experiment_id="exp-1",
                 stage=ValidationStage.PROPOSAL,
                 verdict=ValidationVerdict.REJECTED,
-                blockers=("different result",),
                 leakage_risk="none",
             ),
         ]
@@ -620,10 +792,15 @@ async def test_implementation_repairs_use_immutable_attempt_records() -> None:
     assert ("implementation", "exp-1:attempt:1") in store.json_records
     first_request = agent.calls[0]
     assert isinstance(first_request, ImplementationRequest)
-    assert first_request.source_context == {
-        "src/tiktok2026/experiment/train.py": "unchanged entrypoint\n"
-    }
+    assert first_request.source_context == {}
     assert first_request.base_source_context == {}
+    assert first_request.read_scopes == (
+        "src/tiktok2026/contracts",
+        "src/tiktok2026/benchmark/kuaireand_pure/manifest.py",
+        "tests/experiment/test_training_contract.py",
+        "src/tiktok2026/experiment/train.py",
+    )
+    assert first_request.capabilities == ("scoped_read", "scoped_write", "diff", "checks")
     assert first_request.execution_timeout_seconds == 900
     assert first_request.execution_memory_bytes == 4 * 1024**3
     assert first_request.execution_cpus == 1.0
@@ -676,12 +853,10 @@ async def test_implementation_repair_receives_failure_feedback() -> None:
     request = agent.calls[0]
     assert isinstance(request, ImplementationRequest)
     assert request.repair_feedback == "path is outside the approved implementation scope"
-    assert request.source_context == {
-        "src/tiktok2026/experiment/train.py": "current repaired source\n"
-    }
-    assert request.base_source_context == {
-        "src/tiktok2026/experiment/train.py": "committed controller entrypoint\n"
-    }
+    assert request.source_context == {}
+    assert request.base_source_context == {}
+    assert request.read_scopes
+    assert request.capabilities == ("scoped_read", "scoped_write", "diff", "checks")
     assert result["terminal_reason"] is None
 
 
@@ -816,6 +991,7 @@ async def test_implementation_validation_receives_pre_registration_authority() -
                 experiment_id="exp-1",
                 stage=ValidationStage.IMPLEMENTATION,
                 verdict=ValidationVerdict.APPROVED,
+                criterion_assessments=_passing_implementation_assessments(),
                 leakage_risk="none",
             )
         ]
@@ -882,6 +1058,7 @@ async def test_changed_implementation_diff_does_not_replay_stale_approval() -> N
                 experiment_id="exp-1",
                 stage=ValidationStage.IMPLEMENTATION,
                 verdict=ValidationVerdict.APPROVED,
+                criterion_assessments=_passing_implementation_assessments(),
                 leakage_risk="none",
             ),
             ValidationReport(
@@ -889,6 +1066,7 @@ async def test_changed_implementation_diff_does_not_replay_stale_approval() -> N
                 experiment_id="exp-1",
                 stage=ValidationStage.IMPLEMENTATION,
                 verdict=ValidationVerdict.APPROVED,
+                criterion_assessments=_passing_implementation_assessments(),
                 leakage_risk="none",
             ),
         ]
@@ -1103,7 +1281,7 @@ async def test_research_receives_authoritative_controller_context() -> None:
             ResearchDecision(
                 request_id="research-test-run-0",
                 kind="proposal",
-                experiment_spec=_experiment(("src/tiktok2026/experiment",)),
+                experiment_spec=_estimated_experiment(("src/tiktok2026/experiment",)),
                 message="bounded proposal",
             )
         ]
@@ -1829,6 +2007,7 @@ def _make_services(
     executor: Any = None,
     policy_gate: Any = None,
     bundle_service: Any = None,
+    resource_accountant: Any = None,
     default_timeout_seconds: int = 300,
     default_memory_bytes: int = 1024**3,
     default_cpus: float = 1.0,
@@ -1846,6 +2025,7 @@ def _make_services(
         executor=executor,
         policy_gate=policy_gate,
         bundle_service=bundle_service,
+        resource_accountant=resource_accountant,
         run_store=store,
         evaluator_id="evaluator-1",
         default_timeout_seconds=default_timeout_seconds,

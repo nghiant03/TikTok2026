@@ -127,7 +127,11 @@ def test_pre_registration_recovery_validates_assignment_without_source_artifact(
     subprocess.run(("git", "config", "user.name", "test"), cwd=repository, check=True)
     (repository / "README").write_text("base\n", encoding="utf-8")
     subprocess.run(("git", "add", "."), cwd=repository, check=True)
-    subprocess.run(("git", "commit", "-qm", "base"), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "-c", "commit.gpgsign=false", "commit", "-qm", "base"),
+        cwd=repository,
+        check=True,
+    )
     parent = subprocess.run(
         ("git", "rev-parse", "HEAD"), cwd=repository, check=True, capture_output=True, text=True
     ).stdout.strip()
@@ -157,7 +161,11 @@ def test_pre_registration_recovery_validates_assignment_without_source_artifact(
 
     (worktree / "README").write_text("registered\n", encoding="utf-8")
     subprocess.run(("git", "add", "README"), cwd=worktree, check=True)
-    subprocess.run(("git", "commit", "-qm", "registered"), cwd=worktree, check=True)
+    subprocess.run(
+        ("git", "-c", "commit.gpgsign=false", "commit", "-qm", "registered"),
+        cwd=worktree,
+        check=True,
+    )
     registered = subprocess.run(
         ("git", "rev-parse", "HEAD"),
         cwd=worktree,
@@ -213,7 +221,11 @@ def test_recovery_source_mismatch_with_real_worktree_preserves_lock_and_reservat
     subprocess.run(("git", "config", "user.name", "test"), cwd=repository, check=True)
     (repository / "README").write_text("base\n", encoding="utf-8")
     subprocess.run(("git", "add", "."), cwd=repository, check=True)
-    subprocess.run(("git", "commit", "-qm", "base"), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "-c", "commit.gpgsign=false", "commit", "-qm", "base"),
+        cwd=repository,
+        check=True,
+    )
     parent = subprocess.run(
         ("git", "rev-parse", "HEAD"), cwd=repository, check=True, capture_output=True, text=True
     ).stdout.strip()
@@ -227,7 +239,11 @@ def test_recovery_source_mismatch_with_real_worktree_preserves_lock_and_reservat
     )
     (worktree / "README").write_text("changed\n", encoding="utf-8")
     subprocess.run(("git", "add", "README"), cwd=worktree, check=True)
-    subprocess.run(("git", "commit", "-qm", "changed"), cwd=worktree, check=True)
+    subprocess.run(
+        ("git", "-c", "commit.gpgsign=false", "commit", "-qm", "changed"),
+        cwd=worktree,
+        check=True,
+    )
     changed_head = subprocess.run(
         ("git", "rev-parse", "HEAD"), cwd=worktree, check=True, capture_output=True, text=True
     ).stdout.strip()

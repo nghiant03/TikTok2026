@@ -11,6 +11,7 @@ from tiktok2026.contracts import (
     ExperimentSpec,
     Fidelity,
     FinalizationRecord,
+    PredictionArtifactRegistration,
     ResourceReservation,
     RuntimePaths,
 )
@@ -37,6 +38,30 @@ def test_registered_artifact_requires_sha256() -> None:
             producer="controller",
             retention=ArtifactRetention.RUN,
         )
+
+
+def test_prediction_registration_supports_optional_dataset_view_provenance(
+    tmp_path: Path,
+) -> None:
+    common = {
+        "artifact_id": "predictions-1",
+        "path": tmp_path / "predictions.json",
+        "sha256": "a" * 64,
+        "checkpoint_id": "checkpoint-1",
+        "source_commit": "b" * 40,
+        "execution_id": "execution-1",
+        "dataset_manifest_id": "manifest-1",
+        "dataset_manifest_sha256": "c" * 64,
+        "split": "valid",
+    }
+
+    historic = PredictionArtifactRegistration.model_validate(common)
+    current = PredictionArtifactRegistration.model_validate(
+        {**common, "dataset_view_sha256": "d" * 64}
+    )
+
+    assert historic.dataset_view_sha256 is None
+    assert current.dataset_view_sha256 == "d" * 64
 
 
 def test_provisional_finalization_is_explicit() -> None:

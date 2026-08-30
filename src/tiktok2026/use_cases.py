@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -10,10 +11,12 @@ from typing import NoReturn, cast
 from loguru import logger
 
 from tiktok2026.contracts import (
+    DEFAULT_IMPLEMENTATION_CRITERIA,
     AgentClient,
     AgentFailure,
     AgentRole,
     ControllerContext,
+    CriterionAssessmentStatus,
     DatasetViewProvenance,
     DecisionAction,
     EvaluationContext,
@@ -30,6 +33,9 @@ from tiktok2026.contracts import (
     FinalizationBundleService,
     FrontierService,
     ImplementationAttemptRecord,
+    ImplementationCriterion,
+    ImplementationCriterionAssessment,
+    ImplementationCriterionId,
     ImplementationRequest,
     ImplementationResult,
     ImplementationValidationAuthority,
@@ -62,6 +68,7 @@ from tiktok2026.graph.routes import (
     route_after_validation,
 )
 from tiktok2026.graph.state import ProductionState
+from tiktok2026.policies.lifecycle import check_implementation_resource_estimate
 from tiktok2026.policies.resources import check_smoke_feasibility
 
 
@@ -89,6 +96,12 @@ def _agent_failure(state: ProductionState, failure: AgentFailure) -> dict[str, o
 
 IMPLEMENTATION_ROOTS = ("src/tiktok2026/experiment",)
 EXPERIMENT_ENTRYPOINT = "src/tiktok2026/experiment/train.py"
+CONTROLLER_READ_SCOPES = (
+    "src/tiktok2026/contracts",
+    "src/tiktok2026/benchmark/kuaireand_pure/manifest.py",
+    "tests/experiment/test_training_contract.py",
+    EXPERIMENT_ENTRYPOINT,
+)
 MAX_TERMINAL_TEXT = 2_000
 MAX_EVIDENCE_REFS = 8
 MAX_EVIDENCE_REF_LENGTH = 256
@@ -131,6 +144,7 @@ def _blocker_context(
         ValidationBlockerContext(
             blocker_id=blocker.blocker_id,
             text=blocker.text[:MAX_TERMINAL_TEXT],
+            criterion_id=blocker.criterion_id,
             evidence_refs=tuple(
                 ref[:MAX_EVIDENCE_REF_LENGTH]
                 for ref in blocker.evidence_refs[:MAX_EVIDENCE_REFS]
@@ -241,7 +255,12 @@ def _canonical_validation_report(
 ) -> ValidationReport:
     report_id = f"validation-report-{operation.operation_id}"
     introduced_ids = {blocker.blocker_id for blocker in report.blockers}
-    if introduced_ids & set(report.resolves_blocker_ids):
+    claimed_ids = {
+        blocker_id
+        for claim in report.resolution_claims
+        for blocker_id in claim.blocker_ids
+    }
+    if introduced_ids & (set(report.resolves_blocker_ids) | claimed_ids):
         raise ValueError("a validation report cannot resolve a blocker it introduces")
     blockers = tuple(
         ValidationBlocker(
@@ -251,6 +270,7 @@ def _canonical_validation_report(
             text=blocker.text,
             report_id=report_id,
             evidence_refs=blocker.evidence_refs,
+            criterion_id=blocker.criterion_id,
         )
         for blocker in report.blockers
     )
@@ -272,6 +292,13 @@ def _replayed_validation_updates(
     unresolved_blockers = store.get_unresolved_blockers(report.experiment_id)
     unresolved = tuple(blocker.blocker_id for blocker in unresolved_blockers)
     route = route_after_validation(state, report, unresolved)
+    if (
+        report.stage == ValidationStage.IMPLEMENTATION
+        and _resource_feasibility_escalated(
+            store, report.experiment_id, unresolved_blockers
+        )
+    ):
+        route = "orchestrate"
     updates: dict[str, object] = {"latest_validation_report_id": report.report_id}
     if route not in {"repair", "persist_failure"}:
         return updates | {"pending_route": route}
@@ -540,7 +567,119 @@ def _resource_state(s: ServiceTransitions) -> ResourceState:
     )
 
 
-def _controller_context(s: ServiceTransitions) -> ControllerContext:
+def _execution_resources(s: ServiceTransitions) -> dict[str, object]:
+    return {
+        "timeout_seconds": s.default_timeout_seconds,
+        "memory_bytes": s.default_memory_bytes,
+        "cpus": s.default_cpus,
+        "gpu_count": s.default_gpu_count,
+    }
+
+
+def _implementation_criterion_requirements() -> tuple[ImplementationCriterion, ...]:
+    return tuple(
+        ImplementationCriterion(criterion_id=criterion, description=criterion.value)
+        for criterion in DEFAULT_IMPLEMENTATION_CRITERIA
+    )
+
+
+def _bind_worktree(
+    binder: Callable[..., object],
+    path: Path,
+    write_scopes: tuple[str, ...],
+) -> None:
+    """Bind modern clients with separate reads while tolerating legacy fakes."""
+    try:
+        supports_read_scopes = "read_scopes" in inspect.signature(binder).parameters
+    except (TypeError, ValueError):
+        supports_read_scopes = False
+    if supports_read_scopes:
+        binder(path, write_scopes, read_scopes=CONTROLLER_READ_SCOPES)
+    else:
+        binder(path, write_scopes)
+
+
+def _complete_implementation_validation(
+    report: ValidationReport,
+    unresolved_before: tuple[ValidationBlocker, ...],
+) -> ValidationReport:
+    """Make the controller's criterion matrix total before persisting a report."""
+    assessments = {str(item.criterion_id): item for item in report.criterion_assessments}
+    blockers = list(report.blockers)
+    prior_by_criterion = {
+        str(blocker.criterion_id): blocker
+        for blocker in unresolved_before
+        if blocker.criterion_id is not None
+    }
+    claimed_ids = {
+        blocker_id
+        for claim in report.resolution_claims
+        for blocker_id in claim.blocker_ids
+    }
+    for criterion in DEFAULT_IMPLEMENTATION_CRITERIA:
+        key = str(criterion)
+        assessment = assessments.get(key)
+        if assessment is None:
+            assessment = ImplementationCriterionAssessment(
+                criterion_id=criterion,
+                status=CriterionAssessmentStatus.FAIL,
+                details=f"criterion was not assessed: {criterion.value}",
+            )
+            assessments[key] = assessment
+        if assessment.status not in (
+            CriterionAssessmentStatus.FAIL,
+            CriterionAssessmentStatus.PARTIAL,
+        ):
+            continue
+        has_blocker = any(
+            blocker.criterion_id is not None and str(blocker.criterion_id) == key
+            for blocker in blockers
+        )
+        # A partial claim may address an older, stable blocker.  Do not create
+        # the same blocker in this report or turn that claim into self-resolution.
+        prior = prior_by_criterion.get(key)
+        if not has_blocker and (prior is None or prior.blocker_id not in claimed_ids):
+            blockers.append(
+                ValidationBlocker(
+                    blocker_id="",
+                    experiment_id=report.experiment_id,
+                    stage=report.stage,
+                    text=assessment.details
+                    or f"implementation criterion failed: {criterion.value}",
+                    report_id=report.report_id,
+                    evidence_refs=assessment.evidence_refs,
+                    criterion_id=criterion,
+                )
+            )
+    return report.model_copy(
+        update={
+            "criterion_assessments": tuple(assessments.values()),
+            "blockers": tuple(blockers),
+        }
+    )
+
+
+def _resource_feasibility_escalated(
+    store: RunStore,
+    experiment_id: str,
+    unresolved_blockers: tuple[ValidationBlocker, ...],
+) -> bool:
+    getter = getattr(store, "get_criterion_repeat_count", None)
+    if not callable(getter):
+        return False
+    has_resource_blocker = any(
+        blocker.criterion_id == ImplementationCriterionId.RESOURCE_FEASIBILITY
+        for blocker in unresolved_blockers
+    )
+    typed_getter = cast(Callable[[str, ImplementationCriterionId], int], getter)
+    return has_resource_blocker and int(
+        typed_getter(experiment_id, ImplementationCriterionId.RESOURCE_FEASIBILITY)
+    ) >= 2
+
+
+def _controller_context(
+    s: ServiceTransitions, *, include_experiment_registry: bool = True
+) -> ControllerContext:
     dataset = s.run_store.get_dataset_manifest_identity() if s.run_store is not None else None
     evaluator = (
         s.run_store.get_evaluator_identity(s.evaluator_id)
@@ -554,7 +693,9 @@ def _controller_context(s: ServiceTransitions) -> ControllerContext:
         docker_image=s.docker_image,
         experiment_registry=(
             s.run_store.get_experiment_registry() if s.run_store is not None else None
-        ),
+        )
+        if include_experiment_registry
+        else None,
     )
 
 
@@ -578,6 +719,16 @@ def _proposal_policy(s: ServiceTransitions) -> Transition:
             spec = _spec(s, state)
         except MissingAuthorityError as error:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
+        estimate = spec.implementation_resource_estimate
+        if estimate is not None:
+            decision = check_implementation_resource_estimate(
+                estimate,
+                execution_timeout_seconds=s.default_timeout_seconds,
+                execution_memory_bytes=s.default_memory_bytes,
+                resource_state=_resource_state(s),
+            )
+            if not decision.allowed:
+                return _failure(state, FailureKind.SCHEMA_MISMATCH, decision.reason)
         if s.policy_gate is not None:
             decision = s.policy_gate.check_paths(
                 spec.implementation_scope, IMPLEMENTATION_ROOTS
@@ -601,20 +752,18 @@ def _proposal_validation(s: ServiceTransitions) -> Transition:
         try:
             spec = _spec(s, state)
             store = cast(RunStore, s.run_store)
-            bound_attempt = store.get_validation_report_for_attempt(
-                state["run_id"],
-                spec.experiment_id,
-                ValidationStage.PROPOSAL,
-                state["repair_attempts"],
-            )
-            if bound_attempt is not None:
-                return _replayed_validation_updates(s, state, bound_attempt)
             unresolved = _unresolved_blockers(s, spec.experiment_id)
         except MissingAuthorityError as error:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         subject: dict[str, object] = {
             "experiment_spec": spec.model_dump(mode="json"),
             "controller_context": _controller_context(s).model_dump(mode="json"),
+            "execution_resources": _execution_resources(s),
+            "implementation_resource_estimate": (
+                spec.implementation_resource_estimate.model_dump(mode="json")
+                if spec.implementation_resource_estimate is not None
+                else None
+            ),
             "unresolved_blockers": [
                 item.model_dump(mode="json") for item in _blocker_context(unresolved)
             ],
@@ -666,6 +815,13 @@ def _validation_updates(
     unresolved_blockers = store.get_unresolved_blockers(report.experiment_id)
     unresolved = tuple(blocker.blocker_id for blocker in unresolved_blockers)
     route = route_after_validation(state, report, unresolved)
+    if (
+        report.stage == ValidationStage.IMPLEMENTATION
+        and _resource_feasibility_escalated(
+            store, report.experiment_id, unresolved_blockers
+        )
+    ):
+        route = "orchestrate"
     updates: dict[str, object] = {"latest_validation_report_id": report.report_id}
     if route not in {"repair", "persist_failure"}:
         return updates | {"pending_route": route}
@@ -702,7 +858,7 @@ def _create_worktree(s: ServiceTransitions) -> Transition:
             implementor = _agent(s, AgentRole.IMPLEMENTOR)
             binder = getattr(implementor, "bind_worktree", None)
             if binder is not None:
-                binder(assignment.path, spec.implementation_scope)
+                _bind_worktree(binder, assignment.path, spec.implementation_scope)
         except (MissingAuthorityError, ValueError) as error:
             return _failure(state, FailureKind.MISSING_PATH, str(error))
         return {
@@ -732,15 +888,8 @@ def _implement(s: ServiceTransitions) -> Transition:
         repository = getattr(client, "scoped_repository", None)
         prior_diff_sha256: str | None = None
         try:
-            source_context: dict[str, str] = {}
-            base_source_context: dict[str, str] = {}
             if repository is not None:
                 prior_diff_sha256 = hashlib.sha256(repository.diff().encode()).hexdigest()
-                current_source = repository.read(EXPERIMENT_ENTRYPOINT, 100_000)
-                base_source = repository.read_base(EXPERIMENT_ENTRYPOINT, 100_000)
-                source_context[EXPERIMENT_ENTRYPOINT] = current_source
-                if current_source != base_source:
-                    base_source_context[EXPERIMENT_ENTRYPOINT] = base_source
         except (OSError, PermissionError, ValueError, RuntimeError) as error:
             return _failure(state, FailureKind.MISSING_PATH, str(error))
         unresolved = _unresolved_blockers(s, spec.experiment_id)
@@ -752,14 +901,17 @@ def _implement(s: ServiceTransitions) -> Transition:
                 experiment_id=spec.experiment_id,
                 experiment_spec=spec,
                 allowed_scopes=spec.implementation_scope,
+                read_scopes=CONTROLLER_READ_SCOPES,
+                implementation_criteria=DEFAULT_IMPLEMENTATION_CRITERIA,
+                criterion_requirements=_implementation_criterion_requirements(),
                 capabilities=("scoped_read", "scoped_write", "diff", "checks"),
                 repair_feedback=(
                     _failure_details(state)[1] if state["repair_attempts"] > 0 else None
                 ),
                 unresolved_blocker_ids=unresolved_blocker_ids,
                 unresolved_blockers=unresolved_blocker_context,
-                source_context=source_context,
-                base_source_context=base_source_context,
+                source_context={},
+                base_source_context={},
                 execution_timeout_seconds=s.default_timeout_seconds,
                 execution_memory_bytes=s.default_memory_bytes,
                 execution_cpus=s.default_cpus,
@@ -893,16 +1045,8 @@ def _validation(
                 state, FailureKind.SCHEMA_MISMATCH, "validation ledger authority is absent"
             )
         try:
-            if stage != ValidationStage.IMPLEMENTATION:
-                bound_attempt = s.run_store.get_validation_report_for_attempt(
-                    state["run_id"],
-                    _exp_id(state),
-                    stage,
-                    state["repair_attempts"],
-                )
-                if bound_attempt is not None:
-                    return _replayed_validation_updates(s, state, bound_attempt)
             subject = _validation_subject(s, state, stage)
+            unresolved_before = _unresolved_blockers(s, _exp_id(state))
         except MissingAuthorityError as error:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         if stage == ValidationStage.IMPLEMENTATION:
@@ -915,7 +1059,9 @@ def _validation(
                 )
             binder = getattr(client, "bind_worktree", None)
             if binder is not None:
-                binder(assignment.path, _spec(s, state).implementation_scope)
+                _bind_worktree(
+                    binder, assignment.path, _spec(s, state).implementation_scope
+                )
         operation = _validation_operation(state, stage, subject)
         subject["validation_operation"] = operation.model_dump(mode="json")
         bound = s.run_store.get_validation_report_by_operation(operation.operation_id)
@@ -938,6 +1084,8 @@ def _validation(
             return _failure(
                 state, FailureKind.SCHEMA_MISMATCH, "validation response identity mismatch"
             )
+        if stage == ValidationStage.IMPLEMENTATION:
+            response = _complete_implementation_validation(response, unresolved_before)
         return _validation_updates(s, state, response, operation, subject)
 
     return transition
@@ -946,9 +1094,15 @@ def _validation(
 def _validation_subject(
     s: ServiceTransitions, state: ProductionState, stage: ValidationStage
 ) -> dict[str, object]:
+    controller_context = _controller_context(
+        s, include_experiment_registry=stage != ValidationStage.IMPLEMENTATION
+    ).model_dump(mode="json")
+    if stage == ValidationStage.IMPLEMENTATION:
+        # The registry is proposal/research context, not implementation evidence.
+        controller_context.pop("experiment_registry", None)
     subject: dict[str, object] = {
         "experiment_spec": _spec(s, state).model_dump(mode="json"),
-        "controller_context": _controller_context(s).model_dump(mode="json"),
+        "controller_context": controller_context,
         "unresolved_blockers": [
             item.model_dump(mode="json")
             for item in _blocker_context(_unresolved_blockers(s, _exp_id(state)))
@@ -958,7 +1112,9 @@ def _validation_subject(
         implementation = _implementation_result(s, state)
         if implementation is None:
             raise MissingAuthorityError("implementation result is absent")
-        subject["implementation_result"] = implementation.model_dump(mode="json")
+        subject["implementation_result"] = implementation.model_dump(
+            mode="json", exclude={"edits"}
+        )
         if s.run_store is None:
             raise MissingAuthorityError("run store is required for implementation validation")
         assignment = s.run_store.get_worktree_assignment(_exp_id(state))
@@ -981,12 +1137,13 @@ def _validation_subject(
             changed_files=changed_files,
             allowed_scopes=_spec(s, state).implementation_scope,
         ).model_dump(mode="json")
-        subject["execution_resources"] = {
-            "timeout_seconds": s.default_timeout_seconds,
-            "memory_bytes": s.default_memory_bytes,
-            "cpus": s.default_cpus,
-            "gpu_count": s.default_gpu_count,
-        }
+        subject["execution_resources"] = _execution_resources(s)
+        subject["implementation_criteria"] = [
+            criterion.value for criterion in DEFAULT_IMPLEMENTATION_CRITERIA
+        ]
+        subject["criterion_requirements"] = [
+            item.model_dump(mode="json") for item in _implementation_criterion_requirements()
+        ]
     elif stage == ValidationStage.RESULT:
         if s.run_store is None:
             raise MissingAuthorityError("run store is required for result validation")

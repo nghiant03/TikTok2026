@@ -19,6 +19,7 @@ from tiktok2026.contracts.models import (
     FailureRecord,
     FinalizationBundleRequest,
     FinalizationRecord,
+    ImplementationCriterionId,
     PolicyDecisionModel,
     PredictionArtifactRegistration,
     ProvenanceRequest,
@@ -189,6 +190,10 @@ class RunStore(Protocol):
     def get_unresolved_blocker_ids(self, experiment_id: str) -> tuple[str, ...]: ...
 
     def list_unresolved_blockers(self, experiment_id: str) -> tuple[ValidationBlocker, ...]: ...
+
+    def get_criterion_repeat_count(
+        self, experiment_id: str, criterion_id: ImplementationCriterionId | str
+    ) -> int: ...
 
     def put_failure(self, record: FailureRecord, run_id: str) -> None: ...
 

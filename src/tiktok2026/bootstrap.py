@@ -29,11 +29,13 @@ from tiktok2026.adapters import (
 )
 from tiktok2026.benchmark.kuaireand_pure.manifest import BenchmarkManifest, verify_protected_files
 from tiktok2026.contracts import (
+    DEFAULT_IMPLEMENTATION_CRITERIA,
     AgentRole,
     ArtifactRecord,
     ArtifactRetention,
     AuditEvent,
     ContractModel,
+    CriterionAssessmentStatus,
     DatasetManifestIdentity,
     DatasetViewProvenance,
     DatasetViewRow,
@@ -46,7 +48,10 @@ from tiktok2026.contracts import (
     FailureKind,
     Fidelity,
     FinalizationBundleRequest,
+    ImplementationCriterionAssessment,
+    ImplementationCriterionId,
     ImplementationRequest,
+    ImplementationResourceEstimate,
     ImplementationResult,
     OperationResult,
     OrchestrationDecision,
@@ -62,6 +67,7 @@ from tiktok2026.contracts import (
     SourceRegistration,
     ValidationReport,
     ValidationRequest,
+    ValidationStage,
     ValidationVerdict,
     WorktreeAssignment,
 )
@@ -85,6 +91,15 @@ class RuntimeServices:
     repository_root: Path
     paths: RuntimePaths
     repository: ApplicationRepository
+
+
+class _CriterionAwareRepositoryTransitionStore(RepositoryTransitionStore):
+    """Transition-store seam with the criterion history port required by policy."""
+
+    def get_criterion_repeat_count(
+        self, experiment_id: str, criterion_id: ImplementationCriterionId | str
+    ) -> int:
+        return self._repo.get_criterion_repeat_count(experiment_id, str(criterion_id))
 
 
 def initialize_runtime(repository_root: Path, runtime_root: Path) -> RuntimeServices:
@@ -1179,7 +1194,46 @@ class _RunBoundDockerExecutor:
             source_verifier=RegisteredGitSourceVerifier(self.repository, assignment),
             resource_telemetry=DockerResourceTelemetry(),
         )
+        # The dataset provider is the authority for the exact staged view.  Bind
+        # that identity before launch so the training process writes it into its
+        # envelopes, and reject a result that claims to have executed another
+        # view.  ``provenance`` is optional on test doubles and on non-production
+        # adapters; the execution result remains authoritative in that case.
+        provenance = getattr(self.dataset_provider, "provenance", None)
+        if callable(provenance):
+            current_view = provenance(request)
+            if not isinstance(current_view, DatasetViewProvenance):
+                raise _ExecutionArtifactContractError(
+                    "dataset provider returned invalid view provenance",
+                    FailureKind.SCHEMA_MISMATCH,
+                )
+            if (
+                request.dataset_view_sha256 is not None
+                and request.dataset_view_sha256 != current_view.view_sha256
+            ):
+                raise _ExecutionArtifactContractError(
+                    "execution request dataset view does not match the authorized view",
+                    FailureKind.SCHEMA_MISMATCH,
+                )
+            request = request.model_copy(
+                update={"dataset_view_sha256": current_view.view_sha256}
+            )
         result = await executor.execute(request)
+        if (
+            request.dataset_view_sha256 is not None
+            and result.dataset_view_sha256 != request.dataset_view_sha256
+        ):
+            error = _ExecutionArtifactContractError(
+                "execution result dataset view does not match the request",
+                FailureKind.SCHEMA_MISMATCH,
+            )
+            return result.model_copy(
+                update={
+                    "exit_code": 1,
+                    "failure_kind": error.failure_kind,
+                    "failure_message": str(error),
+                }
+            )
         if result.exit_code != 0:
             return result
         if request.execution_kind == "smoke":
@@ -1228,6 +1282,10 @@ class _RunBoundDockerExecutor:
             result.dataset_manifest_id != dataset_identity.manifest_id
             or result.dataset_manifest_sha256 != dataset_identity.manifest_sha256
             or result.dataset_view_sha256 is None
+            or (
+                request.dataset_view_sha256 is not None
+                and result.dataset_view_sha256 != request.dataset_view_sha256
+            )
         ):
             raise _ExecutionArtifactContractError(
                 "smoke result dataset provenance is invalid", FailureKind.SCHEMA_MISMATCH
@@ -1305,6 +1363,7 @@ class _RunBoundDockerExecutor:
             "fidelity": "smoke",
             "prediction_artifact": predictions_path.name,
             "prediction_sha256": prediction_sha256,
+            "dataset_view_sha256": result.dataset_view_sha256,
         }
         if any(checkpoint_payload.get(key) != value for key, value in required_checkpoint.items()):
             raise _ExecutionArtifactContractError(
@@ -1349,11 +1408,25 @@ class _RunBoundDockerExecutor:
         checkpoint_payload = cast(dict[str, object], checkpoint)
         prediction_bytes = predictions_path.read_bytes()
         prediction_sha256 = hashlib.sha256(prediction_bytes).hexdigest()
+        if result.dataset_view_sha256 is None:
+            raise _ExecutionArtifactContractError(
+                "execution result dataset view provenance is absent",
+                FailureKind.SCHEMA_MISMATCH,
+            )
+        if (
+            request.dataset_view_sha256 is not None
+            and request.dataset_view_sha256 != result.dataset_view_sha256
+        ):
+            raise _ExecutionArtifactContractError(
+                "execution result dataset view does not match the request",
+                FailureKind.SCHEMA_MISMATCH,
+            )
         expected = {
             "manifest_id": dataset_identity.manifest_id,
             "manifest_sha256": request.dataset_manifest_sha256,
             "source_commit": request.source_commit,
             "execution_id": request.execution_id,
+            "dataset_view_sha256": result.dataset_view_sha256,
         }
         if any(prediction_payload.get(key) != value for key, value in expected.items()):
             raise _ExecutionArtifactContractError(
@@ -1366,6 +1439,7 @@ class _RunBoundDockerExecutor:
             "execution_id": request.execution_id,
             "prediction_artifact": predictions_path.name,
             "prediction_sha256": prediction_sha256,
+            "dataset_view_sha256": result.dataset_view_sha256,
         }
         if any(checkpoint_payload.get(key) != value for key, value in checkpoint_expected.items()):
             raise _ExecutionArtifactContractError(
@@ -1404,6 +1478,7 @@ class _RunBoundDockerExecutor:
             execution_id=request.execution_id,
             dataset_manifest_id=dataset_identity.manifest_id,
             dataset_manifest_sha256=dataset_identity.manifest_sha256,
+            dataset_view_sha256=result.dataset_view_sha256,
             split="valid",
         )
         self.repository.put_json(
@@ -1476,7 +1551,7 @@ def build_production_services(settings: Any) -> ProductionServices:
             reserved_final_gpu_hours=app_settings.budget.reserved_final_gpu_hours,
         ),
     )
-    run_store = RepositoryTransitionStore(repo)
+    run_store = _CriterionAwareRepositoryTransitionStore(repo)
     evaluator_hash = evaluator_implementation_sha256()
     run_store.put_evaluator_identity(
         EvaluatorIdentity(
@@ -1799,9 +1874,14 @@ class _ScriptedAgent:
         self._proposal_count = 0
         self.scoped_repository: _SyntheticScopedRepository | None = None
 
-    def bind_worktree(self, path: Path, allowed_scopes: tuple[str, ...]) -> None:
+    def bind_worktree(
+        self,
+        path: Path,
+        allowed_scopes: tuple[str, ...],
+        read_scopes: tuple[str, ...] | None = None,
+    ) -> None:
         del path
-        self.scoped_repository = _SyntheticScopedRepository(allowed_scopes)
+        self.scoped_repository = _SyntheticScopedRepository(allowed_scopes, read_scopes)
 
     async def invoke(self, request: ContractModel) -> ContractModel:
         if isinstance(request, OrchestrationRequest):
@@ -1826,6 +1906,12 @@ class _ScriptedAgent:
                     expected_signal="fixture",
                     implementation_scope=("src/tiktok2026/experiment",),
                     fidelity=Fidelity.SMOKE,
+                    implementation_resource_estimate=ImplementationResourceEstimate(
+                        predicted_wall_seconds=1.0,
+                        predicted_peak_memory_bytes=1 << 20,
+                        predicted_artifact_bytes=1 << 20,
+                        dataset_passes=1,
+                    ),
                     success_criteria="fixture",
                     failure_criteria="fixture",
                     source_provenance=("fixture-provenance",),
@@ -1838,19 +1924,36 @@ class _ScriptedAgent:
                 changed_files=(),
             )
         if isinstance(request, ValidationRequest):
+            criterion_assessments = ()
+            if request.stage == ValidationStage.IMPLEMENTATION:
+                criterion_assessments = tuple(
+                    ImplementationCriterionAssessment(
+                        criterion_id=criterion,
+                        status=CriterionAssessmentStatus.PASS,
+                        evidence_refs=("synthetic-implementation-diff",),
+                        details="synthetic fixture satisfies the implementation criterion",
+                    )
+                    for criterion in DEFAULT_IMPLEMENTATION_CRITERIA
+                )
             return ValidationReport(
                 report_id=f"report-{request.request_id}",
                 experiment_id=request.experiment_id,
                 stage=request.stage,
                 verdict=ValidationVerdict.APPROVED,
+                criterion_assessments=criterion_assessments,
+                evidence_refs=("synthetic-validator",),
                 leakage_risk="none",
             )
         raise ValueError("unsupported synthetic request")
 
 
 class _SyntheticScopedRepository:
-    def __init__(self, allowed_scopes: tuple[str, ...]) -> None:
+    def __init__(
+        self, allowed_scopes: tuple[str, ...], read_scopes: tuple[str, ...] | None = None
+    ) -> None:
         self.allowed_scopes = allowed_scopes
+        self.write_scopes = allowed_scopes
+        self.read_scopes = allowed_scopes if read_scopes is None else read_scopes
 
     def changed_files(self) -> tuple[str, ...]:
         return (f"{self.allowed_scopes[0]}/train.py",)
@@ -1873,7 +1976,7 @@ def build_synthetic_controller(
     if iterations < 2:
         raise ValueError("synthetic controller requires at least two iterations")
     runtime = initialize_runtime(repository_root, runtime_root)
-    repo = RepositoryTransitionStore(runtime.repository)
+    repo = _CriterionAwareRepositoryTransitionStore(runtime.repository)
     manifest = DatasetManifestIdentity(
         manifest_id="synthetic-manifest",
         manifest_sha256=hashlib.sha256(b"synthetic-manifest").hexdigest(),

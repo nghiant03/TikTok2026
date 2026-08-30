@@ -15,6 +15,17 @@ ModelT = TypeVar("ModelT", bound=ContractModel)
 
 # Tool handler: (tool_name, arguments_dict) → result_string
 ToolHandler = Callable[[str, dict[str, object]], str]
+# Terminal guard: return a bounded diagnostic to reject a validated submission,
+# or ``None`` to accept it.
+TerminalGuard = Callable[[ModelT], str | None]
+
+
+def _validate_model(model_type: type[ModelT], raw: object) -> ModelT:
+    # The repository diff, rather than a model-reported edit list, is the
+    # authority for implementation changes.  In particular, an implementation
+    # submission may contain metadata only when the agent has already changed
+    # the bound worktree through tools.
+    return model_type.model_validate(raw)
 
 
 async def invoke_structured(
@@ -51,7 +62,7 @@ async def invoke_structured(
                 role=role.value,
                 attempt=attempt + 1,
             )
-            result = model_type.model_validate(raw)
+            result = _validate_model(model_type, raw)
             logger.debug(
                 "Structured response accepted request_id={} role={} attempt={} schema={}",
                 request_id,
@@ -109,14 +120,15 @@ async def invoke_agentic(
     *,
     max_turns: int = 20,
     terminal_tool: str | None = None,
+    terminal_guard: TerminalGuard[ModelT] | None = None,
 ) -> ModelT | AgentFailure:
     """Multi-turn tool-use loop.  The model drives via tool calls.
 
     Termination: if ``terminal_tool`` is set, the loop ends when the model calls
     that tool — its arguments are validated against ``model_type``.  A
-    validation error is returned to the model as the tool result so it can
-    correct and resubmit.  Otherwise the first turn without tool calls is
-    parsed as the structured result.
+    validation error, or a rejection from ``terminal_guard``, is returned to
+    the model as the tool result so it can correct and resubmit.  Otherwise
+    the first turn without tool calls is parsed as the structured result.
     """
     system = (
         f"{prompt}\n\n"
@@ -133,10 +145,13 @@ async def invoke_agentic(
             " When your work is complete, respond with the final JSON object "
             "matching response_json_schema and no tool calls."
         )
-    user = json.dumps(
-        {"request": payload, "response_json_schema": model_type.model_json_schema()},
-        sort_keys=True,
-    )
+    user_payload: dict[str, object] = {"request": payload}
+    # In terminal-tool mode the submit_result tool already carries the complete
+    # response schema.  Keeping a second copy in the user message wastes context
+    # and can let the two schema representations drift.
+    if terminal_tool is None:
+        user_payload["response_json_schema"] = model_type.model_json_schema()
+    user = json.dumps(user_payload, sort_keys=True)
     messages: list[dict[str, object]] = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -213,7 +228,7 @@ async def invoke_agentic(
                 raw = _extract_agentic_json(content)
                 if raw is None:
                     raise ValueError("no JSON object in final response")
-                result = model_type.model_validate(raw)
+                result = _validate_model(model_type, raw)
                 logger.debug(
                     "Agentic result accepted request_id={} role={} turns={} schema={}",
                     request_id,
@@ -299,7 +314,7 @@ async def invoke_agentic(
             )
             if terminal_tool is not None and tool_name == terminal_tool:
                 try:
-                    result = model_type.model_validate(arguments)
+                    result = _validate_model(model_type, arguments)
                     logger.debug(
                         "Agentic result accepted request_id={} role={} turns={} "
                         "schema={} via terminal tool",
@@ -308,7 +323,6 @@ async def invoke_agentic(
                         turn,
                         model_type.__name__,
                     )
-                    return result
                 except (ValidationError, ValueError) as error:
                     # Feed the validation error back so the model can correct it.
                     logger.warning(
@@ -332,6 +346,42 @@ async def invoke_agentic(
                         }
                     )
                     continue
+                if terminal_guard is not None:
+                    try:
+                        rejection = terminal_guard(result)
+                    except Exception as error:
+                        rejection = f"{type(error).__name__}: {error}"
+                        logger.warning(
+                            "Terminal guard failed request_id={} role={} turn={} "
+                            "error_type={} error_chars={}",
+                            request_id,
+                            role.value,
+                            turn,
+                            type(error).__name__,
+                            len(str(error)),
+                        )
+                    if rejection is not None:
+                        diagnostic = str(rejection)[:2000]
+                        logger.warning(
+                            "Terminal result rejected by guard request_id={} role={} "
+                            "turn={} diagnostic_chars={}",
+                            request_id,
+                            role.value,
+                            turn,
+                            len(diagnostic),
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "content": (
+                                    "error: result rejected, correct and resubmit: "
+                                    f"{diagnostic}"
+                                ),
+                            }
+                        )
+                        continue
+                return result
             try:
                 result_text = tool_handler(tool_name, arguments)
             except Exception as error:
