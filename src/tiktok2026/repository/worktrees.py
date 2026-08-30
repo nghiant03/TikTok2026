@@ -66,7 +66,10 @@ class GitWorktreeManager:
         )
 
     def register_source(
-        self, assignment: WorktreeAssignment, allowed_scopes: tuple[str, ...]
+        self,
+        assignment: WorktreeAssignment,
+        allowed_scopes: tuple[str, ...],
+        previous: SourceRegistration | None = None,
     ) -> SourceRegistration:
         worktree_root = self.runtime_root / "worktrees"
         expected_path = worktree_root / assignment.run_id / assignment.experiment_id
@@ -76,9 +79,18 @@ class GitWorktreeManager:
         parent_commit = self._git("rev-parse", f"{assignment.parent_commit}^{{commit}}")
         if not self.approved_parent_validator(parent_commit):
             raise ValueError("parent commit is not approved")
-        if current_parent == parent_commit:
+        if previous is not None and (
+            previous.experiment_id != assignment.experiment_id
+            or previous.run_id != assignment.run_id
+            or previous.parent_commit != parent_commit
+        ):
+            raise ValueError("previous source registration does not match its assignment")
+        expected_commit = previous.source_commit if previous is not None else parent_commit
+        if current_parent == expected_commit:
             status = self._git("status", "--porcelain", "-z", cwd=assignment.path)
             if not status:
+                if previous is not None:
+                    return previous
                 raise ValueError("source registration requires changes")
             self._git("add", "--all", cwd=assignment.path)
             changed = tuple(
@@ -103,13 +115,13 @@ class GitWorktreeManager:
             source_commit = self._git("rev-parse", "HEAD", cwd=assignment.path)
         else:
             self._git(
-                "merge-base", "--is-ancestor", parent_commit, current_parent, cwd=assignment.path
+                "merge-base", "--is-ancestor", expected_commit, current_parent, cwd=assignment.path
             )
             if (
                 self._git(
                     "rev-list",
                     "--count",
-                    f"{parent_commit}..{current_parent}",
+                    f"{expected_commit}..{current_parent}",
                     cwd=assignment.path,
                 )
                 != "1"
@@ -161,6 +173,8 @@ class GitWorktreeManager:
         if self._git("status", "--porcelain", cwd=assignment.path):
             raise ValueError("source worktree is not clean after registration")
         return SourceRegistration(
+            registration_id=f"source-{source_commit}",
+            revision=previous.revision + 1 if previous is not None else 0,
             experiment_id=assignment.experiment_id,
             parent_commit=parent_commit,
             source_commit=source_commit,

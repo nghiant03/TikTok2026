@@ -160,6 +160,33 @@ def test_source_registration_recovers_after_patch_publish_failure(
     manager.remove(assignment)
 
 
+def test_source_registration_commits_a_revision_after_execution_repair(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    head = create_repository(repository)
+    manager = create_manager(repository, tmp_path / "runtime", head)
+    assignment = manager.create("run-1", spec(), head)
+    target = assignment.path / "src/tiktok2026/experiment/change.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    first = manager.register_source(
+        assignment, ("src/tiktok2026/experiment",)
+    )
+
+    target.write_text("VALUE = 2\n", encoding="utf-8")
+    second = manager.register_source(
+        assignment, ("src/tiktok2026/experiment",), first
+    )
+
+    assert second.revision == 1
+    assert second.registration_id != first.registration_id
+    assert second.source_commit != first.source_commit
+    assert run_git(assignment.path, "rev-list", "--count", f"{head}..HEAD") == "2"
+    assert run_git(assignment.path, "status", "--porcelain") == ""
+    manager.remove(assignment)
+
+
 def test_inspector_bounds_reads(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)

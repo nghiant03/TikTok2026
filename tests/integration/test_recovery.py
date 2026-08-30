@@ -2,10 +2,16 @@ import hashlib
 import subprocess
 from pathlib import Path
 
-from tiktok2026.contracts import WorktreeAssignment
+from tiktok2026.contracts import (
+    ExecutionResult,
+    FailureKind,
+    SourceRegistration,
+    WorktreeAssignment,
+)
 from tiktok2026.recovery import (
     RecoveryCandidate,
     reconcile_recovery,
+    validate_execution_recovery_state,
     validate_pre_registration_assignment,
 )
 
@@ -33,6 +39,55 @@ def test_recovery_releases_stale_state_when_all_identities_agree(tmp_path: Path)
     assert result.released_reservation_id == "reservation-1"
     assert not lock.exists()
     assert released == ["reservation-1"]
+
+
+def test_execution_recovery_requires_exact_checkpoint_and_source_identity() -> None:
+    commit = "a" * 40
+    registration = SourceRegistration(
+        experiment_id="exp-1",
+        run_id="run-1",
+        parent_commit="b" * 40,
+        source_commit=commit,
+        patch_sha256="c" * 64,
+        patch_artifact_id="patch-1",
+        patch_artifact_uri="file:///tmp/patch-1.diff",
+        allowed_scopes=("src/tiktok2026/experiment",),
+        eligible=True,
+    )
+    execution = ExecutionResult(
+        execution_id="execution-run-1-exp-1-39",
+        experiment_id="exp-1",
+        source_registration_id=registration.registration_id,
+        source_commit=commit,
+        command=("python", "-m", "tiktok2026.experiment.train"),
+        exit_code=1,
+        elapsed_seconds=0.1,
+        gpu_hours=0.0,
+        failure_kind=FailureKind.DEPENDENCY_ENVIRONMENT,
+    )
+    state = {
+        "phase": "execute",
+        "pending_route": "execute",
+        "current_experiment_id": "exp-1",
+        "state_version": 39,
+    }
+
+    valid = validate_execution_recovery_state(state, "run-1", execution, registration)
+    wrong_state = validate_execution_recovery_state(
+        {**state, "state_version": 40}, "run-1", execution, registration
+    )
+    wrong_source = validate_execution_recovery_state(
+        state,
+        "run-1",
+        execution.model_copy(update={"source_commit": "d" * 40}),
+        registration,
+    )
+
+    assert valid.resumable
+    assert not wrong_state.resumable
+    assert wrong_state.reason == "execution checkpoint identity mismatch"
+    assert not wrong_source.resumable
+    assert wrong_source.reason == "execution source identity mismatch"
 
 
 def test_recovery_preserves_state_and_blocks_on_identity_mismatch(tmp_path: Path) -> None:
@@ -99,6 +154,27 @@ def test_pre_registration_recovery_validates_assignment_without_source_artifact(
 
     assert result.resumable
     assert result.reason == "pre-registration identities verified"
+
+    (worktree / "README").write_text("registered\n", encoding="utf-8")
+    subprocess.run(("git", "add", "README"), cwd=worktree, check=True)
+    subprocess.run(("git", "commit", "-qm", "registered"), cwd=worktree, check=True)
+    registered = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (worktree / "README").write_text("repair\n", encoding="utf-8")
+
+    repair_result = validate_pre_registration_assignment(
+        assignment,
+        runtime,
+        lambda value: value == parent,
+        prior_source_commit=registered,
+    )
+
+    assert repair_result.resumable
 
 
 def test_recovery_rejects_missing_or_forged_artifact_identity(tmp_path: Path) -> None:

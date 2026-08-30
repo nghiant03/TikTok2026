@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
-from tiktok2026.contracts import WorktreeAssignment
+from tiktok2026.contracts import ExecutionResult, SourceRegistration, WorktreeAssignment
 
 
 class RecoveryCandidate(BaseModel):
@@ -33,10 +33,41 @@ class RecoveryResult(BaseModel):
     released_reservation_id: str | None = None
 
 
+def validate_execution_recovery_state(
+    state: Mapping[str, object],
+    run_id: str,
+    execution: ExecutionResult,
+    registration: SourceRegistration,
+) -> RecoveryResult:
+    """Verify that a historical execute checkpoint owns a persisted result."""
+
+    experiment_id = state.get("current_experiment_id")
+    state_version = state.get("state_version")
+    expected_execution_id = f"execution-{run_id}-{experiment_id}-{state_version}"
+    if state.get("pending_route") != "execute" or str(state.get("phase")) not in {
+        "execute",
+        "RunPhase.EXECUTE",
+    }:
+        return RecoveryResult(resumable=False, reason="checkpoint is not pending execution")
+    if execution.execution_id != expected_execution_id:
+        return RecoveryResult(resumable=False, reason="execution checkpoint identity mismatch")
+    if (
+        execution.experiment_id != experiment_id
+        or registration.experiment_id != experiment_id
+        or execution.source_registration_id != registration.registration_id
+        or execution.source_commit != registration.source_commit
+        or registration.run_id != run_id
+    ):
+        return RecoveryResult(resumable=False, reason="execution source identity mismatch")
+    return RecoveryResult(resumable=True, reason="execution result identities verified")
+
+
 def validate_pre_registration_assignment(
     assignment: WorktreeAssignment,
     runtime_root: Path,
     approved_parent_validator: Callable[[str], bool],
+    prior_source_commit: str | None = None,
+    allow_pending_commit: bool = False,
 ) -> RecoveryResult:
     """Validate a pending worktree before source or patch registration exists."""
     expected_path = (
@@ -57,8 +88,22 @@ def validate_pre_registration_assignment(
         return RecoveryResult(resumable=False, reason=str(error))
     if top_level != str(assignment.path.resolve()):
         return RecoveryResult(resumable=False, reason="assigned worktree root mismatch")
-    if head != parent:
-        return RecoveryResult(resumable=False, reason="worktree HEAD is not its approved parent")
+    expected_head = prior_source_commit or parent
+    if head != expected_head:
+        if not allow_pending_commit:
+            return RecoveryResult(resumable=False, reason="worktree HEAD identity mismatch")
+        try:
+            _git_output(assignment.path, ("merge-base", "--is-ancestor", expected_head, head))
+            count = _git_output(
+                assignment.path, ("rev-list", "--count", f"{expected_head}..{head}")
+            )
+            _, clean = _observe_worktree(assignment.path)
+        except ValueError as error:
+            return RecoveryResult(resumable=False, reason=str(error))
+        if count != "1" or not clean:
+            return RecoveryResult(
+                resumable=False, reason="pending source commit is not recoverable"
+            )
     if branch != assignment.branch:
         return RecoveryResult(resumable=False, reason="worktree branch identity mismatch")
     return RecoveryResult(resumable=True, reason="pre-registration identities verified")
