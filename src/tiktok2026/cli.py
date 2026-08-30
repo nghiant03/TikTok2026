@@ -87,6 +87,19 @@ def synthetic_run(
     _render(result)
 
 
+@app.command("calibrate-baseline")
+def calibrate_baseline_command(
+    runtime_root: Annotated[Path, typer.Option()],
+    repository_root: Annotated[Path | None, typer.Option()] = None,
+    profile_path: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    try:
+        result = _operations(runtime_root, repository_root, profile_path).calibrate_baseline()
+    except Exception as error:
+        _fail(error)
+    _render(result)
+
+
 @app.command("run")
 def run_command(
     runtime_root: Annotated[Path, typer.Option()],
