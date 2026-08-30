@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
 import sqlite3
 import subprocess
 import uuid
+from collections.abc import Generator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -37,12 +40,14 @@ from tiktok2026.contracts import (
     ExecutionRequest,
     ExecutionResult,
     ExperimentSpec,
+    FailureKind,
     Fidelity,
     FinalizationBundleRequest,
     ImplementationRequest,
     ImplementationResult,
     OperationResult,
     OrchestrationDecision,
+    OrchestrationRequest,
     PredictionArtifactRegistration,
     ProvisionalFinalizationRequest,
     ResearchDecision,
@@ -98,6 +103,11 @@ def verify_manifests(repository_root: Path) -> BenchmarkManifest:
     return manifest
 
 
+def _role_prompt(role: AgentRole) -> str:
+    prompt_path = Path(__file__).parent / "agents" / role.value / "prompt.md"
+    return prompt_path.read_text(encoding="utf-8")
+
+
 @dataclass
 class ProductionServices:
     controller: ProductionController
@@ -108,6 +118,7 @@ class ProductionServices:
     executor: Any = None
     evaluator: Any = None
     agent_clients: dict[AgentRole, RoleSpecificAgentClient] = field(default_factory=lambda: {})
+    resource_ledger: ResourceLedger | None = None
 
 
 def _current_commit(repository: Path) -> str | None:
@@ -179,6 +190,28 @@ def _persist_finalization(
 
 class OperationalError(RuntimeError):
     """A typed operator-facing failure from a bootstrap-owned operation."""
+
+
+@contextmanager
+def _exclusive_runtime_run(runtime_root: Path, run_id: str) -> Generator[None, None, None]:
+    locks = runtime_root / "locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    marker = locks / f"{run_id}.lock"
+    with (locks / "controller.lock").open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise OperationalError("another production run owns the runtime root") from error
+        handle.seek(0)
+        handle.truncate()
+        handle.write(run_id)
+        handle.flush()
+        marker.write_text(run_id, encoding="utf-8")
+        try:
+            yield
+        finally:
+            marker.unlink(missing_ok=True)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _initial_state(run_id: str) -> dict[str, object]:
@@ -273,6 +306,59 @@ class ProductionOperations:
             },
         )
 
+    def calibrate_baseline(self) -> OperationResult:
+        from tiktok2026.benchmark.kuaireand_pure.calibration import calibrate_baseline
+
+        settings = self._production_settings()
+        if settings.dataset_root is None:
+            raise OperationalError("baseline calibration requires a configured dataset_root")
+        verify_manifests(self.repository_root)
+        services = initialize_runtime(self.repository_root, self.runtime_root)
+        record, created = calibrate_baseline(
+            self.repository_root,
+            self.runtime_root,
+            settings.dataset_root,
+            services.repository.list_json("baseline_calibration"),
+        )
+        if created:
+            services.repository.put_json(
+                "baseline_calibration", record.calibration_id, record.model_dump_json()
+            )
+            services.repository.put_audit_event(
+                AuditEvent(
+                    event_id=f"baseline-calibrated-{record.calibration_id}",
+                    run_id=record.calibration_id,
+                    event_type="baseline_calibrated",
+                    actor_type="human",
+                    actor_id="cli-operator",
+                    payload={
+                        "calibration_id": record.calibration_id,
+                        "dataset_manifest_sha256": record.dataset_manifest_sha256,
+                        "evaluator_sha256": record.evaluator_sha256,
+                        "baseline_source_sha256": record.baseline_source_sha256,
+                        "config_sha256": record.config_sha256,
+                        "split": record.split,
+                    },
+                )
+            )
+        metrics = {metric.name: metric.value for metric in record.evaluation.metrics}
+        diagnostics = {metric.name: metric.value for metric in record.diagnostic_metrics}
+        return _result(
+            "calibrate-baseline",
+            status="created" if created else "cached",
+            values={
+                "calibration_id": record.calibration_id,
+                "split": record.split,
+                "NDCG@10": metrics["NDCG@10"],
+                "Recall@50": metrics["Recall@50"],
+                "composite": record.evaluation.validation_score,
+                "GAUC": diagnostics["GAUC"],
+                "nDCG@5": diagnostics["nDCG@5"],
+                "diagnostic_primary": diagnostics["primary"],
+                "prediction_artifact_uri": record.prediction_artifact_uri,
+            },
+        )
+
     def synthetic_run(self, iterations: int) -> OperationResult:
         from tiktok2026.testing import run_synthetic_lifecycle
 
@@ -296,6 +382,7 @@ class ProductionOperations:
             synthetic,
             self.runtime_root,
         )
+        ledger: ResourceLedger | None = None
         if synthetic:
             _controller, _store, graph = build_synthetic_controller(
                 self.repository_root, self.runtime_root
@@ -316,31 +403,46 @@ class ProductionOperations:
                 )
             services = build_production_services(settings)
             graph, repository = services.graph, services.repository
-        if not synthetic:
-            repository.put_run(
-                RunRecord(run_id=actual_run_id, status="active"), f"{actual_run_id}-active", None
-            )
-        repository.put_audit_event(
-            AuditEvent(
-                event_id=f"run-{actual_run_id}-start",
-                run_id=actual_run_id,
-                event_type="run_started",
-                actor_type="human",
-                actor_id="cli-operator",
-                payload={
-                    "run_id": actual_run_id,
-                    "mode": "synthetic" if synthetic else "production",
-                },
-            )
+            ledger = services.resource_ledger
+        run_lock = (
+            _exclusive_runtime_run(self.runtime_root, actual_run_id)
+            if not synthetic
+            else nullcontext()
         )
-        try:
-            state = asyncio.run(
-                graph.ainvoke(
-                    _initial_state(actual_run_id), {"configurable": {"thread_id": actual_run_id}}
+        with run_lock:
+            if ledger is not None:
+                ledger.claim_run(actual_run_id)
+            try:
+                if not synthetic:
+                    repository.put_run(
+                        RunRecord(run_id=actual_run_id, status="active"),
+                        f"{actual_run_id}-active",
+                        None,
+                    )
+                repository.put_audit_event(
+                    AuditEvent(
+                        event_id=f"run-{actual_run_id}-start",
+                        run_id=actual_run_id,
+                        event_type="run_started",
+                        actor_type="human",
+                        actor_id="cli-operator",
+                        payload={
+                            "run_id": actual_run_id,
+                            "mode": "synthetic" if synthetic else "production",
+                        },
+                    )
                 )
-            )
-        except Exception as error:
-            raise OperationalError(str(error)) from error
+                state = asyncio.run(
+                    graph.ainvoke(
+                        _initial_state(actual_run_id),
+                        {"configurable": {"thread_id": actual_run_id}},
+                    )
+                )
+            except Exception as error:
+                raise OperationalError(str(error)) from error
+            finally:
+                if ledger is not None:
+                    ledger.release_run(actual_run_id)
         return _result(
             "run",
             run_id=actual_run_id,
@@ -376,7 +478,9 @@ class ProductionOperations:
             )
         else:
             settings = self._production_settings()
-            graph = build_production_services(settings).graph
+            services = build_production_services(settings)
+            self._bind_resumed_implementor(services, repository, state)
+            graph = services.graph
         try:
             result = asyncio.run(graph.ainvoke(None, {"configurable": {"thread_id": run_id}}))
         except Exception as error:
@@ -533,6 +637,7 @@ class ProductionOperations:
             "research",
             "proposal_policy",
             "proposal_validation",
+            "persist_failure",
         }:
             return
         if route == "create_worktree":
@@ -573,6 +678,30 @@ class ProductionOperations:
                 raise OperationalError(result.reason)
             return
         self._reconcile_late_resume(repository, run_id, state)
+
+    @staticmethod
+    def _bind_resumed_implementor(
+        services: ProductionServices,
+        repository: ApplicationRepository,
+        state: dict[str, object],
+    ) -> None:
+        route = str(state.get("pending_route") or "")
+        resumable_implementation_routes = {
+            "implement",
+            "diff_policy",
+            "implementation_validation",
+            "register_source",
+        }
+        if route not in resumable_implementation_routes:
+            return
+        experiment_id = str(state.get("current_experiment_id") or "")
+        store = RepositoryRunStore(repository)
+        assignment = store.get_worktree_assignment(experiment_id) if experiment_id else None
+        spec = store.get_experiment(experiment_id) if experiment_id else None
+        implementor = services.agent_clients.get(AgentRole.IMPLEMENTOR)
+        if assignment is None or spec is None or implementor is None:
+            raise OperationalError("resumed implementor authority is unavailable")
+        implementor.bind_worktree(assignment.path, spec.implementation_scope)
 
     def _approved_parent_for_resume(self, commit: str) -> bool:
         return _current_commit(self.repository_root) == commit
@@ -616,6 +745,12 @@ def build_production_operations(
 ) -> ProductionOperations:
     """Build the sole operator-facing composition used by the CLI."""
     return ProductionOperations(repository_root, runtime_root, profile_path, operator_config)
+
+
+class _ExecutionArtifactContractError(ValueError):
+    def __init__(self, message: str, failure_kind: FailureKind) -> None:
+        super().__init__(message)
+        self.failure_kind = failure_kind
 
 
 class _RunBoundDockerExecutor:
@@ -662,7 +797,15 @@ class _RunBoundDockerExecutor:
         result = await executor.execute(request)
         if result.exit_code != 0:
             return result
-        return self._register_training_artifacts(request, result)
+        try:
+            return self._register_training_artifacts(request, result)
+        except _ExecutionArtifactContractError as error:
+            # The process completed, but its required output contract did not.
+            # Return a typed failed result so the controller persists and routes
+            # it like every other execution failure.
+            return result.model_copy(
+                update={"exit_code": 1, "failure_kind": error.failure_kind}
+            )
 
     def _register_training_artifacts(
         self, request: ExecutionRequest, result: ExecutionResult
@@ -676,14 +819,21 @@ class _RunBoundDockerExecutor:
         predictions_path = output / "predictions.json"
         checkpoint_path = output / "checkpoint_bundle.json"
         if not predictions_path.is_file() or not checkpoint_path.is_file():
-            raise ValueError("execution did not produce prediction and checkpoint artifacts")
+            raise _ExecutionArtifactContractError(
+                "execution did not produce prediction and checkpoint artifacts",
+                FailureKind.MISSING_PATH,
+            )
         try:
             predictions = json.loads(predictions_path.read_text(encoding="utf-8"))
             checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise ValueError("execution artifacts are not valid JSON") from error
+            raise _ExecutionArtifactContractError(
+                "execution artifacts are not valid JSON", FailureKind.SCHEMA_MISMATCH
+            ) from error
         if not isinstance(predictions, dict) or not isinstance(checkpoint, dict):
-            raise ValueError("execution artifacts must be JSON objects")
+            raise _ExecutionArtifactContractError(
+                "execution artifacts must be JSON objects", FailureKind.SCHEMA_MISMATCH
+            )
         prediction_payload = cast(dict[str, object], predictions)
         checkpoint_payload = cast(dict[str, object], checkpoint)
         prediction_bytes = predictions_path.read_bytes()
@@ -695,7 +845,10 @@ class _RunBoundDockerExecutor:
             "execution_id": request.execution_id,
         }
         if any(prediction_payload.get(key) != value for key, value in expected.items()):
-            raise ValueError("prediction artifact provenance does not match execution")
+            raise _ExecutionArtifactContractError(
+                "prediction artifact provenance does not match execution",
+                FailureKind.SCHEMA_MISMATCH,
+            )
         checkpoint_expected = {
             "data_manifest_id": dataset_identity.manifest_id,
             "source_commit": request.source_commit,
@@ -704,10 +857,15 @@ class _RunBoundDockerExecutor:
             "prediction_sha256": prediction_sha256,
         }
         if any(checkpoint_payload.get(key) != value for key, value in checkpoint_expected.items()):
-            raise ValueError("checkpoint artifact provenance does not match execution")
+            raise _ExecutionArtifactContractError(
+                "checkpoint artifact provenance does not match execution",
+                FailureKind.SCHEMA_MISMATCH,
+            )
         checkpoint_id = checkpoint_payload.get("checkpoint_id")
         if not isinstance(checkpoint_id, str) or not checkpoint_id:
-            raise ValueError("checkpoint artifact has no checkpoint identity")
+            raise _ExecutionArtifactContractError(
+                "checkpoint artifact has no checkpoint identity", FailureKind.SCHEMA_MISMATCH
+            )
         prediction = self.artifact_store.publish_bytes(
             request.run_id,
             request.experiment_id,
@@ -851,19 +1009,11 @@ def build_production_services(settings: Any) -> ProductionServices:
     executor = _RunBoundDockerExecutor(
         repository=repo,
         artifact_store=artifact_store,
-        policy=ExecutionPolicy(),
+        policy=ExecutionPolicy(allowed_image_digests=(app_settings.docker_image,)),
         dataset_provider=dataset_provider,
         evaluator=evaluator,
     )
-    prompts = {
-        AgentRole.ORCHESTRATION: "Select one allowed orchestration action as JSON.",
-        AgentRole.RESEARCH: "Return one evidence-backed ResearchDecision as JSON.",
-        AgentRole.IMPLEMENTOR: (
-            "Use the bound scoped worktree capability and return one faithful "
-            "ImplementationResult as JSON with at least one bounded edit."
-        ),
-        AgentRole.VALIDATOR: "Return one adversarial ValidationReport as JSON.",
-    }
+    prompts = {role: _role_prompt(role) for role in AgentRole}
     capabilities = {
         AgentRole.ORCHESTRATION: ("route", "budget", "frontier"),
         AgentRole.RESEARCH: ("repository_read", "dataset_summary", "memory", "literature"),
@@ -897,12 +1047,23 @@ def build_production_services(settings: Any) -> ProductionServices:
         dataset_root=str(app_settings.dataset_root) if app_settings.dataset_root else None,
         evaluator_id=app_settings.evaluator_id,
         docker_image=app_settings.docker_image,
-        default_timeout_seconds=300,
+        default_timeout_seconds=app_settings.execution.timeout_seconds,
+        default_memory_bytes=app_settings.execution.memory_bytes,
+        default_cpus=app_settings.execution.cpus,
+        max_repairs=app_settings.budget.max_repairs,
     )
     controller = ProductionController(ControllerServices(transitions=transitions, store=run_store))
     graph = build_production_graph(controller, checkpointer=SqliteCheckpointer(paths.graph_db))
     return ProductionServices(
-        controller, repo, graph, app_settings, worktree_manager, executor, evaluator, agents
+        controller,
+        repo,
+        graph,
+        app_settings,
+        worktree_manager,
+        executor,
+        evaluator,
+        agents,
+        ledger,
     )
 
 
@@ -1061,9 +1222,14 @@ class _SyntheticExecutor:
 class _ScriptedAgent:
     def __init__(self) -> None:
         self._proposal_count = 0
+        self.scoped_repository: _SyntheticScopedRepository | None = None
+
+    def bind_worktree(self, path: Path, allowed_scopes: tuple[str, ...]) -> None:
+        del path
+        self.scoped_repository = _SyntheticScopedRepository(allowed_scopes)
 
     async def invoke(self, request: ContractModel) -> ContractModel:
-        if isinstance(request, ResearchRequest) and request.objective == "orchestrate":
+        if isinstance(request, OrchestrationRequest):
             return OrchestrationDecision(
                 decision_id=f"decision-{request.request_id}",
                 action=DecisionAction.RESEARCH,
@@ -1105,6 +1271,25 @@ class _ScriptedAgent:
                 leakage_risk="none",
             )
         raise ValueError("unsupported synthetic request")
+
+
+class _SyntheticScopedRepository:
+    def __init__(self, allowed_scopes: tuple[str, ...]) -> None:
+        self.allowed_scopes = allowed_scopes
+
+    def changed_files(self) -> tuple[str, ...]:
+        return (f"{self.allowed_scopes[0]}/train.py",)
+
+    def read(self, relative_path: str, max_characters: int = 20_000) -> str:
+        del relative_path, max_characters
+        return "def run_training():\n    pass\n"
+
+    def read_base(self, relative_path: str, max_characters: int = 20_000) -> str:
+        del relative_path, max_characters
+        return "def run_training():\n    pass\n"
+
+    def diff(self) -> str:
+        return "synthetic implementation diff\n"
 
 
 def build_synthetic_controller(

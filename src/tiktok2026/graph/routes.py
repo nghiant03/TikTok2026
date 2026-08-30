@@ -3,6 +3,7 @@ from tiktok2026.contracts import (
     FailureKind,
     FailureRecord,
     OrchestrationDecision,
+    RunPhase,
     ValidationReport,
     ValidationVerdict,
 )
@@ -22,6 +23,13 @@ REPAIRABLE_FAILURES = {
     FailureKind.CORRUPTED_CHECKPOINT,
 }
 
+REPAIRABLE_PHASES = {
+    RunPhase.RESEARCH,
+    RunPhase.IMPLEMENT,
+    RunPhase.EXECUTE,
+    RunPhase.EVALUATE,
+}
+
 ACTION_ROUTES = {
     DecisionAction.RESEARCH: "research",
     DecisionAction.IMPLEMENT: "implement",
@@ -34,13 +42,25 @@ ACTION_ROUTES = {
 }
 
 
-def route_after_failure(state: ProductionState, failure: FailureRecord) -> str:
-    if failure.kind in REPAIRABLE_FAILURES and state["repair_attempts"] < 2:
+def route_after_failure(
+    state: ProductionState,
+    failure: FailureRecord,
+    max_repairs: int = 2,
+) -> str:
+    if (
+        failure.kind in REPAIRABLE_FAILURES
+        and state.get("current_experiment_id") is not None
+        and state["phase"] in REPAIRABLE_PHASES
+        and state["repair_attempts"] < max_repairs
+    ):
         return "repair"
-    # ``persist_failure`` is a persistence operation, not a retry edge.  Once
-    # classified and persisted, a non-repairable/exhausted failure can only
-    # leave the experiment through the finite export path.
-    return "export"
+    if (
+        failure.kind in REPAIRABLE_FAILURES | {FailureKind.UNSTABLE_VALIDATION}
+        and state.get("current_experiment_id") is not None
+        and state["phase"] in REPAIRABLE_PHASES
+    ):
+        return "orchestrate"
+    return "terminal"
 
 
 def route_after_validation(state: ProductionState, report: ValidationReport) -> str:

@@ -7,12 +7,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NoReturn
 
+from loguru import logger
+
 from tiktok2026.contracts import (
     AgentClient,
     AgentFailure,
     AgentRole,
+    ControllerContext,
+    DecisionAction,
     EvaluationContext,
     EvaluationRequest,
+    EvaluationResult,
     Evaluator,
     ExecutionRequest,
     Executor,
@@ -23,9 +28,12 @@ from tiktok2026.contracts import (
     FinalizationBundleRequest,
     FinalizationBundleService,
     FrontierService,
+    ImplementationAttemptRecord,
     ImplementationRequest,
     ImplementationResult,
+    ImplementationValidationAuthority,
     OrchestrationDecision,
+    OrchestrationRequest,
     PolicyGate,
     ProvenanceRequest,
     ProvisionalFinalizationRequest,
@@ -61,6 +69,20 @@ class TerminalLifecycleError(RuntimeError):
     """A typed terminal failure that must not continue to export or complete."""
 
     terminal = True
+
+
+class ModelUnavailableError(RuntimeError):
+    """A model call failed before an authoritative agent judgment was produced."""
+
+
+def _agent_failure(state: ProductionState, failure: AgentFailure) -> dict[str, object]:
+    if failure.kind == "model":
+        raise ModelUnavailableError(failure.message)
+    return _failure(state, FailureKind.SCHEMA_MISMATCH, failure.message)
+
+
+IMPLEMENTATION_ROOTS = ("src/tiktok2026/experiment",)
+EXPERIMENT_ENTRYPOINT = "src/tiktok2026/experiment/train.py"
 
 
 def _agent(s: ServiceTransitions, role: AgentRole) -> AgentClient | None:
@@ -123,6 +145,7 @@ class ServiceTransitions:
     default_timeout_seconds: int = 300
     default_memory_bytes: int = 1 << 30
     default_cpus: float = 1.0
+    max_repairs: int = 2
 
 
 def make_service_transitions(
@@ -147,6 +170,7 @@ def make_service_transitions(
     default_timeout_seconds: int = 300,
     default_memory_bytes: int = 1 << 30,
     default_cpus: float = 1.0,
+    max_repairs: int = 2,
 ) -> Mapping[str, Transition]:
     s = ServiceTransitions(
         agent_client=agent_client,
@@ -169,6 +193,7 @@ def make_service_transitions(
         default_timeout_seconds=default_timeout_seconds,
         default_memory_bytes=default_memory_bytes,
         default_cpus=default_cpus,
+        max_repairs=max_repairs,
     )
     return {
         "bootstrap": _bootstrap(s),
@@ -225,16 +250,48 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
         client = _agent(s, AgentRole.ORCHESTRATION)
         if client is None:
             return {"pending_route": "research"}
-        request = ResearchRequest(
+        finalization_ready = _finalization_ready(s, state)
+        allowed_actions = (DecisionAction.RESEARCH,)
+        if finalization_ready:
+            allowed_actions = (
+                DecisionAction.RESEARCH,
+                DecisionAction.REPLICATE,
+                DecisionAction.INCREASE_FIDELITY,
+                DecisionAction.REVISIT_BRANCH,
+                DecisionAction.STOP,
+            )
+        request = OrchestrationRequest(
             request_id=f"orchestration-{state['run_id']}-{state['state_version']}",
-            objective="orchestrate",
+            run_id=state["run_id"],
+            phase=state["phase"],
+            allowed_actions=allowed_actions,
             resource_state=_resource_state(s),
+            current_experiment_id=state.get("current_experiment_id"),
+            latest_evaluation_result_id=state.get("latest_evaluation_result_id"),
+            finalization_ready=finalization_ready,
+            failure_summary=state.get("terminal_reason"),
+            controller_context=_controller_context(s),
         )
         response = await client.invoke(request)
         if isinstance(response, AgentFailure):
-            return _failure(state, FailureKind.SCHEMA_MISMATCH, response.message)
+            return _agent_failure(state, response)
         if not isinstance(response, OrchestrationDecision):
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "invalid orchestration response")
+        if response.action not in request.allowed_actions:
+            return _failure(
+                state,
+                FailureKind.SCHEMA_MISMATCH,
+                f"orchestration selected disallowed action: {response.action.value}",
+            )
+        if (
+            response.target_experiment_id is not None
+            and response.target_experiment_id != request.current_experiment_id
+        ):
+            return _failure(
+                state,
+                FailureKind.SCHEMA_MISMATCH,
+                "orchestration selected an unauthorized experiment identity",
+            )
         return {
             "orchestration_decision_id": response.decision_id,
             "pending_route": route_after_orchestration(response),
@@ -243,31 +300,61 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
     return transition
 
 
+def _finalization_ready(s: ServiceTransitions, state: ProductionState) -> bool:
+    experiment_id = state.get("current_experiment_id")
+    evaluation_id = state.get("latest_evaluation_result_id")
+    if (
+        s.run_store is None
+        or s.bundle_service is None
+        or s.evaluator_id is None
+        or experiment_id is None
+        or evaluation_id is None
+    ):
+        return False
+    source = s.run_store.get_source_registration(experiment_id)
+    evaluation = s.run_store.get_evaluation_result(evaluation_id)
+    return (
+        source is not None
+        and evaluation is not None
+        and evaluation.experiment_id == experiment_id
+    )
+
+
 def _research(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         client = _agent(s, AgentRole.RESEARCH)
         if client is None:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "research role is not configured")
+        objective = "propose next experiment"
+        if state.get("terminal_reason"):
+            _, message, _ = _failure_details(state)
+            objective += f"; address validator feedback: {message}"
         request = ResearchRequest(
             request_id=f"research-{state['run_id']}-{state['state_version']}",
-            objective="propose next experiment",
+            objective=objective,
             resource_state=_resource_state(s),
+            allowed_paths=IMPLEMENTATION_ROOTS,
+            controller_context=_controller_context(s),
         )
         response = await client.invoke(request)
         if isinstance(response, AgentFailure):
-            return _failure(state, FailureKind.SCHEMA_MISMATCH, response.message)
+            return _agent_failure(state, response)
         if not isinstance(response, ResearchDecision) or response.experiment_spec is None:
             return _failure(
                 state, FailureKind.SCHEMA_MISMATCH, "research returned no experiment spec"
             )
         spec = response.experiment_spec
+        is_new_experiment = spec.experiment_id != state.get("current_experiment_id")
         if s.run_store is not None:
             s.run_store.put_experiment(
                 spec, "proposed", state["run_id"], f"proposed-{spec.experiment_id}"
             )
         return {
+            "phase": RunPhase.RESEARCH,
             "current_experiment_id": spec.experiment_id,
             "current_hypothesis_id": spec.hypothesis_id,
+            "repair_attempts": 0 if is_new_experiment else state["repair_attempts"],
+            "terminal_reason": None,
             "pending_route": "proposal_policy",
         }
 
@@ -285,6 +372,24 @@ def _resource_state(s: ServiceTransitions) -> ResourceState:
         remaining_tokens=0,
         disk_bytes_available=0,
         reserved_final_gpu_hours=0,
+    )
+
+
+def _controller_context(s: ServiceTransitions) -> ControllerContext:
+    dataset = s.run_store.get_dataset_manifest_identity() if s.run_store is not None else None
+    evaluator = (
+        s.run_store.get_evaluator_identity(s.evaluator_id)
+        if s.run_store is not None and s.evaluator_id is not None
+        else None
+    )
+    return ControllerContext(
+        dataset_manifest_identity=dataset,
+        evaluator_identity=evaluator,
+        parent_commit=s.parent_commit,
+        docker_image=s.docker_image,
+        experiment_registry=(
+            s.run_store.get_experiment_registry() if s.run_store is not None else None
+        ),
     )
 
 
@@ -310,7 +415,7 @@ def _proposal_policy(s: ServiceTransitions) -> Transition:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         if s.policy_gate is not None:
             decision = s.policy_gate.check_paths(
-                spec.implementation_scope, spec.implementation_scope
+                spec.implementation_scope, IMPLEMENTATION_ROOTS
             )
             if not decision.allowed:
                 return _failure(state, FailureKind.SCHEMA_MISMATCH, decision.reason)
@@ -324,23 +429,48 @@ def _proposal_validation(s: ServiceTransitions) -> Transition:
         client = _agent(s, AgentRole.VALIDATOR)
         if client is None:
             return {"pending_route": "create_worktree"}
+        try:
+            spec = _spec(s, state)
+        except MissingAuthorityError as error:
+            return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         response = await client.invoke(
             ValidationRequest(
                 request_id=f"proposal-validation-{state['run_id']}-{state['state_version']}",
-                experiment_id=_exp_id(state),
+                experiment_id=spec.experiment_id,
                 stage=ValidationStage.PROPOSAL,
+                subject={
+                    "experiment_spec": spec.model_dump(mode="json"),
+                    "controller_context": _controller_context(s).model_dump(mode="json"),
+                },
             )
         )
         if isinstance(response, AgentFailure):
-            return _failure(state, FailureKind.SCHEMA_MISMATCH, response.message)
+            return _agent_failure(state, response)
         if not isinstance(response, ValidationReport):
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "invalid proposal validation")
-        return {
-            "latest_validation_report_id": response.report_id,
-            "pending_route": route_after_validation(state, response),
-        }
+        return _validation_updates(state, response)
 
     return transition
+
+
+def _validation_updates(
+    state: ProductionState, report: ValidationReport
+) -> dict[str, object]:
+    route = route_after_validation(state, report)
+    updates: dict[str, object] = {"latest_validation_report_id": report.report_id}
+    if route not in {"repair", "persist_failure"}:
+        return updates | {"pending_route": route}
+    message = "; ".join(report.blockers) or f"{report.stage.value} validation rejected"
+    return updates | _failure(
+        state,
+        (
+            FailureKind.SCHEMA_MISMATCH
+            if route == "repair"
+            else FailureKind.UNSTABLE_VALIDATION
+        ),
+        message,
+        report.evidence_refs,
+    )
 
 
 def _create_worktree(s: ServiceTransitions) -> Transition:
@@ -360,7 +490,11 @@ def _create_worktree(s: ServiceTransitions) -> Transition:
                 binder(assignment.path, spec.implementation_scope)
         except (MissingAuthorityError, ValueError) as error:
             return _failure(state, FailureKind.MISSING_PATH, str(error))
-        return {"active_worktree_id": assignment.worktree_id, "pending_route": "implement"}
+        return {
+            "phase": RunPhase.IMPLEMENT,
+            "active_worktree_id": assignment.worktree_id,
+            "pending_route": "implement",
+        }
 
     return transition
 
@@ -376,19 +510,36 @@ def _implement(s: ServiceTransitions) -> Transition:
             spec = _spec(s, state)
         except MissingAuthorityError as error:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
+        repository = getattr(client, "scoped_repository", None)
+        try:
+            source_context: dict[str, str] = {}
+            base_source_context: dict[str, str] = {}
+            if repository is not None:
+                current_source = repository.read(EXPERIMENT_ENTRYPOINT, 100_000)
+                base_source = repository.read_base(EXPERIMENT_ENTRYPOINT, 100_000)
+                source_context[EXPERIMENT_ENTRYPOINT] = current_source
+                if current_source != base_source:
+                    base_source_context[EXPERIMENT_ENTRYPOINT] = base_source
+        except (OSError, PermissionError, ValueError, RuntimeError) as error:
+            return _failure(state, FailureKind.MISSING_PATH, str(error))
         response = await client.invoke(
             ImplementationRequest(
                 request_id=f"implementation-{state['run_id']}-{state['state_version']}",
                 experiment_id=spec.experiment_id,
+                experiment_spec=spec,
                 allowed_scopes=spec.implementation_scope,
                 capabilities=("scoped_read", "scoped_write", "diff", "checks"),
+                repair_feedback=(
+                    _failure_details(state)[1] if state["repair_attempts"] > 0 else None
+                ),
+                source_context=source_context,
+                base_source_context=base_source_context,
             )
         )
         if isinstance(response, AgentFailure):
-            return _failure(state, FailureKind.SCHEMA_MISMATCH, response.message)
+            return _agent_failure(state, response)
         if not isinstance(response, ImplementationResult):
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "invalid implementation response")
-        repository = getattr(client, "scoped_repository", None)
         if repository is not None:
             try:
                 changed_files = tuple(repository.changed_files())
@@ -400,10 +551,21 @@ def _implement(s: ServiceTransitions) -> Transition:
                 return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
             response = response.model_copy(update={"changed_files": changed_files})
         if s.run_store is not None:
-            s.run_store.put_json(
-                "implementation", response.experiment_id, response.model_dump_json()
+            record = ImplementationAttemptRecord(
+                experiment_id=response.experiment_id,
+                repair_attempt=state["repair_attempts"],
+                result=response,
             )
-        return {"phase": RunPhase.IMPLEMENT, "pending_route": "diff_policy"}
+            s.run_store.put_json(
+                "implementation",
+                f"{response.experiment_id}:attempt:{state['repair_attempts']}",
+                record.model_dump_json(),
+            )
+        return {
+            "phase": RunPhase.IMPLEMENT,
+            "terminal_reason": None,
+            "pending_route": "diff_policy",
+        }
 
     return transition
 
@@ -415,8 +577,18 @@ def _implementation_result(
         return None
     values = s.run_store.list_json("implementation")
     for value in values:
-        result = ImplementationResult.model_validate_json(value)
-        if result.experiment_id == state.get("current_experiment_id"):
+        try:
+            record = ImplementationAttemptRecord.model_validate_json(value)
+            attempt = record.repair_attempt
+            result = record.result
+        except ValueError:
+            # Existing pre-versioning records represent the initial attempt.
+            attempt = 0
+            result = ImplementationResult.model_validate_json(value)
+        if (
+            result.experiment_id == state.get("current_experiment_id")
+            and attempt == state["repair_attempts"]
+        ):
             return result
     return None
 
@@ -441,6 +613,12 @@ def _diff_policy(s: ServiceTransitions) -> Transition:
                 return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         if result is None:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "implementation result is absent")
+        if EXPERIMENT_ENTRYPOINT not in result.changed_files:
+            return _failure(
+                state,
+                FailureKind.SCHEMA_MISMATCH,
+                f"implementation must integrate the execution entrypoint: {EXPERIMENT_ENTRYPOINT}",
+            )
         if s.policy_gate is not None:
             spec = _spec(s, state)
             decision = s.policy_gate.check_paths(result.changed_files, spec.implementation_scope)
@@ -458,23 +636,73 @@ def _validation(
         client = _agent(s, AgentRole.VALIDATOR)
         if client is None:
             return {"pending_route": route}
+        try:
+            subject = _validation_subject(s, state, stage)
+        except MissingAuthorityError as error:
+            return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         response = await client.invoke(
             ValidationRequest(
                 request_id=f"{stage.value}-validation-{state['run_id']}-{state['state_version']}",
                 experiment_id=_exp_id(state),
                 stage=stage,
+                subject=subject,
             )
         )
         if isinstance(response, AgentFailure):
-            return _failure(state, FailureKind.SCHEMA_MISMATCH, response.message)
+            return _agent_failure(state, response)
         if not isinstance(response, ValidationReport):
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "invalid validation response")
-        return {
-            "latest_validation_report_id": response.report_id,
-            "pending_route": route_after_validation(state, response),
-        }
+        return _validation_updates(state, response)
 
     return transition
+
+
+def _validation_subject(
+    s: ServiceTransitions, state: ProductionState, stage: ValidationStage
+) -> dict[str, object]:
+    subject: dict[str, object] = {
+        "experiment_spec": _spec(s, state).model_dump(mode="json"),
+        "controller_context": _controller_context(s).model_dump(mode="json"),
+    }
+    if stage == ValidationStage.IMPLEMENTATION:
+        implementation = _implementation_result(s, state)
+        if implementation is None:
+            raise MissingAuthorityError("implementation result is absent")
+        subject["implementation_result"] = implementation.model_dump(mode="json")
+        if s.run_store is None:
+            raise MissingAuthorityError("run store is required for implementation validation")
+        assignment = s.run_store.get_worktree_assignment(_exp_id(state))
+        repository = getattr(_agent(s, AgentRole.IMPLEMENTOR), "scoped_repository", None)
+        if assignment is None or repository is None:
+            raise MissingAuthorityError("implementation worktree authority is absent")
+        try:
+            diff = repository.diff()
+            changed_files = tuple(repository.changed_files())
+        except (OSError, PermissionError, ValueError, RuntimeError) as error:
+            raise MissingAuthorityError(str(error)) from error
+        if not diff or not changed_files:
+            raise MissingAuthorityError("implementation diff authority is absent")
+        digest = hashlib.sha256(diff.encode()).hexdigest()
+        subject["implementation_authority"] = ImplementationValidationAuthority(
+            evidence_id=f"implementation-diff-{digest}",
+            worktree_id=assignment.worktree_id,
+            parent_commit=assignment.parent_commit,
+            diff_sha256=digest,
+            changed_files=changed_files,
+            allowed_scopes=_spec(s, state).implementation_scope,
+        ).model_dump(mode="json")
+    elif stage == ValidationStage.RESULT:
+        if s.run_store is None:
+            raise MissingAuthorityError("run store is required for result validation")
+        evaluation_id = state.get("latest_evaluation_result_id")
+        execution_id = state.get("latest_execution_result_id")
+        evaluation = s.run_store.get_evaluation_result(evaluation_id) if evaluation_id else None
+        execution = s.run_store.get_execution_result(execution_id) if execution_id else None
+        if evaluation is None or execution is None:
+            raise MissingAuthorityError("result validation evidence is absent")
+        subject["evaluation_result"] = evaluation.model_dump(mode="json")
+        subject["execution_result"] = execution.model_dump(mode="json")
+    return subject
 
 
 def _implementation_validation(s: ServiceTransitions) -> Transition:
@@ -508,14 +736,43 @@ def _preflight(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         if s.run_store is not None and s.run_store.get_source_registration(_exp_id(state)) is None:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "source registration was not found")
-        return {"pending_route": "execute"}
+        return {"phase": RunPhase.EXECUTE, "pending_route": "execute"}
 
     return transition
 
 
+def _fresh_execution_output_path(runtime_root: str, execution_id: str) -> Path:
+    """Create the controller-owned, empty host directory for one execution."""
+
+    root = Path(runtime_root).resolve()
+    artifacts_root = root / "artifacts"
+    execution_root = artifacts_root / ".execution"
+    if artifacts_root.is_symlink() or execution_root.is_symlink():
+        raise ValueError("execution output root must not be a symlink")
+    try:
+        execution_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        execution_root.chmod(0o755)
+        output = execution_root / hashlib.sha256(execution_id.encode()).hexdigest()
+        if output.exists():
+            raise ValueError("execution output path already exists")
+        output.mkdir(parents=True, mode=0o777)
+        # The container runs as a fixed non-root UID.  This directory is
+        # isolated per execution, so granting it writable access does not
+        # expose other runtime state.
+        output.chmod(0o777)
+    except OSError as error:
+        raise ValueError("execution output directory could not be prepared") from error
+    return output
+
+
 def _execute(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
-        if s.executor is None or s.run_store is None or s.dataset_root is None:
+        if (
+            s.executor is None
+            or s.run_store is None
+            or s.dataset_root is None
+            or s.runtime_root is None
+        ):
             return _failure(state, FailureKind.MISSING_PATH, "execution provenance is incomplete")
         try:
             spec = _spec(s, state)
@@ -538,6 +795,7 @@ def _execute(s: ServiceTransitions) -> Transition:
             execution_id = (
                 f"execution-{state['run_id']}-{spec.experiment_id}-{state['state_version']}"
             )
+            output_path = _fresh_execution_output_path(s.runtime_root, execution_id)
             request = ExecutionRequest(
                 run_id=state["run_id"],
                 execution_id=execution_id,
@@ -556,7 +814,7 @@ def _execute(s: ServiceTransitions) -> Transition:
                 image=s.docker_image or "",
                 source_path=assignment.path,
                 dataset_path=Path(s.dataset_root),
-                output_path=Path(s.runtime_root or s.dataset_root) / "artifacts" / state["run_id"],
+                output_path=output_path,
                 timeout_seconds=s.default_timeout_seconds,
                 memory_bytes=s.default_memory_bytes,
                 cpus=s.default_cpus,
@@ -682,6 +940,7 @@ def _evaluate(s: ServiceTransitions) -> Transition:
                 evaluator_sha256=evaluator.evaluator_sha256,
             )
             s.run_store.put_evaluation(result, provenance)
+            _log_evaluation_metrics(s, result)
         except (MissingAuthorityError, ValueError) as error:
             return _failure(state, FailureKind.EVALUATOR_OUTPUT, str(error))
         return {
@@ -691,6 +950,94 @@ def _evaluate(s: ServiceTransitions) -> Transition:
         }
 
     return transition
+
+
+def _log_evaluation_metrics(s: ServiceTransitions, result: EvaluationResult) -> None:
+    metrics = {metric.name: metric.value for metric in result.metrics}
+    ndcg = metrics["NDCG@10"]
+    recall = metrics["Recall@50"]
+    calibrations = (
+        s.run_store.list_baseline_calibrations() if s.run_store is not None else ()
+    )
+    matching_calibrations = tuple(
+        calibration
+        for calibration in calibrations
+        if calibration.dataset_manifest_sha256 == result.dataset_manifest_sha256
+        and calibration.evaluator_sha256 == result.evaluator_sha256
+        and calibration.split == result.split
+    )
+    if matching_calibrations:
+        baseline = matching_calibrations[0]
+        baseline_metrics = {
+            metric.name: metric.value for metric in baseline.evaluation.metrics
+        }
+        baseline_ndcg = baseline_metrics["NDCG@10"]
+        baseline_recall = baseline_metrics["Recall@50"]
+        logger.info(
+            "Provisional pipeline metrics experiment_id={} evaluation_id={} "
+            "NDCG@10={:.6f} Recall@50={:.6f} composite={:.6f} "
+            "baseline=starter_kit_fm baseline_calibration_id={} "
+            "baseline_NDCG@10={:.6f} baseline_Recall@50={:.6f} "
+            "delta_NDCG@10={:+.6f} delta_Recall@50={:+.6f} delta_composite={:+.6f}",
+            result.experiment_id,
+            result.evaluation_id,
+            ndcg,
+            recall,
+            result.validation_score,
+            baseline.calibration_id,
+            baseline_ndcg,
+            baseline_recall,
+            ndcg - baseline_ndcg,
+            recall - baseline_recall,
+            result.validation_score - baseline.evaluation.validation_score,
+        )
+        return
+    candidates = (
+        s.run_store.list_evaluation_results() if s.run_store is not None else ()
+    )
+    comparable = tuple(
+        candidate
+        for candidate in candidates
+        if candidate.evaluation_id != result.evaluation_id
+        and candidate.run_id == result.run_id
+        and candidate.dataset_manifest_sha256 == result.dataset_manifest_sha256
+        and candidate.evaluator_sha256 == result.evaluator_sha256
+        and candidate.split == result.split
+        and candidate.validity == result.validity
+    )
+    if not comparable:
+        logger.info(
+            "Provisional pipeline metrics experiment_id={} evaluation_id={} "
+            "NDCG@10={:.6f} Recall@50={:.6f} composite={:.6f} baseline=unavailable",
+            result.experiment_id,
+            result.evaluation_id,
+            ndcg,
+            recall,
+            result.validation_score,
+        )
+        return
+    baseline = max(comparable, key=lambda candidate: candidate.validation_score)
+    baseline_metrics = {metric.name: metric.value for metric in baseline.metrics}
+    baseline_ndcg = baseline_metrics["NDCG@10"]
+    baseline_recall = baseline_metrics["Recall@50"]
+    logger.info(
+        "Provisional pipeline metrics experiment_id={} evaluation_id={} "
+        "NDCG@10={:.6f} Recall@50={:.6f} composite={:.6f} "
+        "baseline=prior_champion baseline_evaluation_id={} "
+        "baseline_NDCG@10={:.6f} baseline_Recall@50={:.6f} "
+        "delta_NDCG@10={:+.6f} delta_Recall@50={:+.6f} delta_composite={:+.6f}",
+        result.experiment_id,
+        result.evaluation_id,
+        ndcg,
+        recall,
+        result.validation_score,
+        baseline.evaluation_id,
+        baseline_ndcg,
+        baseline_recall,
+        ndcg - baseline_ndcg,
+        recall - baseline_recall,
+        result.validation_score - baseline.validation_score,
+    )
 
 
 def _result_validation(s: ServiceTransitions) -> Transition:
@@ -712,7 +1059,7 @@ def _interpret(s: ServiceTransitions) -> Transition:
                 )
             )
             if isinstance(response, AgentFailure):
-                return _failure(state, FailureKind.SCHEMA_MISMATCH, response.message)
+                return _agent_failure(state, response)
         return {"pending_route": "persist"}
 
     return transition
@@ -778,16 +1125,23 @@ def _update_frontier(s: ServiceTransitions) -> Transition:
 
 def _repair(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
-        if state["repair_attempts"] >= 2:
-            return {"pending_route": "export"}
+        if state["repair_attempts"] >= s.max_repairs:
+            return _failure(state, FailureKind.SCHEMA_MISMATCH, "repair limit reached") | {
+                "pending_route": "persist_failure"
+            }
         if (
             s.policy_gate is not None
             and not s.policy_gate.can_repair(state["repair_attempts"]).allowed
         ):
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "repair limit reached") | {
-                "pending_route": "export"
+                "pending_route": "persist_failure"
             }
-        return {"repair_attempts": state["repair_attempts"] + 1, "pending_route": "implement"}
+        # RESEARCH failures (proposal/schema issues) return to research so the
+        # same hypothesis can be re-formed. IMPLEMENT/EXECUTE/EVALUATE failures
+        # return to implement so the same experiment is re-implemented rather
+        # than replaced by a new experiment via research.
+        route = "research" if state["phase"] == RunPhase.RESEARCH else "implement"
+        return {"repair_attempts": state["repair_attempts"] + 1, "pending_route": route}
 
     return transition
 
@@ -804,7 +1158,22 @@ def _persist_failure(s: ServiceTransitions) -> Transition:
         )
         if s.run_store is not None:
             s.run_store.put_failure(record, state["run_id"])
-        return {"pending_route": route_after_failure(state, record)}
+        route = route_after_failure(state, record, s.max_repairs)
+        if route == "orchestrate" and s.run_store is not None:
+            try:
+                spec = _spec(s, state)
+                s.run_store.put_experiment(
+                    spec,
+                    "failed",
+                    state["run_id"],
+                    f"failed-{spec.experiment_id}",
+                    expected_predecessor=f"proposed-{spec.experiment_id}",
+                )
+            except (MissingAuthorityError, ValueError) as error:
+                raise TerminalLifecycleError(str(error)) from error
+        if route == "terminal":
+            raise TerminalLifecycleError(message)
+        return {"pending_route": route}
 
     return transition
 

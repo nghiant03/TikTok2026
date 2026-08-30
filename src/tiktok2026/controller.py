@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 
+from loguru import logger
+
 from tiktok2026.contracts import TransitionStore
 from tiktok2026.graph.state import ProductionState
 
@@ -56,6 +58,16 @@ class ProductionController:
         self.services = services
 
     async def _run(self, operation: str, state: ProductionState) -> dict[str, object]:
+        logger.debug(
+            "Transition started run_id={} operation={} state_version={} phase={} "
+            "experiment_id={} repair_attempts={}",
+            state["run_id"],
+            operation,
+            state["state_version"],
+            state["phase"],
+            state.get("current_experiment_id"),
+            state["repair_attempts"],
+        )
         transition = self.services.transitions.get(operation)
         if transition is None:
             raise MissingTransitionError(operation)
@@ -72,6 +84,18 @@ class ProductionController:
             )
         except Exception as error:
             raise TransitionPersistenceError(state["run_id"], operation, error) from error
+        logger.info(
+            "Transition persisted run_id={} operation={} state_version={} route={} phase={} "
+            "experiment_id={} repair_attempts={} failure={}",
+            state["run_id"],
+            operation,
+            next_version,
+            persisted["pending_route"],
+            persisted.get("phase", state["phase"]),
+            persisted.get("current_experiment_id", state.get("current_experiment_id")),
+            persisted.get("repair_attempts", state["repair_attempts"]),
+            persisted.get("terminal_reason") is not None,
+        )
         return persisted
 
     def reload(self, run_id: str, state_version: int) -> dict[str, object] | None:
