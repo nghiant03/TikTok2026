@@ -89,7 +89,7 @@ Each role has independent `ModelSettings`: `base_url`, `model`, `api_key_env`, `
 
 ## Execution, evaluation, and finalization
 
-The Docker executor accepts a typed request, verifies registered source identity, stages only the authorized train/valid dataset view, disables network access, applies read-only and resource limits, and publishes bounded output artifacts. Failure classification distinguishes execution failures from scientific non-improvement.
+The Docker executor accepts a typed request, verifies registered source identity, stages only the authorized train/valid dataset view, disables network access, applies read-only and resource limits, and publishes bounded output artifacts. The staged manifest describes only files visible to training and therefore has a different canonical hash from the full authoritative manifest. The executor supplies the authoritative manifest SHA as a separate controller-owned argument; training records that opaque identity in its artifacts, and publication verifies it against the registered dataset authority. Failure classification distinguishes execution failures from scientific non-improvement.
 
 The evaluation registry validates prediction shape, row identity, ordering, hashes, dataset manifest identity, source, checkpoint, and execution provenance. NDCG@10 and Recall@50 are the judging metrics and their mean is the local validation ranking. The repository's evaluator is `provisional`; the protected Starter Kit's incompatible metrics are diagnostic only. Current production composition does not configure an organizer evaluator or expose a CLI final-test operation. Therefore all current evaluation records and finalization records are provisional and must not be described as official results.
 

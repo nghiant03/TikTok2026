@@ -31,6 +31,12 @@ For example, `/external/tiktok2026-operator.toml` can contain the following sett
 dataset_root = "/external/read-only/KuaiRand-Pure"
 docker_image = "registry.example/tiktok2026@sha256:REPLACE_WITH_IMAGE_DIGEST"
 
+[execution]
+timeout_seconds = 900
+memory_bytes = 4294967296
+cpus = 1.0
+gpu_count = 0
+
 [budget]
 gpu_hours = 1.0
 wall_clock_seconds = 7200
@@ -48,6 +54,8 @@ temperature = 0.0
 max_tokens = 4096
 timeout_seconds = 120.0
 ```
+
+`execution.gpu_count` defaults to `0`. Set it to a positive count only when the host Docker daemon has the required GPU runtime and the pinned image supports that accelerator.
 
 Set the corresponding credential variables, including the variables named by the other role tables, before invoking `run` or `resume`.
 
@@ -111,6 +119,7 @@ calibrate-baseline --runtime-root PATH [--repository-root PATH]
 run            --runtime-root PATH [--repository-root PATH]
                [--profile-path PATH] [--operator-config PATH] [--synthetic]
 resume         --runtime-root PATH --run-id TEXT [--repository-root PATH]
+recover-source-registration --runtime-root PATH --run-id TEXT [--repository-root PATH]
                [--profile-path PATH] [--operator-config PATH] [--synthetic]
 inspect        --runtime-root PATH --run-id TEXT
 finalize       --runtime-root PATH --run-id TEXT [--repository-root PATH] [--synthetic]
