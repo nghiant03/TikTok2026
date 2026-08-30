@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -148,13 +148,33 @@ class ExperimentSpec(ContractModel):
     evidence_refs: tuple[str, ...] = ()
     parent_experiment_id: str | None = None
     expected_signal: str
-    implementation_scope: tuple[str, ...]
+    implementation_scope: Annotated[tuple[str, ...], Field(min_length=1)]
     fidelity: Fidelity
     predicted_gpu_hours: Annotated[float, Field(ge=0.0)] = 0.0
     success_criteria: str
     failure_criteria: str
     leakage_risks: tuple[str, ...] = ()
     source_provenance: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_implementation_scope(self) -> ExperimentSpec:
+        for scope in self.implementation_scope:
+            path = PurePosixPath(scope)
+            if (
+                not scope
+                or scope != scope.strip()
+                or "\\" in scope
+                or ":" in scope
+                or path.is_absolute()
+                or path.as_posix() != scope
+                or any(part in {".", ".."} for part in path.parts)
+            ):
+                raise ValueError(
+                    "implementation_scope entries must be canonical relative paths without prose"
+                )
+        if len(set(self.implementation_scope)) != len(self.implementation_scope):
+            raise ValueError("implementation_scope entries must be unique")
+        return self
 
 
 class EvidenceItem(ContractModel):
@@ -174,6 +194,16 @@ class ResearchDecision(ContractModel):
     evidence_refs: tuple[str, ...] = ()
 
 
+class ExperimentProposalDecision(ContractModel):
+    """Research response required when the controller requests an experiment."""
+
+    request_id: str
+    kind: Literal["proposal"]
+    experiment_spec: ExperimentSpec
+    message: str
+    evidence_refs: tuple[str, ...] = ()
+
+
 class OrchestrationDecision(ContractModel):
     schema_version: Literal["1"] = "1"
     decision_id: str
@@ -182,6 +212,12 @@ class OrchestrationDecision(ContractModel):
     fidelity: Fidelity | None = None
     evidence_refs: tuple[str, ...] = ()
     rationale: str
+
+    @model_validator(mode="after")
+    def validate_action_target(self) -> OrchestrationDecision:
+        if self.action == DecisionAction.RESEARCH and self.target_experiment_id is not None:
+            raise ValueError("research decisions must not select an experiment identity")
+        return self
 
 
 class ImplementationEdit(ContractModel):
@@ -203,13 +239,72 @@ class ImplementationResult(ContractModel):
     unresolved_issues: tuple[str, ...] = ()
 
 
+class ImplementationSubmission(ContractModel):
+    """Production implementor response requiring at least one bounded edit."""
+
+    schema_version: Literal["1"] = "1"
+    experiment_id: str
+    patch_artifact_id: str
+    changed_files: tuple[str, ...]
+    edits: Annotated[tuple[ImplementationEdit, ...], Field(min_length=1)]
+    changed_symbols: tuple[str, ...] = ()
+    checks: tuple[str, ...] = ()
+    assumptions: tuple[str, ...] = ()
+    unresolved_issues: tuple[str, ...] = ()
+
+
+class ImplementationAttemptRecord(ContractModel):
+    """Immutable implementor output for one bounded repair attempt."""
+
+    experiment_id: str
+    repair_attempt: Annotated[int, Field(ge=0, le=2)]
+    result: ImplementationResult
+
+    @model_validator(mode="after")
+    def validate_experiment_identity(self) -> ImplementationAttemptRecord:
+        if self.experiment_id != self.result.experiment_id:
+            raise ValueError("implementation attempt/result experiment IDs do not match")
+        return self
+
+
 class ImplementationRequest(ContractModel):
     """Controller-owned request sent to the implementor role."""
 
     request_id: str
     experiment_id: str
+    experiment_spec: ExperimentSpec
     allowed_scopes: tuple[str, ...]
     capabilities: tuple[str, ...] = ()
+    repair_feedback: str | None = None
+    source_context: dict[str, str] = {}
+    base_source_context: dict[str, str] = {}
+    execution_entrypoint: tuple[str, ...] = (
+        "python",
+        "-m",
+        "tiktok2026.experiment.train",
+    )
+    required_changed_paths: tuple[str, ...] = ("src/tiktok2026/experiment/train.py",)
+
+
+class ImplementationValidationAuthority(ContractModel):
+    """Controller-computed identity available before source registration."""
+
+    evidence_id: str
+    worktree_id: str
+    parent_commit: FullCommitSha
+    diff_sha256: Sha256
+    changed_files: tuple[str, ...]
+    allowed_scopes: tuple[str, ...]
+    path_policy_passed: Literal[True] = True
+    execution_entrypoint: tuple[str, ...] = (
+        "python",
+        "-m",
+        "tiktok2026.experiment.train",
+    )
+    required_changed_paths: tuple[str, ...] = ("src/tiktok2026/experiment/train.py",)
+    source_registration_stage: Literal["post_implementation_validation"] = (
+        "post_implementation_validation"
+    )
 
 
 class ValidationRequest(ContractModel):
@@ -434,6 +529,53 @@ class EvaluationResult(ContractModel):
         return (values["NDCG@10"] + values["Recall@50"]) / 2.0
 
 
+class DiagnosticMetricValue(ContractModel):
+    name: Literal["GAUC", "nDCG@5", "primary"]
+    value: float
+
+
+class BaselineCalibrationRecord(ContractModel):
+    """Immutable validation-only Starter Kit calibration."""
+
+    schema_version: Literal["1"] = "1"
+    calibration_id: str
+    dataset_manifest_id: str
+    dataset_manifest_sha256: Sha256
+    evaluator_id: str
+    evaluator_sha256: Sha256
+    baseline_source_sha256: Sha256
+    config_sha256: Sha256
+    model: Literal["fm"] = "fm"
+    seed: Literal[0] = 0
+    split: Literal["valid"] = "valid"
+    prediction_sha256: Sha256
+    prediction_artifact_uri: str
+    evaluation: EvaluationResult
+    diagnostic_metrics: tuple[DiagnosticMetricValue, ...]
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @model_validator(mode="after")
+    def validate_evaluation_identity(self) -> BaselineCalibrationRecord:
+        result = self.evaluation
+        if (
+            result.evaluator_artifact_id != self.evaluator_id
+            or result.evaluator_sha256 != self.evaluator_sha256
+            or result.dataset_manifest_id != self.dataset_manifest_id
+            or result.dataset_manifest_sha256 != self.dataset_manifest_sha256
+            or result.prediction_sha256 != self.prediction_sha256
+            or result.split != self.split
+            or result.validity != "provisional"
+        ):
+            raise ValueError("baseline calibration evaluation provenance does not match")
+        if {metric.name for metric in self.diagnostic_metrics} != {
+            "GAUC",
+            "nDCG@5",
+            "primary",
+        }:
+            raise ValueError("baseline calibration requires all diagnostic metrics")
+        return self
+
+
 class FailureRecord(ContractModel):
     schema_version: Literal["1"] = "1"
     failure_id: str
@@ -463,12 +605,111 @@ class ResourceState(ContractModel):
         return self
 
 
+class ExperimentRegistryEntry(ContractModel):
+    experiment_id: str
+    hypothesis_id: str
+    parent_experiment_id: str | None = None
+    hypothesis: str
+    mechanism: str
+    status: str
+    evaluation_ids: tuple[str, ...] = ()
+    evaluator_sha256s: tuple[Sha256, ...] = ()
+
+
+class ExperimentRegistrySnapshot(ContractModel):
+    evidence_id: str
+    entries: tuple[ExperimentRegistryEntry, ...] = ()
+    total_experiments: Annotated[int, Field(ge=0)] = 0
+    complete: bool = True
+
+    @model_validator(mode="after")
+    def validate_coverage(self) -> ExperimentRegistrySnapshot:
+        if self.total_experiments < len(self.entries):
+            raise ValueError("experiment registry total cannot be smaller than its entries")
+        if self.complete != (self.total_experiments == len(self.entries)):
+            raise ValueError("experiment registry completeness does not match its entries")
+        return self
+
+
+class ExperimentExecutionContract(ContractModel):
+    """Controller-owned experiment interface available to runtime agents."""
+
+    entrypoint_path: Literal["src/tiktok2026/experiment/train.py"] = (
+        "src/tiktok2026/experiment/train.py"
+    )
+    command_module: Literal["tiktok2026.experiment.train"] = "tiktok2026.experiment.train"
+    required_arguments: tuple[str, ...] = (
+        "--output-dir",
+        "--seed",
+        "--fidelity",
+        "--data-manifest",
+        "--source-commit",
+        "--execution-id",
+        "--data-root",
+    )
+    available_splits: tuple[Literal["train", "valid"], ...] = ("train", "valid")
+    prediction_split: Literal["valid"] = "valid"
+    prediction_rows: Literal["exact_valid_manifest_rows_in_manifest_order"] = (
+        "exact_valid_manifest_rows_in_manifest_order"
+    )
+    prediction_fields: tuple[str, ...] = (
+        "row_id",
+        "row_identity",
+        "user_id",
+        "item_id",
+        "score",
+    )
+    required_artifacts: tuple[Literal["predictions.json", "checkpoint_bundle.json"], ...] = (
+        "predictions.json",
+        "checkpoint_bundle.json",
+    )
+    separate_candidate_input: Literal[False] = False
+    valid_labels_may_influence_scores: Literal[False] = False
+
+
+class ControllerContext(ContractModel):
+    """Controller-owned facts agents may reference but must not redefine."""
+
+    schema_version: Literal["1"] = "1"
+    dataset_manifest_identity: DatasetManifestIdentity | None = None
+    evaluator_identity: EvaluatorIdentity | None = None
+    judging_metrics: tuple[Literal["NDCG@10", "Recall@50"], ...] = (
+        "NDCG@10",
+        "Recall@50",
+    )
+    metric_and_candidate_semantics_owner: Literal["controller"] = "controller"
+    source_commit_stage: Literal["post_implementation"] = "post_implementation"
+    dataset_staging_owner: Literal["controller"] = "controller"
+    execution_sandbox_owner: Literal["controller"] = "controller"
+    test_access_owner: Literal["controller"] = "controller"
+    parent_commit: FullCommitSha | None = None
+    docker_image: str | None = None
+    experiment_registry: ExperimentRegistrySnapshot | None = None
+    experiment_execution: ExperimentExecutionContract = ExperimentExecutionContract()
+
+
 class ResearchRequest(ContractModel):
     request_id: str
     objective: str
     resource_state: ResourceState
     parent_experiment_id: str | None = None
     allowed_paths: tuple[str, ...] = ("src/tiktok2026/experiment",)
+    controller_context: ControllerContext | None = None
+
+
+class OrchestrationRequest(ContractModel):
+    """Controller-owned feasible choices and bounded lifecycle evidence."""
+
+    request_id: str
+    run_id: str
+    phase: RunPhase
+    allowed_actions: Annotated[tuple[DecisionAction, ...], Field(min_length=1)]
+    resource_state: ResourceState
+    current_experiment_id: str | None = None
+    latest_evaluation_result_id: str | None = None
+    finalization_ready: bool = False
+    failure_summary: str | None = None
+    controller_context: ControllerContext | None = None
 
 
 class ArtifactRecord(ContractModel):

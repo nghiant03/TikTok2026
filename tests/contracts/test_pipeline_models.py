@@ -8,6 +8,8 @@ from tiktok2026.contracts import (
     ArtifactRecord,
     ArtifactRetention,
     ContractModel,
+    ExperimentSpec,
+    Fidelity,
     FinalizationRecord,
     ResourceReservation,
     RuntimePaths,
@@ -67,6 +69,24 @@ def test_resource_reservation_rejects_negative_values() -> None:
             wall_seconds=1.0,
             tokens=1,
             disk_bytes=1,
+        )
+
+
+def test_experiment_scope_rejects_prose_appended_to_path() -> None:
+    with pytest.raises(ValidationError, match="canonical relative paths without prose"):
+        ExperimentSpec(
+            experiment_id="exp-1",
+            hypothesis_id="hyp-1",
+            hypothesis="hypothesis",
+            mechanism="mechanism",
+            motivation="motivation",
+            expected_signal="signal",
+            implementation_scope=(
+                "src/tiktok2026/experiment/model.py: implement the model",
+            ),
+            fidelity=Fidelity.SMOKE,
+            success_criteria="success",
+            failure_criteria="failure",
         )
 
 

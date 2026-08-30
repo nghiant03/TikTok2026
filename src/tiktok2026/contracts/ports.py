@@ -5,6 +5,7 @@ from typing import Protocol
 
 from tiktok2026.contracts.models import (
     ArtifactRecord,
+    BaselineCalibrationRecord,
     ContractModel,
     DatasetManifestIdentity,
     EvaluationRequest,
@@ -12,6 +13,7 @@ from tiktok2026.contracts.models import (
     EvaluatorIdentity,
     ExecutionRequest,
     ExecutionResult,
+    ExperimentRegistrySnapshot,
     ExperimentSpec,
     FailureRecord,
     FinalizationBundleRequest,
@@ -61,6 +63,8 @@ class RepositoryReader(Protocol):
 
 
 class ScopedRepository(RepositoryReader, Protocol):
+    def read_base(self, relative_path: str, max_characters: int = 20_000) -> str: ...
+
     def write(self, relative_path: str, content: str) -> None: ...
 
     def diff(self) -> str: ...
@@ -147,6 +151,8 @@ class RunStore(Protocol):
 
     def get_experiment(self, experiment_id: str) -> ExperimentSpec | None: ...
 
+    def get_experiment_registry(self, limit: int = 50) -> ExperimentRegistrySnapshot: ...
+
     def put_source_registration(self, registration: SourceRegistration) -> None: ...
 
     def put_execution_result(self, result: ExecutionResult) -> None: ...
@@ -154,6 +160,10 @@ class RunStore(Protocol):
     def get_execution_result(self, execution_id: str) -> ExecutionResult | None: ...
 
     def get_evaluation_result(self, evaluation_id: str) -> EvaluationResult | None: ...
+
+    def list_evaluation_results(self) -> tuple[EvaluationResult, ...]: ...
+
+    def list_baseline_calibrations(self) -> tuple[BaselineCalibrationRecord, ...]: ...
 
     def get_artifact(self, artifact_id: str) -> ArtifactRecord | None: ...
 

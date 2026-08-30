@@ -2,12 +2,23 @@ import pytest
 from pydantic import ValidationError
 
 from tiktok2026.contracts import (
+    ControllerContext,
     EvaluationResult,
     ExecutionResult,
     FailureKind,
     MetricValue,
     ResourceState,
 )
+
+
+def test_controller_context_exposes_the_concrete_experiment_interface() -> None:
+    contract = ControllerContext().experiment_execution
+
+    assert contract.available_splits == ("train", "valid")
+    assert contract.prediction_rows == "exact_valid_manifest_rows_in_manifest_order"
+    assert contract.separate_candidate_input is False
+    assert contract.valid_labels_may_influence_scores is False
+    assert contract.required_artifacts == ("predictions.json", "checkpoint_bundle.json")
 
 
 def test_validation_score_uses_equal_weight_judging_metrics() -> None:
