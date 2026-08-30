@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{7,64}$")]
 FullCommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
+
+
+def _populate_source_identity(value: object, field: str) -> object:
+    if not isinstance(value, dict):
+        return value
+    data = dict(cast(dict[str, object], value))
+    if field not in data:
+        source_commit = data.get("source_commit")
+        if isinstance(source_commit, str):
+            data[field] = f"source-{source_commit}"
+    return data
 
 
 class ContractModel(BaseModel):
@@ -51,6 +64,16 @@ class ValidationVerdict(StrEnum):
     REJECTED = "rejected"
     REPAIRABLE = "repairable"
     INCONCLUSIVE = "inconclusive"
+
+
+def validation_blocker_id(report_id: str, stage: ValidationStage, text: str) -> str:
+    """Return the stable identity used when importing a legacy text blocker."""
+    material = json.dumps(
+        {"report_id": report_id, "stage": stage.value, "text": text},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"blocker-{hashlib.sha256(material.encode()).hexdigest()}"
 
 
 class FailureKind(StrEnum):
@@ -259,6 +282,8 @@ class ImplementationAttemptRecord(ContractModel):
     experiment_id: str
     repair_attempt: Annotated[int, Field(ge=0, le=3)]
     result: ImplementationResult
+    prior_diff_sha256: Sha256 | None = None
+    result_diff_sha256: Sha256 | None = None
 
     @model_validator(mode="after")
     def validate_experiment_identity(self) -> ImplementationAttemptRecord:
@@ -276,6 +301,8 @@ class ImplementationRequest(ContractModel):
     allowed_scopes: tuple[str, ...]
     capabilities: tuple[str, ...] = ()
     repair_feedback: str | None = None
+    unresolved_blocker_ids: tuple[str, ...] = ()
+    unresolved_blockers: tuple[ValidationBlockerContext, ...] = ()
     source_context: dict[str, str] = {}
     base_source_context: dict[str, str] = {}
     execution_entrypoint: tuple[str, ...] = (
@@ -284,6 +311,11 @@ class ImplementationRequest(ContractModel):
         "tiktok2026.experiment.train",
     )
     required_changed_paths: tuple[str, ...] = ("src/tiktok2026/experiment/train.py",)
+    execution_timeout_seconds: Annotated[int, Field(gt=0)] = 300
+    execution_memory_bytes: Annotated[int, Field(gt=0)] = 4 * 1024**3
+    execution_cpus: Annotated[float, Field(gt=0)] = 1.0
+    execution_gpu_count: Annotated[int, Field(ge=0)] = 0
+    prior_diff_sha256: Sha256 | None = None
 
 
 class ImplementationValidationAuthority(ContractModel):
@@ -313,7 +345,64 @@ class ValidationRequest(ContractModel):
     request_id: str
     experiment_id: str
     stage: ValidationStage
+    validation_operation: ValidationOperationIdentity
     subject: dict[str, object] = {}
+
+
+class ValidationBlockerContext(ContractModel):
+    """Bound context copied from authority for a repair or validation request."""
+
+    blocker_id: str
+    text: Annotated[str, Field(max_length=2_000)]
+    evidence_refs: Annotated[
+        tuple[Annotated[str, Field(max_length=256)], ...], Field(max_length=8)
+    ] = ()
+
+
+class ValidationOperationIdentity(ContractModel):
+    """Controller-derived identity for one immutable validation operation."""
+
+    operation_id: str
+    run_id: str
+    experiment_id: str
+    stage: ValidationStage
+    repair_attempt: Annotated[int, Field(ge=0, le=3)]
+    subject_sha256: Sha256
+    implementation_diff_sha256: Sha256 | None = None
+
+class ValidationBlocker(ContractModel):
+    """A durable, independently addressable validation failure."""
+
+    blocker_id: str
+    experiment_id: str
+    stage: ValidationStage
+    text: str
+    report_id: str = ""
+    evidence_refs: tuple[str, ...] = ()
+
+    def __str__(self) -> str:
+        # This keeps diagnostics produced by older callers readable while the
+        # authoritative representation is now typed.
+        return self.text
+
+    def __contains__(self, value: str) -> bool:
+        return value in self.text
+
+    @property
+    def message(self) -> str:
+        """Compatibility spelling for consumers that called blockers messages."""
+        return self.text
+
+
+class BlockerResolution(ContractModel):
+    """Immutable evidence-backed resolution of one validation blocker."""
+
+    resolution_id: str
+    blocker_id: str
+    report_id: str
+    experiment_id: str
+    evidence_refs: Annotated[tuple[str, ...], Field(min_length=1)]
+    validation_operation_id: str = ""
 
 
 class ValidationReport(ContractModel):
@@ -322,49 +411,185 @@ class ValidationReport(ContractModel):
     experiment_id: str
     stage: ValidationStage
     verdict: ValidationVerdict
-    blockers: tuple[str, ...] = ()
+    blockers: tuple[ValidationBlocker, ...] = ()
+    resolves_blocker_ids: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
     leakage_risk: str
     implementation_fidelity: str | None = None
     scientific_confidence: str | None = None
+    validation_operation_id: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_blockers(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        data = dict(cast(dict[str, object], value))
+        report_id = str(data.get("report_id", ""))
+        experiment_id = str(data.get("experiment_id", ""))
+        report_evidence = tuple(cast(tuple[str, ...] | list[str], data.get("evidence_refs", ())))
+        raw_stage = data.get("stage", ValidationStage.RESULT)
+        stage = raw_stage if isinstance(raw_stage, ValidationStage) else ValidationStage(raw_stage)
+        normalized: list[object] = []
+        for raw in cast(tuple[object, ...] | list[object], data.get("blockers", ())):
+            if isinstance(raw, str):
+                normalized.append(
+                    {
+                        "blocker_id": validation_blocker_id(report_id, stage, raw),
+                        "experiment_id": experiment_id,
+                        "stage": stage,
+                        "text": raw,
+                        "report_id": report_id,
+                        "evidence_refs": report_evidence,
+                    }
+                )
+            elif isinstance(raw, ValidationBlocker):
+                blocker = raw.model_dump(mode="json")
+                blocker["report_id"] = blocker.get("report_id") or report_id
+                blocker["evidence_refs"] = blocker.get("evidence_refs") or report_evidence
+                normalized.append(blocker)
+            elif isinstance(raw, dict):
+                blocker = dict(cast(dict[str, object], raw))
+                text = str(blocker.get("text", blocker.get("message", "")))
+                blocker["text"] = text
+                blocker.setdefault("blocker_id", validation_blocker_id(report_id, stage, text))
+                blocker.setdefault("experiment_id", experiment_id)
+                blocker.setdefault("stage", stage)
+                blocker["report_id"] = blocker.get("report_id") or report_id
+                blocker["evidence_refs"] = blocker.get("evidence_refs") or report_evidence
+                normalized.append(blocker)
+            else:
+                normalized.append(raw)
+        data["blockers"] = tuple(normalized)
+        return data
+
+    @model_validator(mode="after")
+    def validate_blockers(self) -> ValidationReport:
+        if len(set(self.resolves_blocker_ids)) != len(self.resolves_blocker_ids):
+            raise ValueError("resolves_blocker_ids must be unique")
+        if self.resolves_blocker_ids and self.verdict != ValidationVerdict.APPROVED:
+            raise ValueError("only approved validation reports may resolve blockers")
+        for blocker in self.blockers:
+            if (
+                blocker.report_id != self.report_id
+                or blocker.experiment_id != self.experiment_id
+                or blocker.stage != self.stage
+            ):
+                raise ValueError("validation blocker identity does not match its report")
+        if set(self.resolves_blocker_ids) & {blocker.blocker_id for blocker in self.blockers}:
+            raise ValueError("a validation report cannot resolve a blocker it introduces")
+        return self
+
+
+class DatasetViewRow(ContractModel):
+    row_id: str
+    row_identity: tuple[str, ...]
+    user_id: str
+    item_id: str
+
+
+class DatasetViewProvenance(ContractModel):
+    manifest_id: str
+    manifest_sha256: Sha256
+    view_sha256: Sha256
+    valid_rows: tuple[DatasetViewRow, ...]
 
 
 class ExecutionRequest(ContractModel):
     run_id: str | None = None
     execution_id: str
     experiment_id: str
+    source_registration_id: str = ""
     source_commit: CommitSha
     command: tuple[str, ...]
     image: str
     source_path: Path
     dataset_path: Path
+    dataset_manifest_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     output_path: Path
     timeout_seconds: Annotated[int, Field(gt=0)]
     memory_bytes: Annotated[int, Field(gt=0)]
     cpus: Annotated[float, Field(gt=0)]
     gpu_count: Annotated[int, Field(ge=0)] = 0
+    execution_kind: Literal["smoke", "full"] = "full"
+    dataset_view_sha256: Sha256 | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_source_registration_id(cls, value: object) -> object:
+        return _populate_source_identity(value, "source_registration_id")
+
+    @model_validator(mode="after")
+    def validate_source_registration_id(self) -> ExecutionRequest:
+        if self.source_registration_id != f"source-{self.source_commit}":
+            raise ValueError("source registration identity does not match source commit")
+        return self
 
 
 class ExecutionResult(ContractModel):
     schema_version: Literal["1"] = "1"
     execution_id: str
     experiment_id: str
+    source_registration_id: str = ""
     source_commit: str
     command: tuple[str, ...]
     exit_code: int
     elapsed_seconds: Annotated[float, Field(ge=0.0)]
     gpu_hours: Annotated[float, Field(ge=0.0)]
+    artifact_output_bytes: Annotated[int, Field(ge=0)] = 0
     artifact_ids: tuple[str, ...] = ()
     failure_kind: FailureKind | None = None
+    failure_message: str | None = None
     checkpoint_id: str | None = None
+    execution_kind: Literal["smoke", "full"] = "full"
+    dataset_manifest_id: str | None = None
+    dataset_manifest_sha256: Sha256 | None = None
+    dataset_view_sha256: Sha256 | None = None
+    dataset_valid_rows: tuple[DatasetViewRow, ...] = ()
+    measured_peak_memory_bytes: Annotated[int, Field(ge=0)] | None = None
+    memory_measurement_status: Literal["measured", "unavailable"] = "unavailable"
+    resource_measurement_basis: Literal["docker_stats", "unavailable"] = "unavailable"
+    measured_gpu_hours: Annotated[float, Field(ge=0.0)] | None = None
+    gpu_telemetry_status: Literal["measured", "unavailable", "not_requested"] = (
+        "not_requested"
+    )
+    smoke_output_valid: bool = False
+    scientific_evidence: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_source_registration_id(cls, value: object) -> object:
+        return _populate_source_identity(value, "source_registration_id")
 
     @model_validator(mode="after")
     def validate_failure(self) -> ExecutionResult:
+        if self.source_registration_id != f"source-{self.source_commit}":
+            raise ValueError("source registration identity does not match source commit")
         if self.exit_code == 0 and self.failure_kind is not None:
             raise ValueError("successful execution cannot have a failure kind")
         if self.exit_code != 0 and self.failure_kind is None:
             raise ValueError("failed execution requires a failure kind")
+        if self.execution_kind == "smoke" and self.scientific_evidence:
+            raise ValueError("smoke execution cannot be scientific evidence")
+        if self.execution_kind == "smoke" and (
+            self.dataset_manifest_id is None
+            or self.dataset_manifest_sha256 is None
+            or self.dataset_view_sha256 is None
+        ):
+            raise ValueError("smoke execution requires dataset provenance")
+        if self.memory_measurement_status == "measured":
+            if self.measured_peak_memory_bytes is None:
+                raise ValueError("measured memory status requires a peak memory value")
+            if self.resource_measurement_basis != "docker_stats":
+                raise ValueError("measured memory requires Docker stats basis")
+        elif self.measured_peak_memory_bytes is not None:
+            raise ValueError("unavailable memory status cannot carry a measurement")
+        if self.gpu_telemetry_status == "measured":
+            if self.measured_gpu_hours is None:
+                raise ValueError("measured GPU status requires a GPU measurement")
+        elif self.measured_gpu_hours is not None:
+            raise ValueError("unavailable GPU telemetry cannot carry a measurement")
         return self
 
 
@@ -699,6 +924,7 @@ class ResearchRequest(ContractModel):
     parent_experiment_id: str | None = None
     allowed_paths: tuple[str, ...] = ("src/tiktok2026/experiment",)
     controller_context: ControllerContext | None = None
+    unresolved_blockers: tuple[ValidationBlockerContext, ...] = ()
 
 
 class OrchestrationRequest(ContractModel):
@@ -773,6 +999,8 @@ class WorktreeAssignment(ContractModel):
 
 
 class SourceRegistration(ContractModel):
+    registration_id: str = ""
+    revision: Annotated[int, Field(ge=0)] = 0
     experiment_id: str
     run_id: str
     parent_commit: FullCommitSha
@@ -782,6 +1010,17 @@ class SourceRegistration(ContractModel):
     patch_artifact_uri: str
     allowed_scopes: tuple[str, ...]
     eligible: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_registration_id(cls, value: object) -> object:
+        return _populate_source_identity(value, "registration_id")
+
+    @model_validator(mode="after")
+    def validate_registration_id(self) -> SourceRegistration:
+        if self.registration_id != f"source-{self.source_commit}":
+            raise ValueError("source registration identity does not match source commit")
+        return self
 
 
 class ModelUsage(ContractModel):

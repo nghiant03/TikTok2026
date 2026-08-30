@@ -9,6 +9,7 @@ from pathlib import Path
 from tiktok2026.contracts import (
     ArtifactRecord,
     AuditEvent,
+    BlockerResolution,
     EvaluatorIdentity,
     ExperimentRegistryEntry,
     ExperimentSpec,
@@ -16,9 +17,14 @@ from tiktok2026.contracts import (
     FinalTestAuthorizationRequest,
     FinalTestClaim,
     FinalTestRequest,
+    ImplementationValidationAuthority,
     ProvisionalFinalizationRequest,
     RunRecord,
     SourceRegistration,
+    ValidationBlocker,
+    ValidationOperationIdentity,
+    ValidationReport,
+    ValidationStage,
 )
 from tiktok2026.persistence.migrations import MigrationRunner, application_migrations_path
 from tiktok2026.repository.diffs import patch_signature
@@ -422,6 +428,502 @@ class ApplicationRepository:
             created_at=datetime.fromisoformat(now),
         )
 
+    @staticmethod
+    def _resolution_id(report_id: str, blocker_id: str, evidence_refs: tuple[str, ...]) -> str:
+        material = json.dumps(
+            {
+                "report_id": report_id,
+                "blocker_id": blocker_id,
+                "evidence_refs": evidence_refs,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return f"resolution-{_content_hash(material)}"
+
+    def _put_validation_operation(
+        self,
+        connection: sqlite3.Connection,
+        operation: ValidationOperationIdentity,
+        subject_json: str,
+        now: str,
+    ) -> None:
+        operation_json = operation.model_dump_json()
+        digest = _content_hash(operation_json + subject_json)
+        subject_for_identity = dict(json.loads(subject_json))
+        subject_for_identity.pop("validation_operation", None)
+        if _content_hash(
+            json.dumps(subject_for_identity, sort_keys=True, separators=(",", ":"))
+        ) != operation.subject_sha256:
+            raise PersistenceConflictError("validation subject identity does not match operation")
+        authority = subject_for_identity.get("implementation_authority")
+        if operation.stage == ValidationStage.IMPLEMENTATION:
+            if not isinstance(authority, dict):
+                raise PersistenceConflictError(
+                    "implementation validation requires implementation authority"
+                )
+            try:
+                parsed_authority = ImplementationValidationAuthority.model_validate(authority)
+            except ValueError as error:
+                raise PersistenceConflictError(
+                    "implementation validation authority is invalid"
+                ) from error
+            if parsed_authority.diff_sha256 != operation.implementation_diff_sha256:
+                raise PersistenceConflictError(
+                    "validation authority diff does not match operation"
+                )
+            if parsed_authority.evidence_id != (
+                f"implementation-diff-{parsed_authority.diff_sha256}"
+            ):
+                raise PersistenceConflictError(
+                    "implementation authority evidence is not controller-derived"
+                )
+        existing = connection.execute(
+            "SELECT content_sha256 FROM authority_validation_operations WHERE operation_id = ?",
+            (operation.operation_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing[0] != digest:
+                raise PersistenceConflictError(
+                    f"validation operation {operation.operation_id} content changed"
+                )
+            return
+        connection.execute(
+            "INSERT INTO authority_validation_operations "
+            "(operation_id, run_id, experiment_id, stage, repair_attempt, subject_sha256, "
+            "implementation_diff_sha256, operation_json, subject_json, content_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                operation.operation_id,
+                operation.run_id,
+                operation.experiment_id,
+                operation.stage.value,
+                operation.repair_attempt,
+                operation.subject_sha256,
+                operation.implementation_diff_sha256,
+                operation_json,
+                subject_json,
+                digest,
+                now,
+            ),
+        )
+
+    def put_validation_report(
+        self,
+        report: ValidationReport,
+        run_id: str,
+        operation: ValidationOperationIdentity,
+        subject: dict[str, object],
+    ) -> None:
+        """Append a validation report and its blocker ledger entries atomically."""
+        if (
+            operation.run_id != run_id
+            or operation.experiment_id != report.experiment_id
+            or operation.stage != report.stage
+        ):
+            raise ValueError("validation operation identity does not match report")
+        if operation.stage == ValidationStage.IMPLEMENTATION and (
+            operation.implementation_diff_sha256 is None
+        ):
+            raise ValueError("implementation validation operation requires a diff identity")
+        if operation.stage != ValidationStage.IMPLEMENTATION and (
+            operation.implementation_diff_sha256 is not None
+        ):
+            raise ValueError("only implementation validation may carry a diff identity")
+        if report.validation_operation_id not in {"", operation.operation_id}:
+            raise PersistenceConflictError("validation report is bound to another operation")
+        if set(report.resolves_blocker_ids) & {b.blocker_id for b in report.blockers}:
+            raise ValueError("a validation report cannot resolve a blocker it introduces")
+        bound_report = report.model_copy(
+            update={"validation_operation_id": operation.operation_id}
+        )
+        payload = bound_report.model_dump_json()
+        digest = _content_hash(payload)
+        now = datetime.now(UTC).isoformat()
+        subject_json = json.dumps(subject or {}, sort_keys=True, separators=(",", ":"))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._put_validation_operation(connection, operation, subject_json, now)
+            existing = connection.execute(
+                "SELECT report_json, content_sha256 FROM authority_validation_reports "
+                "WHERE report_id = ?",
+                (report.report_id,),
+            ).fetchone()
+            if existing is not None and existing[1] != digest:
+                raise PersistenceConflictError(
+                    f"validation report {report.report_id} content changed"
+                )
+            operation_report = connection.execute(
+                "SELECT report_id, report_json FROM authority_validation_reports "
+                "WHERE validation_operation_id = ?",
+                (operation.operation_id,),
+            ).fetchone()
+            if operation_report is not None and operation_report[0] != report.report_id:
+                raise PersistenceConflictError(
+                    f"validation operation {operation.operation_id} already has a report"
+                )
+            report_inserted = existing is None
+            if report_inserted:
+                connection.execute(
+                    "INSERT INTO authority_validation_reports "
+                    "(report_id, experiment_id, stage, report_json, content_sha256, created_at, "
+                    "validation_operation_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        report.report_id,
+                        report.experiment_id,
+                        report.stage.value,
+                        payload,
+                        digest,
+                        now,
+                        operation.operation_id,
+                    ),
+                )
+            for blocker in report.blockers:
+                blocker_payload = blocker.model_dump_json()
+                blocker_digest = _content_hash(blocker_payload)
+                blocker_row = connection.execute(
+                    "SELECT blocker_json, content_sha256 FROM authority_validation_blockers "
+                    "WHERE blocker_id = ?",
+                    (blocker.blocker_id,),
+                ).fetchone()
+                if blocker_row is not None:
+                    if blocker_row[1] != blocker_digest:
+                        raise PersistenceConflictError(
+                            f"validation blocker {blocker.blocker_id} content changed"
+                        )
+                    continue
+                connection.execute(
+                    "INSERT INTO authority_validation_blockers "
+                    "(blocker_id, report_id, experiment_id, stage, blocker_json, "
+                    "content_sha256, created_at, validation_operation_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        blocker.blocker_id,
+                        report.report_id,
+                        blocker.experiment_id,
+                        blocker.stage.value,
+                        blocker_payload,
+                        blocker_digest,
+                        now,
+                        operation.operation_id,
+                    ),
+                )
+                self._insert_audit(
+                    connection,
+                    self._automatic_event(
+                        "validation_blocker_persisted",
+                        run_id,
+                        report.experiment_id,
+                        {"report_id": report.report_id, "blocker_id": blocker.blocker_id},
+                        now,
+                    ),
+                )
+            if report_inserted:
+                self._insert_audit(
+                    connection,
+                    self._automatic_event(
+                        "validation_report_persisted",
+                        run_id,
+                        report.experiment_id,
+                        {
+                            "report_id": report.report_id,
+                            "stage": report.stage.value,
+                            "verdict": report.verdict.value,
+                        },
+                        now,
+                    ),
+                )
+            if report.resolves_blocker_ids:
+                if not report.evidence_refs:
+                    raise ValueError("blocker resolutions require validation evidence")
+                for blocker_id in report.resolves_blocker_ids:
+                    blocker_row = connection.execute(
+                        "SELECT blocker_json, experiment_id, report_id "
+                        "FROM authority_validation_blockers WHERE blocker_id = ?",
+                        (blocker_id,),
+                    ).fetchone()
+                    if blocker_row is None:
+                        raise ValueError(f"validation blocker {blocker_id} does not exist")
+                    blocker = ValidationBlocker.model_validate_json(blocker_row[0])
+                    if blocker.experiment_id != report.experiment_id:
+                        raise ValueError("blocker resolution experiment does not match report")
+                    resolution = BlockerResolution(
+                        resolution_id=self._resolution_id(
+                            report.report_id, blocker_id, report.evidence_refs
+                        ),
+                        blocker_id=blocker_id,
+                        report_id=report.report_id,
+                        experiment_id=report.experiment_id,
+                        evidence_refs=report.evidence_refs,
+                        validation_operation_id=operation.operation_id,
+                    )
+                    resolution_payload = resolution.model_dump_json()
+                    resolution_digest = _content_hash(resolution_payload)
+                    prior = connection.execute(
+                        "SELECT resolution_id, resolution_json, content_sha256 "
+                        "FROM authority_blocker_resolutions WHERE blocker_id = ?",
+                        (blocker_id,),
+                    ).fetchone()
+                    if prior is not None:
+                        if prior[2] != resolution_digest:
+                            raise PersistenceConflictError(
+                                f"blocker {blocker_id} already has a different resolution"
+                            )
+                        continue
+                    connection.execute(
+                        "INSERT INTO authority_blocker_resolutions "
+                        "(resolution_id, blocker_id, report_id, experiment_id, "
+                        "resolution_json, content_sha256, created_at, validation_operation_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            resolution.resolution_id,
+                            resolution.blocker_id,
+                            resolution.report_id,
+                            resolution.experiment_id,
+                            resolution_payload,
+                            resolution_digest,
+                            now,
+                            operation.operation_id,
+                        ),
+                    )
+                    self._insert_audit(
+                        connection,
+                        self._automatic_event(
+                            "validation_blocker_resolved",
+                            run_id,
+                            report.experiment_id,
+                            {
+                                "resolution_id": resolution.resolution_id,
+                                "blocker_id": blocker_id,
+                                "report_id": report.report_id,
+                            },
+                            now,
+                        ),
+                    )
+
+    def put_validation_blocker(self, blocker: ValidationBlocker, run_id: str) -> None:
+        report = self.get_validation_report(blocker.report_id)
+        if report is None:
+            raise ValueError("validation blocker requires a persisted report")
+        if blocker not in report.blockers:
+            raise ValueError("validation blocker does not belong to its persisted report")
+        if not report.validation_operation_id:
+            raise ValueError("validation blocker requires a controller operation")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT operation_json, subject_json FROM authority_validation_operations "
+                "WHERE operation_id = ?",
+                (report.validation_operation_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("validation blocker operation authority is absent")
+        self.put_validation_report(
+            report,
+            run_id,
+            ValidationOperationIdentity.model_validate_json(row[0]),
+            json.loads(row[1]),
+        )
+
+    def put_blocker_resolution(self, resolution: BlockerResolution, run_id: str) -> None:
+        report = self.get_validation_report(resolution.report_id)
+        if report is None or report.verdict.value != "approved":
+            raise ValueError("blocker resolution requires an approved validation report")
+        if resolution.blocker_id not in report.resolves_blocker_ids:
+            raise ValueError("resolution is not authorized by its validation report")
+        if (
+            resolution.experiment_id != report.experiment_id
+            or not resolution.evidence_refs
+            or not resolution.validation_operation_id
+            or resolution.validation_operation_id != report.validation_operation_id
+        ):
+            raise ValueError("blocker resolution identity or evidence is invalid")
+        payload = resolution.model_dump_json()
+        digest = _content_hash(payload)
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            blocker = connection.execute(
+                "SELECT experiment_id, report_id FROM authority_validation_blockers "
+                "WHERE blocker_id = ?",
+                (resolution.blocker_id,),
+            ).fetchone()
+            if blocker is None:
+                raise ValueError("validation blocker does not exist")
+            if blocker[0] != report.experiment_id:
+                raise ValueError("blocker resolution experiment does not match blocker")
+            same_id = connection.execute(
+                "SELECT resolution_json, content_sha256 FROM authority_blocker_resolutions "
+                "WHERE resolution_id = ?",
+                (resolution.resolution_id,),
+            ).fetchone()
+            if same_id is not None:
+                if same_id[1] != digest:
+                    raise PersistenceConflictError(
+                        f"blocker resolution {resolution.resolution_id} content changed"
+                    )
+                return
+            existing = connection.execute(
+                "SELECT resolution_json, content_sha256 FROM authority_blocker_resolutions "
+                "WHERE blocker_id = ?",
+                (resolution.blocker_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing[1] != digest:
+                    raise PersistenceConflictError(
+                        f"blocker {resolution.blocker_id} already has a different resolution"
+                    )
+                return
+            connection.execute(
+                "INSERT INTO authority_blocker_resolutions "
+                "(resolution_id, blocker_id, report_id, experiment_id, resolution_json, "
+                "content_sha256, created_at, validation_operation_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    resolution.resolution_id,
+                    resolution.blocker_id,
+                    resolution.report_id,
+                    resolution.experiment_id,
+                    payload,
+                    digest,
+                    now,
+                    resolution.validation_operation_id,
+                ),
+            )
+            self._insert_audit(
+                connection,
+                self._automatic_event(
+                    "validation_blocker_resolved",
+                    run_id,
+                    resolution.experiment_id,
+                    {
+                        "resolution_id": resolution.resolution_id,
+                        "blocker_id": resolution.blocker_id,
+                        "report_id": resolution.report_id,
+                    },
+                    now,
+                ),
+            )
+
+    def get_validation_report(self, report_id: str) -> ValidationReport | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT report_json FROM authority_validation_reports WHERE report_id = ?",
+                (report_id,),
+            ).fetchone()
+        return ValidationReport.model_validate_json(row[0]) if row else None
+
+    def get_validation_report_by_operation(
+        self, operation_id: str
+    ) -> ValidationReport | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT report_json FROM authority_validation_reports "
+                "WHERE validation_operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        return ValidationReport.model_validate_json(row[0]) if row else None
+
+    def get_validation_report_for_attempt(
+        self, run_id: str, experiment_id: str, stage: ValidationStage, repair_attempt: int
+    ) -> ValidationReport | None:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT report.report_json FROM authority_validation_reports AS report "
+                "JOIN authority_validation_operations AS operation "
+                "ON operation.operation_id = report.validation_operation_id "
+                "WHERE operation.run_id = ? AND operation.experiment_id = ? "
+                "AND operation.stage = ? AND operation.repair_attempt = ?",
+                (run_id, experiment_id, stage.value, repair_attempt),
+            ).fetchall()
+        if len(rows) > 1:
+            raise PersistenceConflictError("validation attempt has multiple authoritative reports")
+        return ValidationReport.model_validate_json(rows[0][0]) if rows else None
+
+    def get_validation_operation(
+        self, operation_id: str
+    ) -> ValidationOperationIdentity | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT operation_json FROM authority_validation_operations "
+                "WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        return ValidationOperationIdentity.model_validate_json(row[0]) if row else None
+
+    def list_validation_reports(
+        self, experiment_id: str | None = None
+    ) -> tuple[ValidationReport, ...]:
+        query = "SELECT report_json FROM authority_validation_reports"
+        parameters: tuple[str, ...] = ()
+        if experiment_id is not None:
+            query += " WHERE experiment_id = ?"
+            parameters = (experiment_id,)
+        query += " ORDER BY created_at, report_id"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(ValidationReport.model_validate_json(row[0]) for row in rows)
+
+    def list_validation_blockers(
+        self, experiment_id: str | None = None
+    ) -> tuple[ValidationBlocker, ...]:
+        query = "SELECT blocker_json FROM authority_validation_blockers"
+        parameters: tuple[str, ...] = ()
+        if experiment_id is not None:
+            query += " WHERE experiment_id = ?"
+            parameters = (experiment_id,)
+        query += " ORDER BY created_at, blocker_id"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(ValidationBlocker.model_validate_json(row[0]) for row in rows)
+
+    def get_validation_blocker(self, blocker_id: str) -> ValidationBlocker | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT blocker_json FROM authority_validation_blockers WHERE blocker_id = ?",
+                (blocker_id,),
+            ).fetchone()
+        return ValidationBlocker.model_validate_json(row[0]) if row else None
+
+    def list_blocker_resolutions(
+        self, experiment_id: str | None = None
+    ) -> tuple[BlockerResolution, ...]:
+        query = "SELECT resolution_json FROM authority_blocker_resolutions"
+        parameters: tuple[str, ...] = ()
+        if experiment_id is not None:
+            query += " WHERE experiment_id = ?"
+            parameters = (experiment_id,)
+        query += " ORDER BY created_at, resolution_id"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(BlockerResolution.model_validate_json(row[0]) for row in rows)
+
+    def get_blocker_resolution(self, resolution_id: str) -> BlockerResolution | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT resolution_json FROM authority_blocker_resolutions "
+                "WHERE resolution_id = ?",
+                (resolution_id,),
+            ).fetchone()
+        return BlockerResolution.model_validate_json(row[0]) if row else None
+
+    def get_unresolved_blockers(self, experiment_id: str) -> tuple[ValidationBlocker, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT blocker.blocker_json FROM authority_validation_blockers AS blocker "
+                "LEFT JOIN authority_blocker_resolutions AS resolution "
+                "ON resolution.blocker_id = blocker.blocker_id "
+                "WHERE blocker.experiment_id = ? AND resolution.blocker_id IS NULL "
+                "ORDER BY blocker.created_at, blocker.blocker_id",
+                (experiment_id,),
+            ).fetchall()
+        return tuple(ValidationBlocker.model_validate_json(row[0]) for row in rows)
+
+    def get_unresolved_blocker_ids(self, experiment_id: str) -> tuple[str, ...]:
+        return tuple(blocker.blocker_id for blocker in self.get_unresolved_blockers(experiment_id))
+
+    def list_unresolved_blockers(self, experiment_id: str) -> tuple[ValidationBlocker, ...]:
+        return self.get_unresolved_blockers(experiment_id)
+
     def put_experiment(
         self,
         spec: ExperimentSpec,
@@ -579,8 +1081,8 @@ class ApplicationRepository:
             except ValueError as error:
                 raise ValueError(str(error)) from error
             row = connection.execute(
-                "SELECT content_sha256 FROM source_registrations WHERE experiment_id = ?",
-                (registration.experiment_id,),
+                "SELECT content_sha256 FROM source_registrations WHERE registration_id = ?",
+                (registration.registration_id,),
             ).fetchone()
             if row is not None:
                 if row[0] != digest:
@@ -590,17 +1092,37 @@ class ApplicationRepository:
                 if audit_event is not None:
                     self._insert_audit(connection, audit_event)
                 return
+            revision_row = connection.execute(
+                "SELECT registration_id FROM source_registrations "
+                "WHERE experiment_id = ? AND revision = ?",
+                (registration.experiment_id, registration.revision),
+            ).fetchone()
+            if revision_row is not None:
+                raise PersistenceConflictError(
+                    f"source revision {registration.experiment_id}:{registration.revision} changed"
+                )
             connection.execute(
                 "INSERT INTO source_registrations "
-                "(experiment_id, registration_json, content_sha256, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (registration.experiment_id, payload, digest, now),
+                "(registration_id, experiment_id, revision, registration_json, "
+                "content_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    registration.registration_id,
+                    registration.experiment_id,
+                    registration.revision,
+                    payload,
+                    digest,
+                    now,
+                ),
             )
             event = audit_event or self._automatic_event(
                 "source_registered",
                 registration.run_id,
                 registration.experiment_id,
-                {"source_commit": registration.source_commit},
+                {
+                    "registration_id": registration.registration_id,
+                    "revision": registration.revision,
+                    "source_commit": registration.source_commit,
+                },
                 now,
             )
             self._insert_audit(connection, event)
@@ -608,8 +1130,19 @@ class ApplicationRepository:
     def get_source_registration(self, experiment_id: str) -> SourceRegistration | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT registration_json FROM source_registrations WHERE experiment_id = ?",
+                "SELECT registration_json FROM source_registrations "
+                "WHERE experiment_id = ? ORDER BY revision DESC LIMIT 1",
                 (experiment_id,),
+            ).fetchone()
+        return SourceRegistration.model_validate_json(row[0]) if row else None
+
+    def get_source_registration_by_id(
+        self, registration_id: str
+    ) -> SourceRegistration | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT registration_json FROM source_registrations WHERE registration_id = ?",
+                (registration_id,),
             ).fetchone()
         return SourceRegistration.model_validate_json(row[0]) if row else None
 
@@ -1052,7 +1585,15 @@ class ApplicationRepository:
 
         Authority records use their typed methods above and cannot be updated here.
         """
-        if kind in {"experiment", "source_registration", "finalization"}:
+        if kind in {
+            "experiment",
+            "source_registration",
+            "finalization",
+            "validation_operation",
+            "validation_report",
+            "validation_blocker",
+            "blocker_resolution",
+        }:
             raise ValueError(f"generic persistence is not allowed for authority kind {kind}")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")

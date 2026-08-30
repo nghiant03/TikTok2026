@@ -1,3 +1,4 @@
+import json
 import shutil
 import sqlite3
 from pathlib import Path
@@ -181,6 +182,49 @@ def test_authority_records_reject_conflicting_replays(tmp_path: Path) -> None:
         )
 
 
+def test_source_registrations_are_append_only_revisions(tmp_path: Path) -> None:
+    repository = ApplicationRepository(tmp_path / "app.sqlite3")
+    repository.initialize()
+    repository.put_run(
+        RunRecord(run_id="run-1", status="running"),
+        transition_id="run-running",
+        expected_predecessor=None,
+    )
+    repository.put_experiment(
+        spec(),
+        status="proposed",
+        run_id="run-1",
+        transition_id="exp-proposed",
+        expected_predecessor=None,
+    )
+    patch_sha256, patch = register_patch(repository, tmp_path)
+    first = SourceRegistration(
+        experiment_id="exp-1",
+        run_id="run-1",
+        parent_commit="a" * 40,
+        source_commit="b" * 40,
+        patch_sha256=patch_sha256,
+        patch_artifact_id=f"patch-{patch_sha256}",
+        patch_artifact_uri=patch.resolve().as_uri(),
+        allowed_scopes=("src/tiktok2026/experiment",),
+        eligible=True,
+    )
+    second = first.model_copy(
+        update={
+            "registration_id": f"source-{'c' * 40}",
+            "revision": 1,
+            "source_commit": "c" * 40,
+        }
+    )
+
+    repository.put_source_registration(first)
+    repository.put_source_registration(second)
+
+    assert repository.get_source_registration("exp-1") == second
+    assert repository.get_source_registration_by_id(first.registration_id) == first
+    assert repository.get_source_registration_by_id(second.registration_id) == second
+
+
 def test_transitions_use_compare_and_swap_predecessors(tmp_path: Path) -> None:
     repository = ApplicationRepository(tmp_path / "app.sqlite3")
     repository.initialize()
@@ -358,3 +402,52 @@ def test_populated_legacy_database_is_adopted_without_duplicate_writes(tmp_path:
     repository.initialize()
     repository.initialize()
     assert repository.get_experiment("legacy-exp") is not None
+
+
+def test_existing_source_registration_migrates_to_revision_zero(tmp_path: Path) -> None:
+    old_migrations = tmp_path / "old-migrations"
+    old_migrations.mkdir()
+    repository_root = Path(__file__).parents[2]
+    migration_root = repository_root / "migrations" / "application"
+    for version in (
+        "001_initial.sql",
+        "002_pipeline.sql",
+        "003_repository_support.sql",
+        "004_authority_provenance.sql",
+        "005_resource_authority.sql",
+    ):
+        shutil.copyfile(migration_root / version, old_migrations / version)
+    database = tmp_path / "old.sqlite3"
+    MigrationRunner(database, old_migrations).apply()
+    registration = SourceRegistration(
+        experiment_id="exp-1",
+        run_id="run-1",
+        parent_commit="a" * 40,
+        source_commit="b" * 40,
+        patch_sha256="c" * 64,
+        patch_artifact_id=f"patch-{'c' * 64}",
+        patch_artifact_uri="file:///tmp/patch.diff",
+        allowed_scopes=("src/tiktok2026/experiment",),
+        eligible=True,
+    )
+    legacy_payload = registration.model_dump(mode="json")
+    legacy_payload.pop("registration_id")
+    legacy_payload.pop("revision")
+    payload = json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"))
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO authority_experiments VALUES (?, ?, ?, ?)",
+            ("exp-1", spec().model_dump_json(), "d" * 64, "now"),
+        )
+        connection.execute(
+            "INSERT INTO source_registrations VALUES (?, ?, ?, ?)",
+            ("exp-1", payload, "e" * 64, "now"),
+        )
+
+    repository = ApplicationRepository(database)
+    repository.initialize()
+
+    migrated = repository.get_source_registration("exp-1")
+    assert migrated is not None
+    assert migrated.registration_id == f"source-{'b' * 40}"
+    assert migrated.revision == 0

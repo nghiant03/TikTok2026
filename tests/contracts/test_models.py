@@ -13,6 +13,7 @@ from tiktok2026.contracts import (
     MetricValue,
     ResourceState,
     RunPhase,
+    SourceRegistration,
 )
 
 
@@ -96,6 +97,22 @@ def test_successful_execution_rejects_failure_classification() -> None:
             elapsed_seconds=1.0,
             gpu_hours=0.0,
             failure_kind=FailureKind.TIMEOUT,
+        )
+
+
+def test_source_registration_identity_is_bound_to_commit() -> None:
+    with pytest.raises(ValidationError, match="identity does not match"):
+        SourceRegistration(
+            registration_id=f"source-{'b' * 40}",
+            experiment_id="experiment-1",
+            run_id="run-1",
+            parent_commit="a" * 40,
+            source_commit="c" * 40,
+            patch_sha256="d" * 64,
+            patch_artifact_id=f"patch-{'d' * 64}",
+            patch_artifact_uri="file:///tmp/patch.diff",
+            allowed_scopes=("src/tiktok2026/experiment",),
+            eligible=True,
         )
 
 

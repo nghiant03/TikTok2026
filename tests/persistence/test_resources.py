@@ -89,6 +89,28 @@ def test_consume_and_reconcile_account_actual_usage(tmp_path: Path) -> None:
     )
 
 
+def test_overage_settlement_consumes_reservation_without_stranding_it(tmp_path: Path) -> None:
+    ledger = ResourceLedger(tmp_path / "resources.sqlite3", state())
+    reservation = ResourceReservation(
+        reservation_id="reservation-overage",
+        run_id="run-1",
+        experiment_id="exp-1",
+        gpu_hours=0.1,
+        wall_seconds=1.0,
+        tokens=1,
+        disk_bytes=10,
+    )
+    assert ledger.reserve(reservation)
+    actual = ResourceUsage(gpu_hours=0.2, wall_seconds=2.0, tokens=2, disk_bytes=20)
+    assert ledger.consume(reservation.reservation_id, actual)
+    assert ledger.reconcile(reservation.reservation_id, actual)
+    with sqlite3.connect(ledger.database) as connection:
+        assert connection.execute(
+            "SELECT status FROM authority_resource_reservations WHERE reservation_id = ?",
+            (reservation.reservation_id,),
+        ).fetchone()[0] == "consumed"
+
+
 def test_new_run_reclaims_interrupted_reservation(tmp_path: Path) -> None:
     ledger = ResourceLedger(tmp_path / "resources.sqlite3", state())
     ledger.claim_run("run-1")

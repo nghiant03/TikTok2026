@@ -353,36 +353,41 @@ class ResourceLedger:
             actual = self._usage(
                 reservation, usage, gpu_hours, wall_seconds, tokens, disk_bytes
             )
-            if (
-                actual.gpu_hours > reservation.gpu_hours
-                or actual.wall_seconds > reservation.wall_seconds
-                or actual.tokens > reservation.tokens
-                or actual.disk_bytes > reservation.disk_bytes
-            ):
-                raise ValueError("resource usage exceeds reservation")
             state = self._read_state(connection)
             updated = state.model_copy(
                 update={
-                    "remaining_gpu_hours": state.remaining_gpu_hours
-                    + reservation.gpu_hours
-                    - actual.gpu_hours,
-                    "remaining_wall_seconds": state.remaining_wall_seconds
-                    + reservation.wall_seconds
-                    - actual.wall_seconds,
-                    "remaining_tokens": state.remaining_tokens + reservation.tokens - actual.tokens,
-                    "disk_bytes_available": state.disk_bytes_available
-                    + reservation.disk_bytes
-                    - actual.disk_bytes,
+                    "remaining_gpu_hours": max(
+                        0.0,
+                        state.remaining_gpu_hours + reservation.gpu_hours - actual.gpu_hours,
+                    ),
+                    "remaining_wall_seconds": max(
+                        0.0,
+                        state.remaining_wall_seconds
+                        + reservation.wall_seconds
+                        - actual.wall_seconds,
+                    ),
+                    "remaining_tokens": max(
+                        0, state.remaining_tokens + reservation.tokens - actual.tokens
+                    ),
+                    "disk_bytes_available": max(
+                        0,
+                        state.disk_bytes_available
+                        + reservation.disk_bytes
+                        - actual.disk_bytes,
+                    ),
                     "accumulated_gpu_hours": state.accumulated_gpu_hours + actual.gpu_hours,
                     "accumulated_wall_seconds": state.accumulated_wall_seconds
                     + actual.wall_seconds,
                     "used_tokens": state.used_tokens + actual.tokens,
                     "used_disk_bytes": state.used_disk_bytes + actual.disk_bytes,
-                    "reserved_final_gpu_hours": state.reserved_final_gpu_hours
-                    + (
-                        reservation.gpu_hours - actual.gpu_hours
-                        if reservation.purpose == "final"
-                        else 0.0
+                    "reserved_final_gpu_hours": max(
+                        0.0,
+                        state.reserved_final_gpu_hours
+                        + (
+                            reservation.gpu_hours - actual.gpu_hours
+                            if reservation.purpose == "final"
+                            else 0.0
+                        ),
                     ),
                 }
             )

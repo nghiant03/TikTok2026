@@ -6,6 +6,7 @@ from typing import Protocol
 from tiktok2026.contracts.models import (
     ArtifactRecord,
     BaselineCalibrationRecord,
+    BlockerResolution,
     ContractModel,
     DatasetManifestIdentity,
     EvaluationRequest,
@@ -24,6 +25,10 @@ from tiktok2026.contracts.models import (
     ResourceState,
     RunRecord,
     SourceRegistration,
+    ValidationBlocker,
+    ValidationOperationIdentity,
+    ValidationReport,
+    ValidationStage,
     WorktreeAssignment,
 )
 
@@ -42,7 +47,10 @@ class WorktreeManager(Protocol):
     ) -> WorktreeAssignment: ...
 
     def register_source(
-        self, assignment: WorktreeAssignment, allowed_scopes: tuple[str, ...]
+        self,
+        assignment: WorktreeAssignment,
+        allowed_scopes: tuple[str, ...],
+        previous: SourceRegistration | None = None,
     ) -> SourceRegistration: ...
 
     def remove(self, assignment: WorktreeAssignment) -> None: ...
@@ -136,6 +144,52 @@ class RunStore(Protocol):
 
     def put_evaluation(self, result: EvaluationResult, provenance: ProvenanceRequest) -> None: ...
 
+    def put_validation_report(
+        self,
+        report: ValidationReport,
+        run_id: str,
+        operation: ValidationOperationIdentity,
+        subject: dict[str, object],
+    ) -> None: ...
+
+    def get_validation_report(self, report_id: str) -> ValidationReport | None: ...
+
+    def get_validation_report_by_operation(
+        self, operation_id: str
+    ) -> ValidationReport | None: ...
+
+    def get_validation_report_for_attempt(
+        self, run_id: str, experiment_id: str, stage: ValidationStage, repair_attempt: int
+    ) -> ValidationReport | None: ...
+
+    def get_validation_operation(
+        self, operation_id: str
+    ) -> ValidationOperationIdentity | None: ...
+
+    def list_validation_reports(
+        self, experiment_id: str | None = None
+    ) -> tuple[ValidationReport, ...]: ...
+
+    def list_validation_blockers(
+        self, experiment_id: str | None = None
+    ) -> tuple[ValidationBlocker, ...]: ...
+
+    def get_validation_blocker(self, blocker_id: str) -> ValidationBlocker | None: ...
+
+    def put_blocker_resolution(self, resolution: BlockerResolution, run_id: str) -> None: ...
+
+    def list_blocker_resolutions(
+        self, experiment_id: str | None = None
+    ) -> tuple[BlockerResolution, ...]: ...
+
+    def get_blocker_resolution(self, resolution_id: str) -> BlockerResolution | None: ...
+
+    def get_unresolved_blockers(self, experiment_id: str) -> tuple[ValidationBlocker, ...]: ...
+
+    def get_unresolved_blocker_ids(self, experiment_id: str) -> tuple[str, ...]: ...
+
+    def list_unresolved_blockers(self, experiment_id: str) -> tuple[ValidationBlocker, ...]: ...
+
     def put_failure(self, record: FailureRecord, run_id: str) -> None: ...
 
     def put_run(
@@ -148,6 +202,10 @@ class RunStore(Protocol):
     def put_audit_event(self, event: ContractModel) -> None: ...
 
     def get_source_registration(self, experiment_id: str) -> SourceRegistration | None: ...
+
+    def get_source_registration_by_id(
+        self, registration_id: str
+    ) -> SourceRegistration | None: ...
 
     def get_experiment(self, experiment_id: str) -> ExperimentSpec | None: ...
 
