@@ -33,6 +33,14 @@ class BudgetSettings(BaseModel):
     max_repairs: int = Field(default=2, ge=0, le=2)
 
 
+class ExecutionSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    timeout_seconds: int = Field(default=300, gt=0)
+    memory_bytes: int = Field(default=1 << 30, gt=0)
+    cpus: float = Field(default=1.0, gt=0.0)
+
+
 class AppSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -41,6 +49,7 @@ class AppSettings(BaseModel):
     dataset_root: Path | None = None
     profile: str = "test"
     budget: BudgetSettings = BudgetSettings()
+    execution: ExecutionSettings = ExecutionSettings()
     models: dict[AgentRole, ModelSettings] = {role: ModelSettings() for role in AgentRole}
     docker_image: str = "tiktok2026:local"
     evaluator_id: str = "provisional-within-user-v1"

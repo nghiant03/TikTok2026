@@ -64,8 +64,6 @@ class FinalTestAuthorizationAdapter(Protocol):
 
 
 class ContainerLifecycle(Protocol):
-    async def copy_output(self, name: str, destination: Path) -> None: ...
-
     async def kill(self, name: str) -> None: ...
 
     async def remove(self, name: str) -> None: ...
@@ -402,6 +400,7 @@ class ExecutionPolicy:
         ("HOME", "/tmp"),
         ("LANG", "C.UTF-8"),
         ("PYTHONUNBUFFERED", "1"),
+        ("PYTHONPATH", "/workspace/src"),
         ("TMPDIR", "/tmp"),
     )
 
@@ -585,8 +584,10 @@ def validate_execution_request(
         for other in mounts[index + 1 :]:
             if mount == other or mount in other.parents or other in mount.parents:
                 raise ExecutionPolicyError("source, dataset, and artifact mounts must be distinct")
-    if not os.access(output, os.W_OK):
+    if not os.access(output, os.W_OK) or not output.stat().st_mode & 0o002:
         raise ExecutionPolicyError("artifact mount is not writable")
+    if any(output.iterdir()):
+        raise ExecutionPolicyError("artifact mount must be a fresh empty directory")
     return source, dataset, output
 
 
@@ -605,7 +606,7 @@ def build_docker_command(
     if dataset_view is None:
         raise ExecutionPolicyError("a controller-provided dataset view is required")
     dataset = validate_dataset_view(request, dataset_view, final_test_authorizer)
-    source, _, _ = validate_execution_request(request, policy, dataset)
+    source, _, output = validate_execution_request(request, policy, dataset)
     command = [
         "docker",
         "run",
@@ -626,17 +627,19 @@ def build_docker_command(
         "--storage-opt",
         f"size={policy.disk_bytes}",
         "--mount",
-        f"type=bind,source={source},target=/workspace,readonly,bind-nonrecursive",
+        f"type=bind,source={source},target=/workspace,readonly,bind-recursive=disabled",
         "--mount",
-        f"type=bind,source={dataset},target=/dataset,readonly,bind-nonrecursive",
-        "--tmpfs",
-        f"/output:rw,noexec,nosuid,size={policy.artifact_quota_bytes}",
+        f"type=bind,source={dataset},target=/dataset,readonly,bind-recursive=disabled",
+        "--mount",
+        f"type=bind,source={output},target=/output,rw,bind-recursive=disabled",
         "--tmpfs",
         "/tmp:rw,noexec,nosuid,size=67108864",
         "--workdir",
         "/workspace",
         "--label",
         f"tiktok2026.source_commit={request.source_commit}",
+        "--entrypoint",
+        request.command[0],
     ]
     for name, value in policy.environment:
         command.extend(("--env", f"{name}={value}"))
@@ -647,7 +650,7 @@ def build_docker_command(
     command.extend(
         (
             request.image,
-            *request.command,
+            *request.command[1:],
             "--data-root=/dataset",
             "--data-manifest=/dataset/manifest.json",
         )
@@ -720,9 +723,6 @@ async def _run_docker_control(arguments: tuple[str, ...]) -> None:
 
 
 class DockerContainerLifecycle:
-    async def copy_output(self, name: str, destination: Path) -> None:
-        await _run_docker_control(("cp", f"{name}:/output/.", str(destination)))
-
     async def kill(self, name: str) -> None:
         await _run_docker_control(("kill", name))
 
@@ -825,6 +825,12 @@ class DockerExecutor:
         prefix = hashlib.sha256(request.execution_id.encode()).hexdigest()[:16]
         name = container_name(request.execution_id)
         baseline_bytes = _directory_size(output)
+        docker_command = build_docker_command(
+            request,
+            self.policy,
+            dataset_view,
+            self.final_test_authorizer,
+        )
         stdout_capture = BoundedOutputCapture(
             output / f"{prefix}.stdout.log", self.policy.max_output_bytes
         )
@@ -850,12 +856,7 @@ class DockerExecutor:
         try:
             try:
                 process = await asyncio.create_subprocess_exec(
-                    *build_docker_command(
-                        request,
-                        self.policy,
-                        dataset_view,
-                        self.final_test_authorizer,
-                    ),
+                    *docker_command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env={"PATH": "/usr/bin:/bin"},
@@ -915,22 +916,13 @@ class DockerExecutor:
         )
         try:
             if process is not None and not timed_out and not quota_exceeded:
-                copy_failed = False
                 try:
-                    await self.lifecycle.copy_output(name, output)
+                    await self.lifecycle.remove(name)
                 except Exception as error:
-                    copy_failed = True
-                    cleanup_errors.append(f"artifact copy {type(error).__name__}: {error}")
-                if copy_failed:
+                    cleanup_errors.append(
+                        f"container removal {type(error).__name__}: {error}"
+                    )
                     await cleanup_container()
-                else:
-                    try:
-                        await self.lifecycle.remove(name)
-                    except Exception as error:
-                        cleanup_errors.append(
-                            f"container removal {type(error).__name__}: {error}"
-                        )
-                        await cleanup_container()
         except asyncio.CancelledError:
             if process is not None:
                 await terminate_process_group(process, self.policy.termination_grace_seconds)

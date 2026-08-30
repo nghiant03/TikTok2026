@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from tiktok2026.config import AppSettings, ModelSettings
+from tiktok2026.config import AppSettings, ExecutionSettings, ModelSettings
 from tiktok2026.contracts import RuntimePaths
 
 
@@ -49,3 +49,23 @@ def test_settings_load_operator_values(tmp_path: Path) -> None:
 
     assert settings.budget.wall_clock_seconds == 90
     assert settings.docker_image == "controller:sha256"
+
+
+def test_execution_settings_have_safe_defaults_and_validate_values() -> None:
+    settings = ExecutionSettings()
+    assert settings.timeout_seconds == 300
+    assert settings.memory_bytes == 1 << 30
+    assert settings.cpus == 1.0
+    with pytest.raises(ValidationError):
+        ExecutionSettings(memory_bytes=0)
+
+
+def test_development_profile_configures_execution_resources() -> None:
+    settings = AppSettings.load(
+        repository_root=Path("/tmp/repo"),
+        profile_path=Path("config/budgets/development.toml"),
+        overrides={"runtime_root": Path("/tmp/tiktok2026-test-runtime")},
+    )
+    assert settings.execution.memory_bytes == 4_294_967_296
+    assert settings.execution.timeout_seconds == 300
+    assert settings.execution.cpus == 1.0

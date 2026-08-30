@@ -36,6 +36,7 @@ def request(tmp_path: Path) -> ExecutionRequest:
     source.mkdir()
     dataset.mkdir()
     output.mkdir()
+    output.chmod(0o777)
     for filename in ("manifest.json", "train.csv", "valid.csv"):
         (dataset / filename).write_text("authorized", encoding="utf-8")
     return ExecutionRequest(
@@ -118,24 +119,10 @@ class FakeLifecycle:
     def __init__(
         self,
         *,
-        block_copy: bool = False,
         fail_cleanup: bool = False,
-        copy_delay: float = 0.0,
     ) -> None:
-        self.block_copy = block_copy
         self.fail_cleanup = fail_cleanup
-        self.copy_delay = copy_delay
         self.calls: list[str] = []
-        self.copy_started = asyncio.Event()
-
-    async def copy_output(self, name: str, destination: Path) -> None:
-        del destination
-        self.calls.append(f"copy:{name}")
-        self.copy_started.set()
-        if self.copy_delay:
-            await asyncio.sleep(self.copy_delay)
-        if self.block_copy:
-            await asyncio.Future()
 
     async def kill(self, name: str) -> None:
         self.calls.append(f"kill:{name}")
@@ -153,12 +140,31 @@ def test_docker_command_disables_network_and_mounts_data_read_only(tmp_path: Pat
     command = build_docker_command(current, dataset_view=dataset_view(current.dataset_path))
     assert "--network=none" in command
     assert "--rm" not in command
-    assert any(item.startswith("/output:rw") for item in command)
+    assert command[command.index("--entrypoint") + 1] == "python"
+    image_index = command.index(current.image)
+    assert command[image_index + 1 : image_index + 3] == ("-m", "tiktok2026.experiment.train")
+    output_mounts = tuple(
+        command[index + 1] for index, item in enumerate(command) if item == "--mount"
+    )
+    assert any(
+        "target=/output" in mount
+        and f"source={current.output_path.resolve()}" in mount
+        and "type=bind" in mount
+        and ",rw," in mount
+        for mount in output_mounts
+    )
+    assert not any(item.startswith("/output") for item in command)
+    env_index = command.index("--env")
+    assert command[env_index + 1] == "HOME=/tmp"
+    assert "PYTHONPATH=/workspace/src" in command
     assert command[-2:] == ("--data-root=/dataset", "--data-manifest=/dataset/manifest.json")
     dataset_mount = command[command.index("--mount") + 1]
     assert "readonly" in dataset_mount or any(
         "dataset" in item and "readonly" in item for item in command
     )
+    mounts = tuple(command[index + 1] for index, item in enumerate(command) if item == "--mount")
+    assert all("bind-recursive=disabled" in mount for mount in mounts)
+    assert not any("bind-nonrecursive" in mount for mount in mounts)
 
 
 def test_cuda_oom_evidence_is_classified() -> None:
@@ -176,6 +182,28 @@ def test_untrusted_image_and_shell_command_are_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ExecutionPolicyError):
         build_docker_command(untrusted, dataset_view=dataset_view(current.dataset_path))
+
+
+def test_artifact_bind_requires_a_fresh_empty_directory(tmp_path: Path) -> None:
+    current = request(tmp_path)
+    (current.output_path / "stale.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ExecutionPolicyError, match="fresh empty"):
+        build_docker_command(current, dataset_view=dataset_view(current.dataset_path))
+
+
+def test_experiment_package_does_not_eagerly_import_train() -> None:
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "import sys; import tiktok2026.experiment; "
+            "assert 'tiktok2026.experiment.train' not in sys.modules",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert not result.stderr
 
 
 def test_alternative_data_root_is_rejected(tmp_path: Path) -> None:
@@ -265,15 +293,15 @@ def test_executor_requires_authoritative_artifact_publisher(tmp_path: Path) -> N
         asyncio.run(DockerExecutor().execute(request(tmp_path)))
 
 
-def test_cancellation_during_output_copy_cleans_container(
+def test_cancellation_after_launch_cleans_container(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     current = request(tmp_path)
     provider = FakeProvider(dataset_view(current.dataset_path))
-    lifecycle = FakeLifecycle(block_copy=True)
+    lifecycle = FakeLifecycle()
 
     async def run() -> None:
-        process = FakeProcess(returncode=0)
+        process = FakeProcess(returncode=None)
 
         async def create_process(*args: object, **kwargs: object) -> FakeProcess:
             del args, kwargs
@@ -297,7 +325,7 @@ def test_cancellation_during_output_copy_cleans_container(
             lifecycle=lifecycle,
         )
         task = asyncio.create_task(executor.execute(current))
-        await lifecycle.copy_started.wait()
+        await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -370,11 +398,11 @@ def test_gpu_launch_failure_has_zero_usage(tmp_path: Path, monkeypatch: pytest.M
     asyncio.run(run())
 
 
-def test_gpu_fallback_stops_before_delayed_output_copy(
+def test_gpu_execution_stops_without_output_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     current = request(tmp_path).model_copy(update={"gpu_count": 1})
-    lifecycle = FakeLifecycle(copy_delay=0.2)
+    lifecycle = FakeLifecycle()
 
     async def run() -> float:
         process = FakeProcess(returncode=0)
@@ -398,7 +426,8 @@ def test_gpu_fallback_stops_before_delayed_output_copy(
         ).execute(current)
         return result.gpu_hours
 
-    assert asyncio.run(run()) < 0.00005
+    assert asyncio.run(run()) < 0.05
+    assert f"remove:{container_name(current.execution_id)}" in lifecycle.calls
 
 
 def test_output_is_bounded_without_buffering(tmp_path: Path) -> None:
