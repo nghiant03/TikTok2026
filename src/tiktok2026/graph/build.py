@@ -20,6 +20,7 @@ NODES = (
     "implementation_validation",
     "register_source",
     "preflight",
+    "smoke",
     "execute",
     "evaluate",
     "result_validation",

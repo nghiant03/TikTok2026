@@ -37,12 +37,12 @@ async def test_two_cycles_persist_audit_and_provisional_bundle(tmp_path: Path) -
     with sqlite3.connect(result.paths.application_db) as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM authority_resource_reservations"
-        ).fetchone()[0] == 2
+        ).fetchone()[0] == 4
         reservations = connection.execute(
             "SELECT status, reservation_json, settled_usage_json "
             "FROM authority_resource_reservations"
         ).fetchall()
-        assert len(reservations) == 2
+        assert len(reservations) == 4
         assert all(row[0] == "consumed" for row in reservations)
         for status, reservation_json, settled_usage_json in reservations:
             assert status == "consumed"

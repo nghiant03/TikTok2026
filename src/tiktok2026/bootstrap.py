@@ -4,6 +4,7 @@ import asyncio
 import fcntl
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import subprocess
@@ -34,6 +35,8 @@ from tiktok2026.contracts import (
     AuditEvent,
     ContractModel,
     DatasetManifestIdentity,
+    DatasetViewProvenance,
+    DatasetViewRow,
     DecisionAction,
     EvaluationResult,
     EvaluatorIdentity,
@@ -152,7 +155,6 @@ def _persist_finalization(
     if experiment_id is None:
         raise ValueError("no experiment found for this run")
     store = RepositoryRunStore(repository)
-    source = store.get_source_registration(experiment_id)
     evaluation_values: list[EvaluationResult] = []
     for raw in repository.list_json("evaluation"):
         value = json.loads(raw)
@@ -160,6 +162,11 @@ def _persist_finalization(
         if evaluation.experiment_id == experiment_id:
             evaluation_values.append(evaluation)
     evaluation = evaluation_values[-1] if evaluation_values else None
+    source = (
+        store.get_source_registration_by_id(f"source-{evaluation.source_commit}")
+        if evaluation is not None and evaluation.source_commit is not None
+        else store.get_source_registration(experiment_id)
+    )
     if source is None or evaluation is None:
         raise ValueError("finalization provenance is unavailable")
     if evaluation.run_id != run_id:
@@ -498,6 +505,354 @@ class ProductionOperations:
             },
         )
 
+    def recover_source_registration(self, run_id: str) -> OperationResult:
+        with _exclusive_runtime_run(self.runtime_root, run_id):
+            return self._recover_source_registration(run_id)
+
+    def recover_execution_result(self, run_id: str, execution_id: str) -> OperationResult:
+        with _exclusive_runtime_run(self.runtime_root, run_id):
+            return self._recover_execution_result(run_id, execution_id)
+
+    def retry_execution(self, run_id: str, failed_execution_id: str) -> OperationResult:
+        with _exclusive_runtime_run(self.runtime_root, run_id):
+            from tiktok2026.recovery import validate_execution_recovery_state
+
+            repository = ApplicationRepository(self.runtime_root / "application.sqlite3")
+            store = RepositoryRunStore(repository)
+            failed = store.get_execution_result(failed_execution_id)
+            if failed is None or failed.failure_kind is None:
+                raise OperationalError("failed execution result is unavailable")
+            registration = store.get_source_registration_by_id(failed.source_registration_id)
+            if (
+                registration is None
+                or registration.run_id != run_id
+                or registration.experiment_id != failed.experiment_id
+                or registration.source_commit != failed.source_commit
+            ):
+                raise OperationalError("run is not eligible for execution retry")
+            checkpointer = SqliteCheckpointer(self.runtime_root / "graph.sqlite3")
+
+            async def _find_checkpoint() -> tuple[Any | None, int]:
+                target = None
+                maximum_state_version = 0
+                async for candidate in checkpointer.alist(
+                    {"configurable": {"thread_id": run_id}}, limit=100
+                ):
+                    state = _checkpoint_state(candidate.checkpoint)
+                    state_version = state.get("state_version")
+                    if isinstance(state_version, int):
+                        maximum_state_version = max(maximum_state_version, state_version)
+                    if target is None and validate_execution_recovery_state(
+                        state, run_id, failed, registration
+                    ).resumable:
+                        target = candidate
+                return target, maximum_state_version
+
+            target, state_version = asyncio.run(_find_checkpoint())
+            if target is None:
+                raise OperationalError("eligible pre-execution checkpoint was not found")
+            target_state = _checkpoint_state(target.checkpoint)
+            experiment_id = failed.experiment_id
+            retry_execution_id = f"execution-{run_id}-{experiment_id}-{state_version}"
+            if (
+                store.get_execution_result(retry_execution_id) is not None
+                or store.load_transition(run_id, state_version + 1) is not None
+            ):
+                raise OperationalError("execution retry identity is not fresh")
+
+            services = build_production_services(self._production_settings())
+            config = asyncio.run(
+                services.graph.aupdate_state(
+                    cast(dict[str, object], target.config),
+                    {
+                        "phase": RunPhase.EXECUTE,
+                        "pending_route": "execute",
+                        "state_version": state_version,
+                        "latest_execution_result_id": None,
+                        "latest_evaluation_result_id": None,
+                        "terminal_reason": None,
+                    },
+                    as_node="preflight",
+                )
+            )
+            configurable = config.get("configurable")
+            checkpoint_id = (
+                cast(dict[str, object], configurable).get("checkpoint_id")
+                if isinstance(configurable, dict)
+                else None
+            )
+            repository.put_audit_event(
+                AuditEvent(
+                    event_id=f"execution-retry-{run_id}-{uuid.uuid4().hex[:8]}",
+                    run_id=run_id,
+                    experiment_id=experiment_id,
+                    event_type="execution_retry_accepted",
+                    actor_type="human",
+                    actor_id="cli-operator",
+                    payload={
+                        "failed_execution_id": failed_execution_id,
+                        "retry_execution_id": retry_execution_id,
+                        "failure_kind": failed.failure_kind.value,
+                        "source_registration_id": registration.registration_id,
+                        "target_state_version": target_state.get("state_version"),
+                        "retry_state_version": state_version,
+                        "checkpoint_id": checkpoint_id,
+                    },
+                )
+            )
+            return _result(
+                "retry_execution",
+                run_id=run_id,
+                phase=RunPhase.EXECUTE,
+                status="recovered",
+                values={
+                    "pending_route": "execute",
+                    "failed_execution_id": failed_execution_id,
+                    "retry_execution_id": retry_execution_id,
+                    "target_state_version": target_state.get("state_version"),
+                    "retry_state_version": state_version,
+                },
+            )
+
+    def _recover_execution_result(self, run_id: str, execution_id: str) -> OperationResult:
+        from tiktok2026.recovery import validate_execution_recovery_state
+
+        repository = ApplicationRepository(self.runtime_root / "application.sqlite3")
+        store = RepositoryRunStore(repository)
+        execution = store.get_execution_result(execution_id)
+        if execution is None:
+            raise OperationalError("authoritative execution result is unavailable")
+        registration = store.get_source_registration_by_id(execution.source_registration_id)
+        if registration is None:
+            raise OperationalError("execution source registration is unavailable")
+        for artifact_id in execution.artifact_ids:
+            artifact = store.get_artifact(artifact_id)
+            if (
+                artifact is None
+                or artifact.run_id != run_id
+                or artifact.experiment_id != execution.experiment_id
+            ):
+                raise OperationalError("execution artifact authority is unavailable")
+
+        checkpointer = SqliteCheckpointer(self.runtime_root / "graph.sqlite3")
+
+        async def _find_checkpoint() -> tuple[Any | None, int]:
+            target = None
+            maximum_state_version = 0
+            async for candidate in checkpointer.alist(
+                {"configurable": {"thread_id": run_id}}, limit=100
+            ):
+                state = _checkpoint_state(candidate.checkpoint)
+                state_version = state.get("state_version")
+                if isinstance(state_version, int):
+                    maximum_state_version = max(maximum_state_version, state_version)
+                validation = validate_execution_recovery_state(
+                    state, run_id, execution, registration
+                )
+                if target is None and validation.resumable:
+                    target = candidate
+            return target, maximum_state_version
+
+        target, maximum_state_version = asyncio.run(_find_checkpoint())
+        if target is None:
+            raise OperationalError("eligible execution checkpoint was not found")
+        target_state = _checkpoint_state(target.checkpoint)
+        target_config = cast(dict[str, object], target.config)
+        services = build_production_services(self._production_settings())
+        ledger = services.resource_ledger
+        reservation_id = f"reservation-{execution.execution_id}"
+        if ledger is None or not ledger.consume(
+            reservation_id,
+            gpu_hours=execution.gpu_hours,
+            wall_seconds=execution.elapsed_seconds,
+            tokens=0,
+            disk_bytes=0,
+        ):
+            raise OperationalError("execution resource settlement is unavailable")
+        ledger.reconcile(
+            reservation_id,
+            gpu_hours=execution.gpu_hours,
+            wall_seconds=execution.elapsed_seconds,
+            tokens=0,
+            disk_bytes=0,
+        )
+        if execution.failure_kind is None:
+            pending_route = "evaluate"
+            terminal_reason = None
+        else:
+            detail = json.dumps(
+                {
+                    "kind": execution.failure_kind.value,
+                    "message": "execution failed",
+                    "evidence": [execution.execution_id],
+                },
+                sort_keys=True,
+            )
+            pending_route = "persist_failure"
+            terminal_reason = f"failure:{detail}"
+        config = asyncio.run(
+            services.graph.aupdate_state(
+                target_config,
+                {
+                    "phase": RunPhase.EXECUTE,
+                    "pending_route": pending_route,
+                    "state_version": maximum_state_version,
+                    "latest_execution_result_id": execution.execution_id,
+                    "latest_evaluation_result_id": None,
+                    "terminal_reason": terminal_reason,
+                },
+                as_node="execute",
+            )
+        )
+        configurable = config.get("configurable")
+        checkpoint_id = (
+            cast(dict[str, object], configurable).get("checkpoint_id")
+            if isinstance(configurable, dict)
+            else None
+        )
+        target_checkpoint_id = cast(dict[str, object], target_config.get("configurable", {})).get(
+            "checkpoint_id"
+        )
+        repository.put_audit_event(
+            AuditEvent(
+                event_id=f"execution-result-recovery-{run_id}-{uuid.uuid4().hex[:8]}",
+                run_id=run_id,
+                experiment_id=execution.experiment_id,
+                event_type="execution_result_recovery_accepted",
+                actor_type="human",
+                actor_id="cli-operator",
+                payload={
+                    "execution_id": execution.execution_id,
+                    "source_registration_id": registration.registration_id,
+                    "source_commit": registration.source_commit,
+                    "target_state_version": target_state.get("state_version"),
+                    "recovery_state_version": maximum_state_version,
+                    "pending_route": pending_route,
+                    "target_checkpoint_id": target_checkpoint_id,
+                    "checkpoint_id": checkpoint_id,
+                },
+            )
+        )
+        return _result(
+            "recover_execution_result",
+            run_id=run_id,
+            phase=RunPhase.EXECUTE,
+            status="recovered",
+            values={
+                "pending_route": pending_route,
+                "execution_id": execution.execution_id,
+                "source_registration_id": registration.registration_id,
+                "target_state_version": target_state.get("state_version"),
+                "recovery_state_version": maximum_state_version,
+            },
+        )
+
+    def _recover_source_registration(self, run_id: str) -> OperationResult:
+        checkpoint = self._load_checkpoint(run_id)
+        if checkpoint is None:
+            raise OperationalError(f"no durable checkpoint exists for run {run_id}")
+        state = _checkpoint_state(checkpoint)
+        experiment_id = str(state.get("current_experiment_id") or "")
+        repository = ApplicationRepository(self.runtime_root / "application.sqlite3")
+        store = RepositoryRunStore(repository)
+        assignment = store.get_worktree_assignment(experiment_id) if experiment_id else None
+        source = store.get_source_registration(experiment_id) if experiment_id else None
+        if assignment is None or source is None:
+            raise OperationalError("source-registration recovery authority is unavailable")
+
+        events = repository.list_audit_events(run_id)
+
+        def _approved_registration_transition(event: AuditEvent) -> bool:
+            updates = event.payload.get("updates")
+            return (
+                event.event_type == "controller_transition"
+                and event.payload.get("operation") == "implementation_validation"
+                and isinstance(updates, dict)
+                and cast(dict[str, object], updates).get("pending_route")
+                == "register_source"
+            )
+
+        failure = next(
+            (
+                event
+                for event in reversed(events)
+                if event.event_type == "failure_persisted"
+                and event.experiment_id == experiment_id
+            ),
+            None,
+        )
+        validation = next(
+            (
+                event
+                for event in reversed(events)
+                if _approved_registration_transition(event)
+            ),
+            None,
+        )
+        failure_evidence = failure.payload.get("evidence_refs") if failure is not None else None
+        if (
+            failure is None
+            or failure_evidence != ["source worktree is not clean after registration"]
+            or validation is None
+        ):
+            raise OperationalError("run is not eligible for source-registration recovery")
+
+        result = validate_pre_registration_assignment(
+            assignment,
+            self.runtime_root,
+            lambda commit: self._approved_parent_for_resume(commit),
+            source.source_commit,
+        )
+        if not result.resumable:
+            raise OperationalError(result.reason)
+
+        services = build_production_services(self._production_settings())
+        config = asyncio.run(
+            services.graph.aupdate_state(
+                {"configurable": {"thread_id": run_id}},
+                {
+                    "phase": RunPhase.IMPLEMENT,
+                    "pending_route": "register_source",
+                    "terminal_reason": None,
+                },
+                as_node="implementation_validation",
+            )
+        )
+        configurable = config.get("configurable")
+        checkpoint_id = (
+            cast(dict[str, object], configurable).get("checkpoint_id")
+            if isinstance(configurable, dict)
+            else None
+        )
+        repository.put_audit_event(
+            AuditEvent(
+                event_id=f"source-registration-recovery-{run_id}-{uuid.uuid4().hex[:8]}",
+                run_id=run_id,
+                experiment_id=experiment_id,
+                event_type="source_registration_recovery_accepted",
+                actor_type="human",
+                actor_id="cli-operator",
+                payload={
+                    "prior_registration_id": source.registration_id,
+                    "prior_revision": source.revision,
+                    "validation_event_id": validation.event_id,
+                    "failure_event_id": failure.event_id,
+                    "checkpoint_id": checkpoint_id,
+                },
+            )
+        )
+        return _result(
+            "recover_source_registration",
+            run_id=run_id,
+            phase=RunPhase.IMPLEMENT,
+            status="recovered",
+            values={
+                "pending_route": "register_source",
+                "prior_registration_id": source.registration_id,
+                "prior_revision": source.revision,
+            },
+        )
+
     def inspect(self, run_id: str) -> OperationResult:
         repository = ApplicationRepository(self.runtime_root / "application.sqlite3")
         events = repository.list_audit_events(run_id)
@@ -608,6 +963,18 @@ class ProductionOperations:
             reason = "late resume provenance is unavailable"
             self._resume_audit(repository, run_id, False, reason)
             raise OperationalError(reason)
+        stale_reservation_id = self._reservation_id(run_id)
+        if str(state.get("pending_route")) == "execute":
+            state_version = state.get("state_version")
+            execution_id = f"execution-{run_id}-{experiment_id}-{state_version}"
+            execution = store.get_execution_result(execution_id)
+            if (
+                stale_reservation_id == f"reservation-{execution_id}"
+                and execution is not None
+                and execution.source_registration_id == source.registration_id
+                and execution.source_commit == source.source_commit
+            ):
+                stale_reservation_id = None
         candidate = RecoveryCandidate(
             run_id=run_id,
             experiment_id=experiment_id,
@@ -618,7 +985,7 @@ class ProductionOperations:
             stale_lock=self.runtime_root / "locks" / f"{run_id}.lock",
             worktree_path=assignment.path,
             artifact_uri=Path(patch.uri.removeprefix("file://")),
-            stale_reservation_id=self._reservation_id(run_id),
+            stale_reservation_id=stale_reservation_id,
         )
         result = reconcile_recovery(candidate, self._release_reservation)
         if not result.resumable:
@@ -659,11 +1026,9 @@ class ProductionOperations:
             return
         if route in {"implement", "diff_policy", "implementation_validation", "register_source"}:
             experiment_id = str(state.get("current_experiment_id") or "")
-            assignment = (
-                RepositoryRunStore(repository).get_worktree_assignment(experiment_id)
-                if experiment_id
-                else None
-            )
+            store = RepositoryRunStore(repository)
+            assignment = store.get_worktree_assignment(experiment_id) if experiment_id else None
+            source = store.get_source_registration(experiment_id) if experiment_id else None
             if assignment is None:
                 reason = "pre-registration worktree assignment is unavailable"
                 self._resume_audit(repository, run_id, False, reason)
@@ -672,6 +1037,8 @@ class ProductionOperations:
                 assignment,
                 self.runtime_root,
                 lambda commit: self._approved_parent_for_resume(commit),
+                source.source_commit if source is not None else None,
+                allow_pending_commit=route == "register_source",
             )
             if not result.resumable:
                 self._resume_audit(repository, run_id, False, result.reason)
@@ -704,7 +1071,23 @@ class ProductionOperations:
         implementor.bind_worktree(assignment.path, spec.implementation_scope)
 
     def _approved_parent_for_resume(self, commit: str) -> bool:
-        return _current_commit(self.repository_root) == commit
+        try:
+            subprocess.run(
+                (
+                    "git",
+                    "merge-base",
+                    "--is-ancestor",
+                    f"{commit}^{{commit}}",
+                    "HEAD",
+                ),
+                cwd=self.repository_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return False
+        return True
 
     def _reservation_id(self, run_id: str) -> str | None:
         with sqlite3.connect(self.runtime_root / "application.sqlite3") as connection:
@@ -774,6 +1157,7 @@ class _RunBoundDockerExecutor:
         from tiktok2026.execution.docker import (
             ArtifactStorePublisher,
             DockerExecutor,
+            DockerResourceTelemetry,
             RegisteredGitSourceVerifier,
         )
 
@@ -793,10 +1177,23 @@ class _RunBoundDockerExecutor:
             ),
             dataset_provider=self.dataset_provider,
             source_verifier=RegisteredGitSourceVerifier(self.repository, assignment),
+            resource_telemetry=DockerResourceTelemetry(),
         )
         result = await executor.execute(request)
         if result.exit_code != 0:
             return result
+        if request.execution_kind == "smoke":
+            try:
+                self._validate_smoke_artifacts(request, result)
+            except _ExecutionArtifactContractError as error:
+                return result.model_copy(
+                    update={
+                        "exit_code": 1,
+                        "failure_kind": error.failure_kind,
+                        "failure_message": str(error),
+                    }
+                )
+            return result.model_copy(update={"smoke_output_valid": True})
         try:
             return self._register_training_artifacts(request, result)
         except _ExecutionArtifactContractError as error:
@@ -804,7 +1201,119 @@ class _RunBoundDockerExecutor:
             # Return a typed failed result so the controller persists and routes
             # it like every other execution failure.
             return result.model_copy(
-                update={"exit_code": 1, "failure_kind": error.failure_kind}
+                update={
+                    "exit_code": 1,
+                    "failure_kind": error.failure_kind,
+                    "failure_message": str(error),
+                }
+            )
+
+    def _validate_smoke_artifacts(
+        self, request: ExecutionRequest, result: ExecutionResult
+    ) -> None:
+        dataset_identity = RepositoryRunStore(self.repository).get_dataset_manifest_identity()
+        if dataset_identity is None or (
+            request.dataset_manifest_sha256 != dataset_identity.manifest_sha256
+        ):
+            raise _ExecutionArtifactContractError(
+                "smoke dataset provenance is unavailable", FailureKind.SCHEMA_MISMATCH
+            )
+        expected_rows = result.dataset_valid_rows
+        if not expected_rows or len(expected_rows) > 32:
+            raise _ExecutionArtifactContractError(
+                "smoke valid-view expectation is absent or unbounded",
+                FailureKind.SCHEMA_MISMATCH,
+            )
+        if (
+            result.dataset_manifest_id != dataset_identity.manifest_id
+            or result.dataset_manifest_sha256 != dataset_identity.manifest_sha256
+            or result.dataset_view_sha256 is None
+        ):
+            raise _ExecutionArtifactContractError(
+                "smoke result dataset provenance is invalid", FailureKind.SCHEMA_MISMATCH
+            )
+        output = request.output_path.resolve()
+        predictions_path = output / "predictions.json"
+        checkpoint_path = output / "checkpoint_bundle.json"
+        if not predictions_path.is_file() or not checkpoint_path.is_file():
+            raise _ExecutionArtifactContractError(
+                "smoke execution did not produce required outputs", FailureKind.MISSING_PATH
+            )
+        try:
+            predictions = json.loads(predictions_path.read_text(encoding="utf-8"))
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise _ExecutionArtifactContractError(
+                "smoke outputs are not valid JSON", FailureKind.SCHEMA_MISMATCH
+            ) from error
+        if not isinstance(predictions, dict) or not isinstance(checkpoint, dict):
+            raise _ExecutionArtifactContractError(
+                "smoke outputs must be JSON objects", FailureKind.SCHEMA_MISMATCH
+            )
+        prediction_payload = cast(dict[str, object], predictions)
+        checkpoint_payload = cast(dict[str, object], checkpoint)
+        required_prediction = {
+            "manifest_id": dataset_identity.manifest_id,
+            "manifest_sha256": request.dataset_manifest_sha256,
+            "dataset_view_sha256": result.dataset_view_sha256,
+            "source_commit": request.source_commit,
+            "execution_id": request.execution_id,
+            "split": "valid",
+        }
+        if any(prediction_payload.get(key) != value for key, value in required_prediction.items()):
+            raise _ExecutionArtifactContractError(
+                "smoke prediction provenance is invalid", FailureKind.SCHEMA_MISMATCH
+            )
+        rows: object = prediction_payload.get("rows")
+        if not isinstance(rows, list) or len(cast(list[object], rows)) != len(expected_rows):
+            raise _ExecutionArtifactContractError(
+                "smoke predictions do not match the staged valid view",
+                FailureKind.SCHEMA_MISMATCH,
+            )
+        seen_row_ids: set[str] = set()
+        for raw, expected in zip(cast(list[object], rows), expected_rows, strict=True):
+            if not isinstance(raw, dict):
+                raise _ExecutionArtifactContractError(
+                    "smoke prediction row is invalid", FailureKind.SCHEMA_MISMATCH
+                )
+            row = cast(dict[str, object], raw)
+            if set(row) != {"row_id", "row_identity", "user_id", "item_id", "score"}:
+                raise _ExecutionArtifactContractError(
+                    "smoke prediction fields are invalid", FailureKind.SCHEMA_MISMATCH
+                )
+            score = row.get("score")
+            if (
+                row.get("row_id") != expected.row_id
+                or row.get("row_identity") != list(expected.row_identity)
+                or row.get("user_id") != expected.user_id
+                or row.get("item_id") != expected.item_id
+                or expected.row_id in seen_row_ids
+                or not isinstance(score, (int, float))
+                or isinstance(score, bool)
+                or not math.isfinite(float(score))
+            ):
+                raise _ExecutionArtifactContractError(
+                    "smoke predictions do not match the staged valid view",
+                    FailureKind.SCHEMA_MISMATCH,
+                )
+            seen_row_ids.add(expected.row_id)
+        prediction_sha256 = hashlib.sha256(predictions_path.read_bytes()).hexdigest()
+        required_checkpoint = {
+            "data_manifest_id": dataset_identity.manifest_id,
+            "source_commit": request.source_commit,
+            "execution_id": request.execution_id,
+            "fidelity": "smoke",
+            "prediction_artifact": predictions_path.name,
+            "prediction_sha256": prediction_sha256,
+        }
+        if any(checkpoint_payload.get(key) != value for key, value in required_checkpoint.items()):
+            raise _ExecutionArtifactContractError(
+                "smoke checkpoint provenance is invalid", FailureKind.SCHEMA_MISMATCH
+            )
+        checkpoint_id = checkpoint_payload.get("checkpoint_id")
+        if not isinstance(checkpoint_id, str) or not checkpoint_id:
+            raise _ExecutionArtifactContractError(
+                "smoke checkpoint identity is absent", FailureKind.SCHEMA_MISMATCH
             )
 
     def _register_training_artifacts(
@@ -815,6 +1324,8 @@ class _RunBoundDockerExecutor:
         dataset_identity = RepositoryRunStore(self.repository).get_dataset_manifest_identity()
         if dataset_identity is None:
             raise ValueError("verified dataset manifest identity is unavailable")
+        if request.dataset_manifest_sha256 != dataset_identity.manifest_sha256:
+            raise ValueError("execution dataset identity does not match registered authority")
         output = request.output_path.resolve()
         predictions_path = output / "predictions.json"
         checkpoint_path = output / "checkpoint_bundle.json"
@@ -840,7 +1351,7 @@ class _RunBoundDockerExecutor:
         prediction_sha256 = hashlib.sha256(prediction_bytes).hexdigest()
         expected = {
             "manifest_id": dataset_identity.manifest_id,
-            "manifest_sha256": dataset_identity.manifest_sha256,
+            "manifest_sha256": request.dataset_manifest_sha256,
             "source_commit": request.source_commit,
             "execution_id": request.execution_id,
         }
@@ -1051,11 +1562,18 @@ def build_production_services(settings: Any) -> ProductionServices:
         repository_root=str(app_settings.repository_root),
         parent_commit=_current_commit(app_settings.repository_root),
         dataset_root=str(app_settings.dataset_root) if app_settings.dataset_root else None,
+        dataset_view_provenance=(
+            dataset_provider.provenance if dataset_provider is not None else None
+        ),
         evaluator_id=app_settings.evaluator_id,
         docker_image=app_settings.docker_image,
         default_timeout_seconds=app_settings.execution.timeout_seconds,
         default_memory_bytes=app_settings.execution.memory_bytes,
         default_cpus=app_settings.execution.cpus,
+        default_gpu_count=app_settings.execution.gpu_count,
+        smoke_timeout_seconds=app_settings.execution.smoke_timeout_seconds,
+        smoke_memory_bytes=app_settings.execution.smoke_memory_bytes,
+        smoke_disk_bytes=app_settings.execution.smoke_disk_bytes,
         max_repairs=app_settings.budget.max_repairs,
     )
     controller = ProductionController(ControllerServices(transitions=transitions, store=run_store))
@@ -1090,11 +1608,15 @@ class _SyntheticWorktreeManager:
         )
 
     def register_source(
-        self, assignment: WorktreeAssignment, allowed_scopes: tuple[str, ...]
+        self,
+        assignment: WorktreeAssignment,
+        allowed_scopes: tuple[str, ...],
+        previous: SourceRegistration | None = None,
     ) -> SourceRegistration:
         from tiktok2026.repository.diffs import patch_signature
 
-        content = f"synthetic source for {assignment.experiment_id}\n".encode()
+        revision = previous.revision + 1 if previous is not None else 0
+        content = f"synthetic source for {assignment.experiment_id} revision {revision}\n".encode()
         digest = patch_signature(content.decode())
         destination = (
             self.root
@@ -1118,11 +1640,14 @@ class _SyntheticWorktreeManager:
                 retention=ArtifactRetention.PROVENANCE,
             )
         )
+        source_commit = hashlib.sha1((assignment.worktree_id + digest).encode()).hexdigest()
         return SourceRegistration(
+            registration_id=f"source-{source_commit}",
+            revision=revision,
             experiment_id=assignment.experiment_id,
             run_id=assignment.run_id,
             parent_commit=assignment.parent_commit,
-            source_commit=hashlib.sha1((assignment.worktree_id + digest).encode()).hexdigest(),
+            source_commit=source_commit,
             patch_sha256=digest,
             patch_artifact_id=f"patch-{digest}",
             patch_artifact_uri=destination.as_uri(),
@@ -1164,6 +1689,37 @@ class _SyntheticExecutor:
             },
             sort_keys=True,
         ).encode()
+        if request.execution_kind == "smoke":
+            smoke_row = DatasetViewRow(
+                row_id='["synthetic-row","synthetic-user","synthetic-item"]',
+                row_identity=("synthetic-row", "synthetic-user", "synthetic-item"),
+                user_id="synthetic-user",
+                item_id="synthetic-item",
+            )
+            return ExecutionResult(
+                execution_id=request.execution_id,
+                experiment_id=request.experiment_id,
+                source_registration_id=request.source_registration_id,
+                source_commit=request.source_commit,
+                command=request.command,
+                exit_code=0,
+                elapsed_seconds=0.1,
+                gpu_hours=0.0,
+                artifact_output_bytes=0,
+                execution_kind="smoke",
+                dataset_manifest_id=self.manifest.manifest_id,
+                dataset_manifest_sha256=self.manifest.manifest_sha256,
+                dataset_view_sha256=hashlib.sha256(
+                    (self.manifest.manifest_sha256 + "smoke").encode()
+                ).hexdigest(),
+                dataset_valid_rows=(smoke_row,),
+                measured_peak_memory_bytes=1 << 20,
+                memory_measurement_status="measured",
+                resource_measurement_basis="docker_stats",
+                gpu_telemetry_status="not_requested",
+                smoke_output_valid=True,
+                scientific_evidence=False,
+            )
         digest = hashlib.sha256(payload).hexdigest()
         run_id = request.run_id or "synthetic-run"
         prediction_filename = f"prediction-{digest}.json"
@@ -1215,6 +1771,7 @@ class _SyntheticExecutor:
         return ExecutionResult(
             execution_id=request.execution_id,
             experiment_id=request.experiment_id,
+            source_registration_id=request.source_registration_id,
             source_commit=request.source_commit,
             command=request.command,
             exit_code=0,
@@ -1222,6 +1779,18 @@ class _SyntheticExecutor:
             gpu_hours=0,
             artifact_ids=(prediction.artifact_id, checkpoint.artifact_id),
             checkpoint_id=f"checkpoint-{digest}",
+            execution_kind="full",
+            dataset_manifest_id=self.manifest.manifest_id,
+            dataset_manifest_sha256=self.manifest.manifest_sha256,
+            dataset_view_sha256=hashlib.sha256(
+                (self.manifest.manifest_sha256 + "full").encode()
+            ).hexdigest(),
+            measured_peak_memory_bytes=1 << 20,
+            memory_measurement_status="measured",
+            resource_measurement_basis="docker_stats",
+            gpu_telemetry_status="not_requested",
+            smoke_output_valid=False,
+            scientific_evidence=True,
         )
 
 
@@ -1323,6 +1892,17 @@ def build_synthetic_controller(
     from tiktok2026.testing.synthetic import FixtureEvaluator
 
     artifact_store = ArtifactStore(runtime.paths, runtime.repository)
+    smoke_view_sha256 = hashlib.sha256(
+        (manifest.manifest_sha256 + "smoke").encode()
+    ).hexdigest()
+    smoke_valid_rows = (
+        DatasetViewRow(
+            row_id='["synthetic-row","synthetic-user","synthetic-item"]',
+            row_identity=("synthetic-row", "synthetic-user", "synthetic-item"),
+            user_id="synthetic-user",
+            item_id="synthetic-item",
+        ),
+    )
 
     transitions = make_service_transitions(
         agent_clients=agent_clients,
@@ -1356,6 +1936,12 @@ def build_synthetic_controller(
         repository_root=str(repository_root),
         parent_commit=hashlib.sha1(b"synthetic-parent").hexdigest(),
         dataset_root=str(runtime.paths.root),
+        dataset_view_provenance=lambda request: DatasetViewProvenance(
+            manifest_id=manifest.manifest_id,
+            manifest_sha256=manifest.manifest_sha256,
+            view_sha256=smoke_view_sha256,
+            valid_rows=smoke_valid_rows,
+        ),
         evaluator_id="synthetic-evaluator",
     )
     controller = ProductionController(ControllerServices(transitions=transitions, store=repo))

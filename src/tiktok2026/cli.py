@@ -151,6 +151,59 @@ def inspect_run(
     _render(result)
 
 
+@app.command("recover-source-registration")
+def recover_source_registration_command(
+    runtime_root: Annotated[Path, typer.Option()],
+    run_id: Annotated[str, typer.Option()],
+    repository_root: Annotated[Path | None, typer.Option()] = None,
+    profile_path: Annotated[Path | None, typer.Option()] = None,
+    operator_config: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    try:
+        result = _operations(
+            runtime_root, repository_root, profile_path, operator_config
+        ).recover_source_registration(run_id)
+    except Exception as error:
+        _fail(error)
+    _render(result)
+
+
+@app.command("recover-execution-result")
+def recover_execution_result_command(
+    runtime_root: Annotated[Path, typer.Option()],
+    run_id: Annotated[str, typer.Option()],
+    execution_id: Annotated[str, typer.Option()],
+    repository_root: Annotated[Path | None, typer.Option()] = None,
+    profile_path: Annotated[Path | None, typer.Option()] = None,
+    operator_config: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    try:
+        result = _operations(
+            runtime_root, repository_root, profile_path, operator_config
+        ).recover_execution_result(run_id, execution_id)
+    except Exception as error:
+        _fail(error)
+    _render(result)
+
+
+@app.command("retry-execution")
+def retry_execution_command(
+    runtime_root: Annotated[Path, typer.Option()],
+    run_id: Annotated[str, typer.Option()],
+    failed_execution_id: Annotated[str, typer.Option()],
+    repository_root: Annotated[Path | None, typer.Option()] = None,
+    profile_path: Annotated[Path | None, typer.Option()] = None,
+    operator_config: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    try:
+        result = _operations(
+            runtime_root, repository_root, profile_path, operator_config
+        ).retry_execution(run_id, failed_execution_id)
+    except Exception as error:
+        _fail(error)
+    _render(result)
+
+
 @app.command("finalize")
 def finalize_command(
     runtime_root: Annotated[Path, typer.Option()],

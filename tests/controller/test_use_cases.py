@@ -11,8 +11,11 @@ from tiktok2026.contracts import (
     AgentFailure,
     AgentRole,
     BaselineCalibrationRecord,
+    BlockerResolution,
     ContractModel,
     DatasetManifestIdentity,
+    DatasetViewProvenance,
+    DatasetViewRow,
     DecisionAction,
     DiagnosticMetricValue,
     EvaluationResult,
@@ -21,6 +24,7 @@ from tiktok2026.contracts import (
     ExperimentRegistryEntry,
     ExperimentRegistrySnapshot,
     ExperimentSpec,
+    FailureKind,
     Fidelity,
     ImplementationAttemptRecord,
     ImplementationRequest,
@@ -31,8 +35,11 @@ from tiktok2026.contracts import (
     PredictionArtifactRegistration,
     ResearchDecision,
     ResearchRequest,
+    ResourceState,
     RunPhase,
     SourceRegistration,
+    ValidationBlocker,
+    ValidationOperationIdentity,
     ValidationReport,
     ValidationRequest,
     ValidationStage,
@@ -94,6 +101,10 @@ class _FakeStore:
         self.baseline_calibrations: list[BaselineCalibrationRecord] = []
         self.failures: list[object] = []
         self.json_records: dict[tuple[str, str], str] = {}
+        self.validation_reports: dict[str, ValidationReport] = {}
+        self.validation_operations: dict[str, ValidationOperationIdentity] = {}
+        self.validation_blockers: dict[str, ValidationBlocker] = {}
+        self.validation_resolutions: dict[str, BlockerResolution] = {}
 
     def persist_transition(
         self, run_id: str, operation: str, state_version: int, updates: dict[str, object]
@@ -155,6 +166,18 @@ class _FakeStore:
     def get_source_registration(self, experiment_id: str) -> SourceRegistration | None:
         return self.sources.get(experiment_id)
 
+    def get_source_registration_by_id(
+        self, registration_id: str
+    ) -> SourceRegistration | None:
+        return next(
+            (
+                source
+                for source in self.sources.values()
+                if source.registration_id == registration_id
+            ),
+            None,
+        )
+
     def get_worktree_assignment(self, experiment_id: str) -> WorktreeAssignment | None:
         return self.assignments.get(experiment_id)
 
@@ -172,6 +195,74 @@ class _FakeStore:
     def put_evaluation(self, result: EvaluationResult, provenance: Any) -> None:
         del provenance
         self.evaluations.append(result)
+
+    def put_validation_report(
+        self,
+        report: ValidationReport,
+        run_id: str,
+        operation: ValidationOperationIdentity | None = None,
+        subject: dict[str, object] | None = None,
+    ) -> None:
+        del run_id, subject
+        if operation is None:
+            raise ValueError("operation is required")
+        self.validation_reports[report.report_id] = report
+        self.validation_operations[operation.operation_id] = operation
+        self.validation_blockers.update(
+            {blocker.blocker_id: blocker for blocker in report.blockers}
+        )
+        for blocker_id in report.resolves_blocker_ids:
+            self.validation_resolutions[blocker_id] = BlockerResolution(
+                resolution_id=f"resolution-{operation.operation_id}-{blocker_id}",
+                blocker_id=blocker_id,
+                report_id=report.report_id,
+                experiment_id=report.experiment_id,
+                evidence_refs=report.evidence_refs or ("test-evidence",),
+                validation_operation_id=operation.operation_id,
+            )
+
+    def get_validation_report_by_operation(
+        self, operation_id: str
+    ) -> ValidationReport | None:
+        operation = self.validation_operations.get(operation_id)
+        if operation is None:
+            return None
+        return next(
+            (
+                report
+                for report in self.validation_reports.values()
+                if report.validation_operation_id == operation_id
+            ),
+            None,
+        )
+
+    def get_validation_report_for_attempt(
+        self, run_id: str, experiment_id: str, stage: ValidationStage, repair_attempt: int
+    ) -> ValidationReport | None:
+        operation = next(
+            (
+                operation
+                for operation in self.validation_operations.values()
+                if operation.run_id == run_id
+                and operation.experiment_id == experiment_id
+                and operation.stage == stage
+                and operation.repair_attempt == repair_attempt
+            ),
+            None,
+        )
+        return (
+            self.get_validation_report_by_operation(operation.operation_id)
+            if operation is not None
+            else None
+        )
+
+    def get_unresolved_blockers(self, experiment_id: str) -> tuple[ValidationBlocker, ...]:
+        return tuple(
+            blocker
+            for blocker in self.validation_blockers.values()
+            if blocker.experiment_id == experiment_id
+            and blocker.blocker_id not in self.validation_resolutions
+        )
 
     def put_execution_result(self, result: ExecutionResult) -> None:
         self.executions[result.execution_id] = result
@@ -305,7 +396,7 @@ async def test_rejected_validation_carries_blockers_into_failure() -> None:
 
     assert result["pending_route"] == "persist_failure"
     assert "success criterion is not measurable" in str(result["terminal_reason"])
-    assert result["latest_validation_report_id"] == "report-1"
+    assert str(result["latest_validation_report_id"]).startswith("validation-report-")
     request = agent.calls[0]
     assert isinstance(request, ValidationRequest)
     assert request.subject["experiment_spec"] == store.experiments["exp-1"].model_dump(
@@ -354,6 +445,93 @@ async def test_repairable_proposal_returns_to_research_with_feedback() -> None:
     assert repaired["pending_route"] == "research"
 
 
+async def test_proposal_repair_passes_authoritative_blocker_context_to_research() -> None:
+    store = _FakeStore()
+    store.experiments["exp-1"] = _experiment(("src/tiktok2026/experiment",))
+    validator = _ScriptedAgentClient(
+        [
+            ValidationReport(
+                report_id="report-1",
+                experiment_id="exp-1",
+                stage=ValidationStage.PROPOSAL,
+                verdict=ValidationVerdict.REPAIRABLE,
+                blockers=("tighten the success criterion",),
+                evidence_refs=("evidence-1",),
+                leakage_risk="none",
+            )
+        ]
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=validator))
+    state = minimal_state(phase=RunPhase.RESEARCH, current_experiment_id="exp-1")
+    validation = await controller.proposal_validation(state)
+    persisted = await controller.persist_failure(state | validation)  # type: ignore[arg-type]
+    repaired = await controller.repair(state | validation | persisted)  # type: ignore[arg-type]
+
+    researcher = _ScriptedAgentClient(
+        [
+            ResearchDecision(
+                request_id="research-1",
+                kind="proposal",
+                experiment_spec=_experiment(("src/tiktok2026/experiment",)),
+                message="repaired proposal",
+            )
+        ]
+    )
+    research_controller = ProductionController(
+        _make_services(store=store, agent_client=researcher)
+    )
+    await research_controller.research(state | validation | persisted | repaired)  # type: ignore[arg-type]
+    request = researcher.calls[0]
+    assert isinstance(request, ResearchRequest)
+    assert len(request.unresolved_blockers) == 1
+    assert request.unresolved_blockers[0].text == "tighten the success criterion"
+    assert request.unresolved_blockers[0].evidence_refs == ("evidence-1",)
+
+
+async def test_validation_replay_reuses_bound_report_without_invoking_validator() -> None:
+    store = _FakeStore()
+    store.experiments["exp-1"] = _experiment(("src/tiktok2026/experiment",))
+    agent = _ScriptedAgentClient(
+        [
+            ValidationReport(
+                report_id="first",
+                experiment_id="exp-1",
+                stage=ValidationStage.PROPOSAL,
+                verdict=ValidationVerdict.REJECTED,
+                blockers=("first result",),
+                leakage_risk="none",
+            ),
+            ValidationReport(
+                report_id="divergent",
+                experiment_id="exp-1",
+                stage=ValidationStage.PROPOSAL,
+                verdict=ValidationVerdict.REJECTED,
+                blockers=("different result",),
+                leakage_risk="none",
+            ),
+        ]
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=agent))
+    state = minimal_state(current_experiment_id="exp-1")
+    first = await controller.proposal_validation(state)
+    second = await controller.proposal_validation(state)
+
+    assert len(agent.calls) == 1
+    assert second["latest_validation_report_id"] == first["latest_validation_report_id"]
+
+
+async def test_validation_fails_closed_without_typed_ledger_authority() -> None:
+    agent = _ScriptedAgentClient([])
+    controller = ProductionController(_make_services(store=None, agent_client=agent))
+
+    result = await controller.proposal_validation(
+        minimal_state(current_experiment_id="exp-1")
+    )
+
+    assert result["pending_route"] == "persist_failure"
+    assert not agent.calls
+
+
 async def test_execution_repair_returns_to_implement_for_same_experiment() -> None:
     controller = ProductionController(_make_services())
 
@@ -398,7 +576,11 @@ async def test_implementation_repairs_use_immutable_attempt_records() -> None:
                 patch_artifact_id="patch-1",
                 changed_files=("src/tiktok2026/experiment/model.py",),
             ),
-        ]
+        ],
+        diffs_after_invoke=(
+            "diff --git a/train.py b/train.py\n+attempt 0\n",
+            "diff --git a/train.py b/train.py\n+attempt 1\n",
+        ),
     )
     agent.scoped_repository = _FakeScopedRepository(
         "diff --git a/train.py b/train.py\n",
@@ -406,7 +588,16 @@ async def test_implementation_repairs_use_immutable_attempt_records() -> None:
         source="unchanged entrypoint\n",
         base_source="unchanged entrypoint\n",
     )
-    controller = ProductionController(_make_services(store=store, agent_client=agent))
+    controller = ProductionController(
+        _make_services(
+            store=store,
+            agent_client=agent,
+            default_timeout_seconds=900,
+            default_memory_bytes=4 * 1024**3,
+            default_cpus=1.0,
+            default_gpu_count=1,
+        )
+    )
 
     first = await controller.implement(
         minimal_state(
@@ -433,6 +624,20 @@ async def test_implementation_repairs_use_immutable_attempt_records() -> None:
         "src/tiktok2026/experiment/train.py": "unchanged entrypoint\n"
     }
     assert first_request.base_source_context == {}
+    assert first_request.execution_timeout_seconds == 900
+    assert first_request.execution_memory_bytes == 4 * 1024**3
+    assert first_request.execution_cpus == 1.0
+    assert first_request.execution_gpu_count == 1
+    first_record = ImplementationAttemptRecord.model_validate_json(
+        store.json_records[("implementation", "exp-1:attempt:0")]
+    )
+    second_record = ImplementationAttemptRecord.model_validate_json(
+        store.json_records[("implementation", "exp-1:attempt:1")]
+    )
+    assert first_record.prior_diff_sha256 is not None
+    assert first_record.result_diff_sha256 is not None
+    assert second_record.prior_diff_sha256 == first_record.result_diff_sha256
+    assert second_record.result_diff_sha256 != second_record.prior_diff_sha256
 
 
 async def test_implementation_repair_receives_failure_feedback() -> None:
@@ -445,7 +650,8 @@ async def test_implementation_repair_receives_failure_feedback() -> None:
                 patch_artifact_id="patch-1",
                 changed_files=("src/tiktok2026/experiment/model.py",),
             )
-        ]
+        ],
+        diffs_after_invoke=("diff --git a/train.py b/train.py\n+repaired\n",),
     )
     agent.scoped_repository = _FakeScopedRepository(
         "diff --git a/train.py b/train.py\n",
@@ -479,6 +685,43 @@ async def test_implementation_repair_receives_failure_feedback() -> None:
     assert result["terminal_reason"] is None
 
 
+async def test_implementation_repair_requires_a_new_authoritative_diff() -> None:
+    store = _FakeStore()
+    store.experiments["exp-1"] = _experiment(("src/tiktok2026/experiment",))
+    agent = _ScriptedAgentClient(
+        [
+            ImplementationResult(
+                experiment_id="exp-1",
+                patch_artifact_id="unchanged-repair",
+                changed_files=("src/tiktok2026/experiment/train.py",),
+            )
+        ]
+    )
+    agent.scoped_repository = _FakeScopedRepository(
+        "diff --git a/train.py b/train.py\n+existing implementation\n",
+        ("src/tiktok2026/experiment/train.py",),
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=agent))
+
+    result = await controller.implement(
+        minimal_state(
+            phase=RunPhase.IMPLEMENT,
+            current_experiment_id="exp-1",
+            repair_attempts=1,
+            terminal_reason=(
+                'failure:{"evidence": [], "kind": "schema_mismatch", '
+                '"message": "repair this"}'
+            ),
+        )
+    )
+
+    assert result["pending_route"] == "persist_failure"
+    assert "did not change the authoritative implementation diff" in str(
+        result["terminal_reason"]
+    )
+    assert ("implementation", "exp-1:attempt:1") not in store.json_records
+
+
 # ---------------------------------------------------------------------------
 # Test 2: research transition repairs one bad structured response
 # ---------------------------------------------------------------------------
@@ -487,13 +730,20 @@ async def test_implementation_repair_receives_failure_feedback() -> None:
 class _ScriptedAgentClient:
     """AgentClient that returns scripted responses, failing once then succeeding."""
 
-    def __init__(self, responses: list[ContractModel]) -> None:
+    def __init__(
+        self,
+        responses: list[ContractModel],
+        diffs_after_invoke: tuple[str, ...] = (),
+    ) -> None:
         self.responses = list(responses)
+        self.diffs_after_invoke = list(diffs_after_invoke)
         self.calls: list[ContractModel] = []
         self.scoped_repository: _FakeScopedRepository | None = None
 
     async def invoke(self, request: ContractModel) -> ContractModel:
         self.calls.append(request)
+        if self.diffs_after_invoke and self.scoped_repository is not None:
+            self.scoped_repository.set_diff(self.diffs_after_invoke.pop(0))
         if self.responses:
             return self.responses.pop(0)
         return AgentFailure(
@@ -528,6 +778,9 @@ class _FakeScopedRepository:
 
     def diff(self) -> str:
         return self._diff
+
+    def set_diff(self, diff: str) -> None:
+        self._diff = diff
 
     def changed_files(self) -> tuple[str, ...]:
         return self._changed_files
@@ -591,6 +844,84 @@ async def test_implementation_validation_receives_pre_registration_authority() -
     assert authority["path_policy_passed"] is True
     assert authority["source_registration_stage"] == "post_implementation_validation"
     assert "controller_context" in request.subject
+    assert request.subject["execution_resources"] == {
+        "timeout_seconds": 300,
+        "memory_bytes": 1024**3,
+        "cpus": 1.0,
+        "gpu_count": 0,
+    }
+
+
+async def test_changed_implementation_diff_does_not_replay_stale_approval() -> None:
+    store = _FakeStore()
+    store.experiments["exp-1"] = _experiment(("src/tiktok2026/experiment",))
+    store.assignments["exp-1"] = WorktreeAssignment(
+        worktree_id="worktree-exp-1",
+        run_id="test-run",
+        experiment_id="exp-1",
+        path=Path("/tmp/worktree-exp-1"),
+        branch="experiment/test-run/exp-1",
+        parent_commit="a" * 40,
+    )
+    implementation = ImplementationResult(
+        experiment_id="exp-1",
+        patch_artifact_id="inline-patch-label",
+        changed_files=("src/tiktok2026/experiment/model.py",),
+    )
+    store.put_json(
+        "implementation",
+        "exp-1:attempt:0",
+        ImplementationAttemptRecord(
+            experiment_id="exp-1", repair_attempt=0, result=implementation
+        ).model_dump_json(),
+    )
+    agent = _ScriptedAgentClient(
+        [
+            ValidationReport(
+                report_id="implementation-report-1",
+                experiment_id="exp-1",
+                stage=ValidationStage.IMPLEMENTATION,
+                verdict=ValidationVerdict.APPROVED,
+                leakage_risk="none",
+            ),
+            ValidationReport(
+                report_id="implementation-report-2",
+                experiment_id="exp-1",
+                stage=ValidationStage.IMPLEMENTATION,
+                verdict=ValidationVerdict.APPROVED,
+                leakage_risk="none",
+            ),
+        ]
+    )
+    first_diff = "diff --git a/model.py b/model.py\n+VALUE = 1\n"
+    second_diff = "diff --git a/model.py b/model.py\n+VALUE = 2\n"
+    agent.scoped_repository = _FakeScopedRepository(
+        first_diff, ("src/tiktok2026/experiment/model.py",)
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=agent))
+    state = minimal_state(
+        phase=RunPhase.IMPLEMENT,
+        current_experiment_id="exp-1",
+        repair_attempts=0,
+    )
+
+    first = await controller.implementation_validation(state)
+    agent.scoped_repository.set_diff(second_diff)
+    second = await controller.implementation_validation(state)
+
+    assert first["pending_route"] == "register_source"
+    assert second["pending_route"] == "register_source"
+    assert len(agent.calls) == 2
+    first_request = agent.calls[0]
+    second_request = agent.calls[1]
+    assert isinstance(first_request, ValidationRequest)
+    assert isinstance(second_request, ValidationRequest)
+    assert first_request.validation_operation.operation_id != (
+        second_request.validation_operation.operation_id
+    )
+    assert first_request.validation_operation.implementation_diff_sha256 != (
+        second_request.validation_operation.implementation_diff_sha256
+    )
 
 
 async def test_diff_policy_requires_execution_entrypoint_integration() -> None:
@@ -825,21 +1156,118 @@ class _FakeEvaluator:
 
 
 class _CapturingExecutor:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_smoke: bool = False) -> None:
         self.request = None
+        self.calls = 0
+        self.fail_smoke = fail_smoke
 
     async def execute(self, request: Any) -> ExecutionResult:
         self.request = request
+        self.calls += 1
         return ExecutionResult(
             execution_id=request.execution_id,
             experiment_id=request.experiment_id,
+            source_registration_id=request.source_registration_id,
             source_commit=request.source_commit,
             command=request.command,
-            exit_code=0,
+            exit_code=1 if self.fail_smoke and request.execution_kind == "smoke" else 0,
             elapsed_seconds=0.1,
             gpu_hours=0.0,
             checkpoint_id="checkpoint-1",
+            execution_kind=request.execution_kind,
+            measured_peak_memory_bytes=1 << 20 if request.execution_kind == "smoke" else None,
+            memory_measurement_status=(
+                "measured" if request.execution_kind == "smoke" else "unavailable"
+            ),
+            resource_measurement_basis=(
+                "docker_stats" if request.execution_kind == "smoke" else "unavailable"
+            ),
+            smoke_output_valid=request.execution_kind == "smoke",
+            scientific_evidence=request.execution_kind != "smoke",
+            dataset_manifest_id="manifest-1" if request.execution_kind == "smoke" else None,
+            dataset_manifest_sha256="d" * 64 if request.execution_kind == "smoke" else None,
+            dataset_view_sha256="e" * 64 if request.execution_kind == "smoke" else None,
+            dataset_valid_rows=(
+                DatasetViewRow(
+                    row_id='["row-1","user-1","item-1"]',
+                    row_identity=("row-1", "user-1", "item-1"),
+                    user_id="user-1",
+                    item_id="item-1",
+                ),
+            )
+            if request.execution_kind == "smoke"
+            else (),
+            failure_kind=(
+                FailureKind.SCHEMA_MISMATCH
+                if self.fail_smoke and request.execution_kind == "smoke"
+                else None
+            ),
+            failure_message=(
+                "smoke failed" if self.fail_smoke and request.execution_kind == "smoke" else None
+            ),
         )
+
+
+class _FakeResourceAccountant:
+    def __init__(self, *, fail_consume_once: bool = False) -> None:
+        self.operations: list[str] = []
+        self.fail_consume_once = fail_consume_once
+
+    def state(self) -> ResourceState:
+        return ResourceState(
+            remaining_gpu_hours=10.0,
+            accumulated_gpu_hours=0.0,
+            remaining_wall_seconds=10_000.0,
+            used_tokens=0,
+            remaining_tokens=10_000,
+            disk_bytes_available=10_000_000_000,
+            reserved_final_gpu_hours=0.0,
+        )
+
+    def reserve(self, reservation: Any) -> bool:
+        self.operations.append(f"reserve:{reservation.reservation_id}")
+        return True
+
+    def consume(self, reservation_id: str, **usage: float | int) -> bool:
+        del usage
+        self.operations.append(f"consume:{reservation_id}")
+        if self.fail_consume_once:
+            self.fail_consume_once = False
+            raise RuntimeError("settlement interrupted")
+        return True
+
+    def reconcile(self, reservation_id: str, **usage: float | int) -> bool:
+        del usage
+        self.operations.append(f"reconcile:{reservation_id}")
+        return True
+
+
+def _populate_execution_authority(store: _FakeStore) -> str:
+    source_commit = "a" * 40
+    store.manifest = DatasetManifestIdentity(
+        manifest_id="manifest-1", manifest_sha256="d" * 64
+    )
+    store.experiments["exp-1"] = _experiment(("src/tiktok2026/experiment",))
+    store.sources["exp-1"] = SourceRegistration(
+        experiment_id="exp-1",
+        run_id="test-run",
+        parent_commit="b" * 40,
+        source_commit=source_commit,
+        patch_sha256="c" * 64,
+        patch_artifact_id="patch-1",
+        patch_artifact_uri="file:///tmp/patch-1.diff",
+        allowed_scopes=("src/tiktok2026/experiment",),
+        eligible=True,
+    )
+    store.assignments["exp-1"] = WorktreeAssignment(
+        worktree_id="wt-1",
+        run_id="test-run",
+        experiment_id="exp-1",
+        path=Path("/tmp/worktree/exp-1"),
+        branch="experiment/test-run/exp-1",
+        parent_commit="b" * 40,
+    )
+    return source_commit
 
 
 async def test_execute_builds_only_deterministic_allowlisted_train_command(
@@ -848,6 +1276,9 @@ async def test_execute_builds_only_deterministic_allowlisted_train_command(
     store = _FakeStore()
     executor = _CapturingExecutor()
     source_commit = "a" * 40
+    store.manifest = DatasetManifestIdentity(
+        manifest_id="manifest-1", manifest_sha256="d" * 64
+    )
     store.experiments["exp-1"] = _experiment(("src/tiktok2026/experiment",))
     store.sources["exp-1"] = SourceRegistration(
         experiment_id="exp-1",
@@ -876,6 +1307,7 @@ async def test_execute_builds_only_deterministic_allowlisted_train_command(
         default_timeout_seconds=123,
         default_memory_bytes=4_294_967_296,
         default_cpus=2.0,
+        default_gpu_count=1,
     )
     controller = ProductionController(ControllerServices(services, store))
 
@@ -903,7 +1335,171 @@ async def test_execute_builds_only_deterministic_allowlisted_train_command(
     assert executor.request.timeout_seconds == 123
     assert executor.request.memory_bytes == 4_294_967_296
     assert executor.request.cpus == 2.0
+    assert executor.request.gpu_count == 1
+    assert executor.request.dataset_manifest_sha256 == "d" * 64
     assert executor.request.execution_id in store.executions
+
+    retried = await controller.execute(minimal_state(current_experiment_id="exp-1"))
+
+    assert retried["pending_route"] == "evaluate"
+    assert executor.calls == 1
+
+    del store.executions[executor.request.execution_id]
+    ambiguous = await controller.execute(minimal_state(current_experiment_id="exp-1"))
+
+    assert ambiguous["pending_route"] == "persist_failure"
+    assert "execution output path already exists" in str(ambiguous["terminal_reason"])
+    assert executor.calls == 1
+
+
+async def test_smoke_runs_before_full_execution_with_distinct_identity(tmp_path: Path) -> None:
+    store = _FakeStore()
+    source_commit = _populate_execution_authority(store)
+    executor = _CapturingExecutor()
+    accountant = _FakeResourceAccountant()
+    services = make_service_transitions(
+        executor=executor,
+        run_store=store,
+        dataset_root="/external/readonly-dataset",
+        runtime_root=str(tmp_path / "runtime"),
+        resource_accountant=accountant,
+        docker_image="tiktok2026:test@sha256:" + "0" * 64,
+        dataset_view_provenance=lambda request: DatasetViewProvenance(
+            manifest_id="manifest-1",
+            manifest_sha256="d" * 64,
+            view_sha256="e" * 64,
+            valid_rows=(
+                DatasetViewRow(
+                    row_id='["row-1","user-1","item-1"]',
+                    row_identity=("row-1", "user-1", "item-1"),
+                    user_id="user-1",
+                    item_id="item-1",
+                ),
+            ),
+        ),
+    )
+    controller = ProductionController(ControllerServices(services, store))
+    state = minimal_state(current_experiment_id="exp-1", phase=RunPhase.EXECUTE)
+
+    smoke = await controller.smoke(state)
+    smoke_operations = tuple(accountant.operations)
+    full = await controller.execute(state)
+
+    assert smoke["pending_route"] == "execute"
+    assert full["pending_route"] == "evaluate"
+    assert executor.calls == 2
+    assert executor.request is not None
+    assert executor.request.execution_kind == "full"
+    assert executor.request.source_commit == source_commit
+    smoke_ids = tuple(
+        execution_id for execution_id in store.executions if execution_id.startswith("smoke-")
+    )
+    assert len(smoke_ids) == 1
+    assert smoke_ids[0] != executor.request.execution_id
+    assert smoke_operations == (
+        f"reserve:reservation-{smoke_ids[0]}",
+        f"consume:reservation-{smoke_ids[0]}",
+        f"reconcile:reservation-{smoke_ids[0]}",
+    )
+
+
+async def test_smoke_failure_does_not_route_to_evaluation(tmp_path: Path) -> None:
+    store = _FakeStore()
+    _populate_execution_authority(store)
+    executor = _CapturingExecutor(fail_smoke=True)
+    accountant = _FakeResourceAccountant()
+    services = make_service_transitions(
+        executor=executor,
+        run_store=store,
+        dataset_root="/external/readonly-dataset",
+        runtime_root=str(tmp_path / "runtime"),
+        resource_accountant=accountant,
+        dataset_view_provenance=lambda request: DatasetViewProvenance(
+            manifest_id="manifest-1",
+            manifest_sha256="d" * 64,
+            view_sha256="e" * 64,
+            valid_rows=(),
+        ),
+    )
+    controller = ProductionController(ControllerServices(services, store))
+
+    result = await controller.smoke(
+        minimal_state(current_experiment_id="exp-1", phase=RunPhase.EXECUTE)
+    )
+
+    assert result["pending_route"] == "persist_failure"
+    assert executor.calls == 1
+    assert result.get("latest_execution_result_id") is None
+
+
+async def test_smoke_requires_resource_accountant(tmp_path: Path) -> None:
+    store = _FakeStore()
+    _populate_execution_authority(store)
+    executor = _CapturingExecutor()
+    services = make_service_transitions(
+        executor=executor,
+        run_store=store,
+        dataset_root="/external/readonly-dataset",
+        runtime_root=str(tmp_path / "runtime"),
+        dataset_view_provenance=lambda request: DatasetViewProvenance(
+            manifest_id="manifest-1",
+            manifest_sha256="d" * 64,
+            view_sha256="e" * 64,
+            valid_rows=(),
+        ),
+    )
+    controller = ProductionController(ControllerServices(services, store))
+
+    result = await controller.smoke(
+        minimal_state(current_experiment_id="exp-1", phase=RunPhase.EXECUTE)
+    )
+
+    assert result["pending_route"] == "persist_failure"
+    assert "incomplete" in str(result["terminal_reason"])
+    assert executor.calls == 0
+
+
+async def test_smoke_settlement_replays_after_result_persistence(tmp_path: Path) -> None:
+    store = _FakeStore()
+    _populate_execution_authority(store)
+    executor = _CapturingExecutor()
+    accountant = _FakeResourceAccountant(fail_consume_once=True)
+    services = make_service_transitions(
+        executor=executor,
+        run_store=store,
+        dataset_root="/external/readonly-dataset",
+        runtime_root=str(tmp_path / "runtime"),
+        resource_accountant=accountant,
+        dataset_view_provenance=lambda request: DatasetViewProvenance(
+            manifest_id="manifest-1",
+            manifest_sha256="d" * 64,
+            view_sha256="e" * 64,
+            valid_rows=(
+                DatasetViewRow(
+                    row_id='["row-1","user-1","item-1"]',
+                    row_identity=("row-1", "user-1", "item-1"),
+                    user_id="user-1",
+                    item_id="item-1",
+                ),
+            ),
+        ),
+    )
+    controller = ProductionController(ControllerServices(services, store))
+    state = minimal_state(current_experiment_id="exp-1", phase=RunPhase.EXECUTE)
+
+    with pytest.raises(RuntimeError, match="settlement interrupted"):
+        await controller.smoke(state)
+    replay = await controller.smoke(state)
+
+    assert replay["pending_route"] == "execute"
+    assert executor.calls == 1
+    assert accountant.operations == [
+        "reserve:reservation-smoke-test-run-exp-1-0",
+        "consume:reservation-smoke-test-run-exp-1-0",
+        "reserve:reservation-smoke-test-run-exp-1-0",
+        "consume:reservation-smoke-test-run-exp-1-0",
+        "reconcile:reservation-smoke-test-run-exp-1-0",
+    ]
 
 
 def test_execution_output_directories_are_distinct_and_writable(tmp_path: Path) -> None:
@@ -933,7 +1529,13 @@ async def test_evaluate_persists_evaluation_with_provenance() -> None:
         exit_code=0,
         elapsed_seconds=1.0,
         gpu_hours=0.0,
-        artifact_ids=("prediction-1",),
+        artifact_ids=(
+            "stdout-1",
+            "stderr-1",
+            "resource-evidence-1",
+            "prediction-1",
+            "ckpt-1",
+        ),
         checkpoint_id="ckpt-1",
     )
     store.sources["exp-1"] = SourceRegistration(
@@ -1227,6 +1829,10 @@ def _make_services(
     executor: Any = None,
     policy_gate: Any = None,
     bundle_service: Any = None,
+    default_timeout_seconds: int = 300,
+    default_memory_bytes: int = 1024**3,
+    default_cpus: float = 1.0,
+    default_gpu_count: int = 0,
 ) -> ControllerServices:
     """Build real service-driven transitions with fake injected services."""
     if store is None:
@@ -1242,6 +1848,10 @@ def _make_services(
         bundle_service=bundle_service,
         run_store=store,
         evaluator_id="evaluator-1",
+        default_timeout_seconds=default_timeout_seconds,
+        default_memory_bytes=default_memory_bytes,
+        default_cpus=default_cpus,
+        default_gpu_count=default_gpu_count,
     )
     return ControllerServices(
         transitions=transitions,

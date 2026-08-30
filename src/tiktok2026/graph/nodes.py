@@ -33,6 +33,8 @@ class ControllerOperations(Protocol):
 
     async def preflight(self, state: ProductionState) -> dict[str, object]: ...
 
+    async def smoke(self, state: ProductionState) -> dict[str, object]: ...
+
     async def execute(self, state: ProductionState) -> dict[str, object]: ...
 
     async def evaluate(self, state: ProductionState) -> dict[str, object]: ...
@@ -68,6 +70,7 @@ def controller_nodes(controller: ControllerOperations) -> dict[str, Node]:
         "implementation_validation": controller.implementation_validation,
         "register_source": controller.register_source,
         "preflight": controller.preflight,
+        "smoke": controller.smoke,
         "execute": controller.execute,
         "evaluate": controller.evaluate,
         "result_validation": controller.result_validation,

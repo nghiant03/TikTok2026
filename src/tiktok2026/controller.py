@@ -141,6 +141,9 @@ class ProductionController:
     async def preflight(self, state: ProductionState) -> dict[str, object]:
         return await self._run("preflight", state)
 
+    async def smoke(self, state: ProductionState) -> dict[str, object]:
+        return await self._run("smoke", state)
+
     async def execute(self, state: ProductionState) -> dict[str, object]:
         return await self._run("execute", state)
 

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, cast
 
 from loguru import logger
 
@@ -14,6 +14,7 @@ from tiktok2026.contracts import (
     AgentFailure,
     AgentRole,
     ControllerContext,
+    DatasetViewProvenance,
     DecisionAction,
     EvaluationContext,
     EvaluationRequest,
@@ -45,10 +46,14 @@ from tiktok2026.contracts import (
     RunPhase,
     RunRecord,
     RunStore,
+    ValidationBlocker,
+    ValidationBlockerContext,
+    ValidationOperationIdentity,
     ValidationReport,
     ValidationRequest,
     ValidationStage,
     WorktreeManager,
+    validation_blocker_id,
 )
 from tiktok2026.controller import Transition
 from tiktok2026.graph.routes import (
@@ -57,6 +62,7 @@ from tiktok2026.graph.routes import (
     route_after_validation,
 )
 from tiktok2026.graph.state import ProductionState
+from tiktok2026.policies.resources import check_smoke_feasibility
 
 
 class MissingAuthorityError(RuntimeError):
@@ -83,6 +89,9 @@ def _agent_failure(state: ProductionState, failure: AgentFailure) -> dict[str, o
 
 IMPLEMENTATION_ROOTS = ("src/tiktok2026/experiment",)
 EXPERIMENT_ENTRYPOINT = "src/tiktok2026/experiment/train.py"
+MAX_TERMINAL_TEXT = 2_000
+MAX_EVIDENCE_REFS = 8
+MAX_EVIDENCE_REF_LENGTH = 256
 
 
 def _agent(s: ServiceTransitions, role: AgentRole) -> AgentClient | None:
@@ -104,10 +113,31 @@ def _failure(
 ) -> dict[str, object]:
     # The bounded graph state carries only an ID-sized summary.  Persist_failure
     # turns this into the typed FailureRecord exactly once.
+    bounded_message = message[:MAX_TERMINAL_TEXT]
+    bounded_evidence = tuple(
+        item[:MAX_EVIDENCE_REF_LENGTH] for item in evidence[:MAX_EVIDENCE_REFS]
+    )
     detail = json.dumps(
-        {"kind": kind.value, "message": message, "evidence": evidence}, sort_keys=True
+        {"kind": kind.value, "message": bounded_message, "evidence": bounded_evidence},
+        sort_keys=True,
     )
     return {"terminal_reason": f"failure:{detail}", "pending_route": "persist_failure"}
+
+
+def _blocker_context(
+    blockers: tuple[ValidationBlocker, ...],
+) -> tuple[ValidationBlockerContext, ...]:
+    return tuple(
+        ValidationBlockerContext(
+            blocker_id=blocker.blocker_id,
+            text=blocker.text[:MAX_TERMINAL_TEXT],
+            evidence_refs=tuple(
+                ref[:MAX_EVIDENCE_REF_LENGTH]
+                for ref in blocker.evidence_refs[:MAX_EVIDENCE_REFS]
+            ),
+        )
+        for blocker in blockers
+    )
 
 
 def _failure_details(state: ProductionState) -> tuple[FailureKind, str, tuple[str, ...]]:
@@ -119,6 +149,40 @@ def _failure_details(state: ProductionState) -> tuple[FailureKind, str, tuple[st
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             pass
     return FailureKind.SCHEMA_MISMATCH, "failure classification was absent", ()
+
+
+def _validation_operation(
+    state: ProductionState, stage: ValidationStage, subject: dict[str, object]
+) -> ValidationOperationIdentity:
+    subject_json = json.dumps(subject, sort_keys=True, separators=(",", ":"))
+    subject_sha256 = hashlib.sha256(subject_json.encode()).hexdigest()
+    authority = subject.get("implementation_authority")
+    diff_sha256 = (
+        str(cast(dict[str, object], authority)["diff_sha256"])
+        if isinstance(authority, dict) and "diff_sha256" in authority
+        else None
+    )
+    material = json.dumps(
+        {
+            "run_id": state["run_id"],
+            "experiment_id": state.get("current_experiment_id"),
+            "stage": stage.value,
+            "repair_attempt": state["repair_attempts"],
+            "subject_sha256": subject_sha256,
+            "implementation_diff_sha256": diff_sha256,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return ValidationOperationIdentity(
+        operation_id=f"validation-operation-{hashlib.sha256(material.encode()).hexdigest()}",
+        run_id=state["run_id"],
+        experiment_id=_exp_id(state),
+        stage=stage,
+        repair_attempt=state["repair_attempts"],
+        subject_sha256=subject_sha256,
+        implementation_diff_sha256=diff_sha256,
+    )
 
 
 @dataclass
@@ -145,7 +209,85 @@ class ServiceTransitions:
     default_timeout_seconds: int = 300
     default_memory_bytes: int = 1 << 30
     default_cpus: float = 1.0
+    default_gpu_count: int = 0
+    smoke_timeout_seconds: int = 30
+    smoke_memory_bytes: int = 512 * 1024 * 1024
+    smoke_disk_bytes: int = 64 * 1024 * 1024
+    dataset_view_provenance: Callable[[ExecutionRequest], DatasetViewProvenance] | None = None
     max_repairs: int = 3
+
+
+def _unresolved_blockers(
+    s: ServiceTransitions, experiment_id: str
+) -> tuple[ValidationBlocker, ...]:
+    if s.run_store is None:
+        raise MissingAuthorityError("validation ledger authority is absent")
+    return s.run_store.get_unresolved_blockers(experiment_id)
+
+
+def _has_validation_ledger(s: ServiceTransitions) -> bool:
+    return s.run_store is not None and all(
+        callable(getattr(s.run_store, method, None))
+        for method in (
+            "put_validation_report",
+            "get_validation_report_by_operation",
+            "get_unresolved_blockers",
+        )
+    )
+
+
+def _canonical_validation_report(
+    report: ValidationReport, operation: ValidationOperationIdentity
+) -> ValidationReport:
+    report_id = f"validation-report-{operation.operation_id}"
+    introduced_ids = {blocker.blocker_id for blocker in report.blockers}
+    if introduced_ids & set(report.resolves_blocker_ids):
+        raise ValueError("a validation report cannot resolve a blocker it introduces")
+    blockers = tuple(
+        ValidationBlocker(
+            blocker_id=validation_blocker_id(report_id, operation.stage, blocker.text),
+            experiment_id=operation.experiment_id,
+            stage=operation.stage,
+            text=blocker.text,
+            report_id=report_id,
+            evidence_refs=blocker.evidence_refs,
+        )
+        for blocker in report.blockers
+    )
+    return report.model_copy(
+        update={
+            "report_id": report_id,
+            "experiment_id": operation.experiment_id,
+            "stage": operation.stage,
+            "blockers": blockers,
+            "validation_operation_id": operation.operation_id,
+        }
+    )
+
+
+def _replayed_validation_updates(
+    s: ServiceTransitions, state: ProductionState, report: ValidationReport
+) -> dict[str, object]:
+    store = cast(RunStore, s.run_store)
+    unresolved_blockers = store.get_unresolved_blockers(report.experiment_id)
+    unresolved = tuple(blocker.blocker_id for blocker in unresolved_blockers)
+    route = route_after_validation(state, report, unresolved)
+    updates: dict[str, object] = {"latest_validation_report_id": report.report_id}
+    if route not in {"repair", "persist_failure"}:
+        return updates | {"pending_route": route}
+    message = "; ".join(blocker.text for blocker in report.blockers)
+    if unresolved:
+        message = "unresolved validation blockers: " + "; ".join(
+            f"{blocker.blocker_id}: {blocker.text}" for blocker in unresolved_blockers
+        )
+    if not message:
+        message = f"{report.stage.value} validation rejected"
+    return updates | _failure(
+        state,
+        FailureKind.SCHEMA_MISMATCH if route == "repair" else FailureKind.UNSTABLE_VALIDATION,
+        message,
+        report.evidence_refs,
+    )
 
 
 def make_service_transitions(
@@ -170,6 +312,11 @@ def make_service_transitions(
     default_timeout_seconds: int = 300,
     default_memory_bytes: int = 1 << 30,
     default_cpus: float = 1.0,
+    default_gpu_count: int = 0,
+    smoke_timeout_seconds: int = 30,
+    smoke_memory_bytes: int = 512 * 1024 * 1024,
+    smoke_disk_bytes: int = 64 * 1024 * 1024,
+    dataset_view_provenance: Callable[[ExecutionRequest], DatasetViewProvenance] | None = None,
     max_repairs: int = 3,
 ) -> Mapping[str, Transition]:
     s = ServiceTransitions(
@@ -193,6 +340,11 @@ def make_service_transitions(
         default_timeout_seconds=default_timeout_seconds,
         default_memory_bytes=default_memory_bytes,
         default_cpus=default_cpus,
+        default_gpu_count=default_gpu_count,
+        smoke_timeout_seconds=smoke_timeout_seconds,
+        smoke_memory_bytes=smoke_memory_bytes,
+        smoke_disk_bytes=smoke_disk_bytes,
+        dataset_view_provenance=dataset_view_provenance,
         max_repairs=max_repairs,
     )
     return {
@@ -208,6 +360,7 @@ def make_service_transitions(
         "implementation_validation": _implementation_validation(s),
         "register_source": _register_source(s),
         "preflight": _preflight(s),
+        "smoke": _smoke(s),
         "execute": _execute(s),
         "evaluate": _evaluate(s),
         "result_validation": _result_validation(s),
@@ -311,8 +464,12 @@ def _finalization_ready(s: ServiceTransitions, state: ProductionState) -> bool:
         or evaluation_id is None
     ):
         return False
-    source = s.run_store.get_source_registration(experiment_id)
     evaluation = s.run_store.get_evaluation_result(evaluation_id)
+    source = (
+        s.run_store.get_source_registration_by_id(f"source-{evaluation.source_commit}")
+        if evaluation is not None and evaluation.source_commit is not None
+        else s.run_store.get_source_registration(experiment_id)
+    )
     return (
         source is not None
         and evaluation is not None
@@ -326,15 +483,23 @@ def _research(s: ServiceTransitions) -> Transition:
         if client is None:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "research role is not configured")
         objective = "propose next experiment"
+        unresolved_context: tuple[ValidationBlockerContext, ...] = ()
         if state.get("terminal_reason"):
             _, message, _ = _failure_details(state)
             objective += f"; address validator feedback: {message}"
+            try:
+                unresolved_context = _blocker_context(
+                    _unresolved_blockers(s, _exp_id(state))
+                )
+            except MissingAuthorityError as error:
+                return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         request = ResearchRequest(
             request_id=f"research-{state['run_id']}-{state['state_version']}",
             objective=objective,
             resource_state=_resource_state(s),
             allowed_paths=IMPLEMENTATION_ROOTS,
             controller_context=_controller_context(s),
+            unresolved_blockers=unresolved_context,
         )
         response = await client.invoke(request)
         if isinstance(response, AgentFailure):
@@ -428,39 +593,89 @@ def _proposal_validation(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         client = _agent(s, AgentRole.VALIDATOR)
         if client is None:
-            return {"pending_route": "create_worktree"}
+            return _failure(state, FailureKind.SCHEMA_MISMATCH, "validator role is not configured")
+        if not _has_validation_ledger(s):
+            return _failure(
+                state, FailureKind.SCHEMA_MISMATCH, "validation ledger authority is absent"
+            )
         try:
             spec = _spec(s, state)
+            store = cast(RunStore, s.run_store)
+            bound_attempt = store.get_validation_report_for_attempt(
+                state["run_id"],
+                spec.experiment_id,
+                ValidationStage.PROPOSAL,
+                state["repair_attempts"],
+            )
+            if bound_attempt is not None:
+                return _replayed_validation_updates(s, state, bound_attempt)
+            unresolved = _unresolved_blockers(s, spec.experiment_id)
         except MissingAuthorityError as error:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
+        subject: dict[str, object] = {
+            "experiment_spec": spec.model_dump(mode="json"),
+            "controller_context": _controller_context(s).model_dump(mode="json"),
+            "unresolved_blockers": [
+                item.model_dump(mode="json") for item in _blocker_context(unresolved)
+            ],
+        }
+        operation = _validation_operation(state, ValidationStage.PROPOSAL, subject)
+        subject["validation_operation"] = operation.model_dump(mode="json")
+        bound = store.get_validation_report_by_operation(operation.operation_id)
+        if bound is not None:
+            return _replayed_validation_updates(s, state, bound)
         response = await client.invoke(
             ValidationRequest(
-                request_id=f"proposal-validation-{state['run_id']}-{state['state_version']}",
+                request_id=operation.operation_id,
                 experiment_id=spec.experiment_id,
                 stage=ValidationStage.PROPOSAL,
-                subject={
-                    "experiment_spec": spec.model_dump(mode="json"),
-                    "controller_context": _controller_context(s).model_dump(mode="json"),
-                },
+                validation_operation=operation,
+                subject=subject,
             )
         )
         if isinstance(response, AgentFailure):
             return _agent_failure(state, response)
         if not isinstance(response, ValidationReport):
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "invalid proposal validation")
-        return _validation_updates(state, response)
+        if (
+            response.experiment_id != spec.experiment_id
+            or response.stage != ValidationStage.PROPOSAL
+        ):
+            return _failure(
+                state, FailureKind.SCHEMA_MISMATCH, "validation response identity mismatch"
+            )
+        return _validation_updates(s, state, response, operation, subject)
 
     return transition
 
 
 def _validation_updates(
-    state: ProductionState, report: ValidationReport
+    s: ServiceTransitions,
+    state: ProductionState,
+    report: ValidationReport,
+    operation: ValidationOperationIdentity,
+    subject: dict[str, object],
 ) -> dict[str, object]:
-    route = route_after_validation(state, report)
+    if not _has_validation_ledger(s):
+        return _failure(
+            state, FailureKind.SCHEMA_MISMATCH, "validation ledger authority is absent"
+        )
+    report = _canonical_validation_report(report, operation)
+    store = cast(RunStore, s.run_store)
+    store.put_validation_report(report, state["run_id"], operation, subject)
+    unresolved_blockers = store.get_unresolved_blockers(report.experiment_id)
+    unresolved = tuple(blocker.blocker_id for blocker in unresolved_blockers)
+    route = route_after_validation(state, report, unresolved)
     updates: dict[str, object] = {"latest_validation_report_id": report.report_id}
     if route not in {"repair", "persist_failure"}:
         return updates | {"pending_route": route}
-    message = "; ".join(report.blockers) or f"{report.stage.value} validation rejected"
+    message = "; ".join(blocker.text for blocker in report.blockers)
+    if unresolved:
+        message = "unresolved validation blockers: " + "; ".join(
+            f"{blocker.blocker_id}: {blocker.text}" for blocker in unresolved_blockers
+        )
+    if not message:
+        message = f"{report.stage.value} validation rejected"
     return updates | _failure(
         state,
         (
@@ -506,15 +721,21 @@ def _implement(s: ServiceTransitions) -> Transition:
             return _failure(
                 state, FailureKind.SCHEMA_MISMATCH, "implementor role is not configured"
             )
+        if not _has_validation_ledger(s):
+            return _failure(
+                state, FailureKind.SCHEMA_MISMATCH, "validation ledger authority is absent"
+            )
         try:
             spec = _spec(s, state)
         except MissingAuthorityError as error:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         repository = getattr(client, "scoped_repository", None)
+        prior_diff_sha256: str | None = None
         try:
             source_context: dict[str, str] = {}
             base_source_context: dict[str, str] = {}
             if repository is not None:
+                prior_diff_sha256 = hashlib.sha256(repository.diff().encode()).hexdigest()
                 current_source = repository.read(EXPERIMENT_ENTRYPOINT, 100_000)
                 base_source = repository.read_base(EXPERIMENT_ENTRYPOINT, 100_000)
                 source_context[EXPERIMENT_ENTRYPOINT] = current_source
@@ -522,6 +743,9 @@ def _implement(s: ServiceTransitions) -> Transition:
                     base_source_context[EXPERIMENT_ENTRYPOINT] = base_source
         except (OSError, PermissionError, ValueError, RuntimeError) as error:
             return _failure(state, FailureKind.MISSING_PATH, str(error))
+        unresolved = _unresolved_blockers(s, spec.experiment_id)
+        unresolved_blocker_ids = tuple(blocker.blocker_id for blocker in unresolved)
+        unresolved_blocker_context = _blocker_context(unresolved)
         response = await client.invoke(
             ImplementationRequest(
                 request_id=f"implementation-{state['run_id']}-{state['state_version']}",
@@ -532,8 +756,15 @@ def _implement(s: ServiceTransitions) -> Transition:
                 repair_feedback=(
                     _failure_details(state)[1] if state["repair_attempts"] > 0 else None
                 ),
+                unresolved_blocker_ids=unresolved_blocker_ids,
+                unresolved_blockers=unresolved_blocker_context,
                 source_context=source_context,
                 base_source_context=base_source_context,
+                execution_timeout_seconds=s.default_timeout_seconds,
+                execution_memory_bytes=s.default_memory_bytes,
+                execution_cpus=s.default_cpus,
+                execution_gpu_count=s.default_gpu_count,
+                prior_diff_sha256=prior_diff_sha256,
             )
         )
         if isinstance(response, AgentFailure):
@@ -543,18 +774,33 @@ def _implement(s: ServiceTransitions) -> Transition:
         if repository is not None:
             try:
                 changed_files = tuple(repository.changed_files())
-                if not changed_files or not repository.diff():
+                diff = repository.diff()
+                if not changed_files or not diff:
                     return _failure(
                         state, FailureKind.SCHEMA_MISMATCH, "implementation produced no real diff"
+                    )
+                result_diff_sha256 = hashlib.sha256(diff.encode()).hexdigest()
+                if (
+                    state["repair_attempts"] > 0
+                    and result_diff_sha256 == prior_diff_sha256
+                ):
+                    return _failure(
+                        state,
+                        FailureKind.SCHEMA_MISMATCH,
+                        "repair attempt did not change the authoritative implementation diff",
                     )
             except (OSError, PermissionError, ValueError, RuntimeError) as error:
                 return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
             response = response.model_copy(update={"changed_files": changed_files})
+        else:
+            result_diff_sha256 = None
         if s.run_store is not None:
             record = ImplementationAttemptRecord(
                 experiment_id=response.experiment_id,
                 repair_attempt=state["repair_attempts"],
                 result=response,
+                prior_diff_sha256=prior_diff_sha256,
+                result_diff_sha256=result_diff_sha256,
             )
             s.run_store.put_json(
                 "implementation",
@@ -635,18 +881,31 @@ def _validation(
     async def transition(_: ProductionState) -> dict[str, object]:
         client = _agent(s, AgentRole.VALIDATOR)
         if client is None:
-            return {"pending_route": route}
+            return _failure(
+                state, FailureKind.SCHEMA_MISMATCH, "validator role is not configured"
+            )
+        if s.run_store is None:
+            return _failure(
+                state, FailureKind.SCHEMA_MISMATCH, "validation ledger authority is absent"
+            )
+        if not _has_validation_ledger(s):
+            return _failure(
+                state, FailureKind.SCHEMA_MISMATCH, "validation ledger authority is absent"
+            )
         try:
+            if stage != ValidationStage.IMPLEMENTATION:
+                bound_attempt = s.run_store.get_validation_report_for_attempt(
+                    state["run_id"],
+                    _exp_id(state),
+                    stage,
+                    state["repair_attempts"],
+                )
+                if bound_attempt is not None:
+                    return _replayed_validation_updates(s, state, bound_attempt)
             subject = _validation_subject(s, state, stage)
         except MissingAuthorityError as error:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         if stage == ValidationStage.IMPLEMENTATION:
-            if s.run_store is None:
-                return _failure(
-                    state,
-                    FailureKind.SCHEMA_MISMATCH,
-                    "run store is required for validator worktree binding",
-                )
             assignment = s.run_store.get_worktree_assignment(_exp_id(state))
             if assignment is None:
                 return _failure(
@@ -657,11 +916,17 @@ def _validation(
             binder = getattr(client, "bind_worktree", None)
             if binder is not None:
                 binder(assignment.path, _spec(s, state).implementation_scope)
+        operation = _validation_operation(state, stage, subject)
+        subject["validation_operation"] = operation.model_dump(mode="json")
+        bound = s.run_store.get_validation_report_by_operation(operation.operation_id)
+        if bound is not None:
+            return _replayed_validation_updates(s, state, bound)
         response = await client.invoke(
             ValidationRequest(
-                request_id=f"{stage.value}-validation-{state['run_id']}-{state['state_version']}",
+                request_id=operation.operation_id,
                 experiment_id=_exp_id(state),
                 stage=stage,
+                validation_operation=operation,
                 subject=subject,
             )
         )
@@ -669,7 +934,11 @@ def _validation(
             return _agent_failure(state, response)
         if not isinstance(response, ValidationReport):
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "invalid validation response")
-        return _validation_updates(state, response)
+        if response.experiment_id != _exp_id(state) or response.stage != stage:
+            return _failure(
+                state, FailureKind.SCHEMA_MISMATCH, "validation response identity mismatch"
+            )
+        return _validation_updates(s, state, response, operation, subject)
 
     return transition
 
@@ -680,6 +949,10 @@ def _validation_subject(
     subject: dict[str, object] = {
         "experiment_spec": _spec(s, state).model_dump(mode="json"),
         "controller_context": _controller_context(s).model_dump(mode="json"),
+        "unresolved_blockers": [
+            item.model_dump(mode="json")
+            for item in _blocker_context(_unresolved_blockers(s, _exp_id(state)))
+        ],
     }
     if stage == ValidationStage.IMPLEMENTATION:
         implementation = _implementation_result(s, state)
@@ -708,6 +981,12 @@ def _validation_subject(
             changed_files=changed_files,
             allowed_scopes=_spec(s, state).implementation_scope,
         ).model_dump(mode="json")
+        subject["execution_resources"] = {
+            "timeout_seconds": s.default_timeout_seconds,
+            "memory_bytes": s.default_memory_bytes,
+            "cpus": s.default_cpus,
+            "gpu_count": s.default_gpu_count,
+        }
     elif stage == ValidationStage.RESULT:
         if s.run_store is None:
             raise MissingAuthorityError("run store is required for result validation")
@@ -740,7 +1019,10 @@ def _register_source(s: ServiceTransitions) -> Transition:
             if assignment is None:
                 raise MissingAuthorityError("worktree assignment was not found")
             spec = _spec(s, state)
-            registration = s.worktree_manager.register_source(assignment, spec.implementation_scope)
+            previous = s.run_store.get_source_registration(spec.experiment_id)
+            registration = s.worktree_manager.register_source(
+                assignment, spec.implementation_scope, previous
+            )
             s.run_store.put_source_registration(registration)
         except (MissingAuthorityError, ValueError) as error:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
@@ -753,9 +1035,155 @@ def _preflight(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         if s.run_store is not None and s.run_store.get_source_registration(_exp_id(state)) is None:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "source registration was not found")
+        return {"phase": RunPhase.EXECUTE, "pending_route": "smoke"}
+
+    return transition
+
+
+def _smoke(s: ServiceTransitions) -> Transition:
+    async def transition(state: ProductionState) -> dict[str, object]:
+        if (
+            s.executor is None
+            or s.run_store is None
+            or s.dataset_root is None
+            or s.runtime_root is None
+            or s.resource_accountant is None
+        ):
+            return _failure(
+                state, FailureKind.MISSING_PATH, "smoke execution provenance is incomplete"
+            )
+        try:
+            spec = _spec(s, state)
+            registration = s.run_store.get_source_registration(spec.experiment_id)
+            assignment = s.run_store.get_worktree_assignment(spec.experiment_id)
+            manifest = s.run_store.get_dataset_manifest_identity()
+            if registration is None or assignment is None or manifest is None:
+                raise MissingAuthorityError(
+                    "smoke source, worktree, or dataset authority is absent"
+                )
+            if s.dataset_view_provenance is None:
+                raise MissingAuthorityError("current authorized smoke dataset view is absent")
+            execution_id = f"smoke-{state['run_id']}-{spec.experiment_id}-{state['state_version']}"
+            command = (
+                "python",
+                "-m",
+                "tiktok2026.experiment.train",
+                "--output-dir=/output",
+                f"--seed={_deterministic_seed(state['run_id'], spec.experiment_id)}",
+                "--fidelity=smoke",
+                f"--source-commit={registration.source_commit}",
+                f"--execution-id={execution_id}",
+            )
+            request = ExecutionRequest(
+                run_id=state["run_id"],
+                execution_id=execution_id,
+                experiment_id=spec.experiment_id,
+                source_registration_id=registration.registration_id,
+                source_commit=registration.source_commit,
+                command=command,
+                image=s.docker_image or "",
+                source_path=assignment.path,
+                dataset_path=Path(s.dataset_root),
+                dataset_manifest_sha256=manifest.manifest_sha256,
+                output_path=Path(s.runtime_root) / "smoke-placeholder",
+                timeout_seconds=s.smoke_timeout_seconds,
+                memory_bytes=s.smoke_memory_bytes,
+                cpus=s.default_cpus,
+                gpu_count=s.default_gpu_count,
+                execution_kind="smoke",
+            )
+            current_view = s.dataset_view_provenance(request)
+            request = request.model_copy(update={"dataset_view_sha256": current_view.view_sha256})
+            result = s.run_store.get_execution_result(execution_id)
+            if result is not None and (
+                result.execution_kind != "smoke"
+                or result.experiment_id != spec.experiment_id
+                or result.source_registration_id != registration.registration_id
+                or result.source_commit != registration.source_commit
+                or result.command != command
+                or result.dataset_manifest_id != current_view.manifest_id
+                or result.dataset_manifest_sha256 != current_view.manifest_sha256
+                or result.dataset_view_sha256 != current_view.view_sha256
+                or result.dataset_valid_rows != current_view.valid_rows
+            ):
+                raise MissingAuthorityError("persisted smoke result does not match the request")
+            reservation_id = f"reservation-{execution_id}"
+            reservation = ResourceReservation(
+                reservation_id=reservation_id,
+                run_id=state["run_id"],
+                experiment_id=spec.experiment_id,
+                gpu_hours=smoke_gpu_hours(s),
+                wall_seconds=float(s.smoke_timeout_seconds + 5),
+                tokens=0,
+                disk_bytes=s.smoke_disk_bytes,
+            )
+            if not s.resource_accountant.reserve(reservation):
+                return _failure(state, FailureKind.DISK, "smoke resource reservation was denied")
+            if result is None:
+                request = request.model_copy(
+                    update={
+                        "output_path": _fresh_execution_output_path(
+                            s.runtime_root, execution_id
+                        )
+                    }
+                )
+                result = await s.executor.execute(request)
+                s.run_store.put_execution_result(result)
+            s.resource_accountant.consume(
+                reservation_id,
+                gpu_hours=result.gpu_hours,
+                wall_seconds=result.elapsed_seconds,
+                tokens=0,
+                disk_bytes=result.artifact_output_bytes,
+            )
+            s.resource_accountant.reconcile(
+                reservation_id,
+                gpu_hours=result.gpu_hours,
+                wall_seconds=result.elapsed_seconds,
+                tokens=0,
+                disk_bytes=result.artifact_output_bytes,
+            )
+            if result.failure_kind is not None:
+                return _failure(
+                    state,
+                    result.failure_kind,
+                    result.failure_message or "smoke execution failed",
+                    (result.execution_id,),
+                )
+            if (
+                result.dataset_manifest_id != current_view.manifest_id
+                or result.dataset_manifest_sha256 != current_view.manifest_sha256
+                or result.dataset_view_sha256 != current_view.view_sha256
+                or result.dataset_valid_rows != current_view.valid_rows
+            ):
+                return _failure(
+                    state,
+                    FailureKind.SCHEMA_MISMATCH,
+                    "smoke dataset provenance does not match current authorized view",
+                    (result.execution_id,),
+                )
+            decision = check_smoke_feasibility(
+                result,
+                memory_limit_bytes=s.smoke_memory_bytes,
+                timeout_seconds=s.smoke_timeout_seconds,
+                gpu_requested=s.default_gpu_count > 0,
+            )
+            if not decision.allowed:
+                return _failure(
+                    state,
+                    FailureKind.SCHEMA_MISMATCH,
+                    decision.reason,
+                    (result.execution_id,),
+                )
+        except (MissingAuthorityError, ValueError) as error:
+            return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         return {"phase": RunPhase.EXECUTE, "pending_route": "execute"}
 
     return transition
+
+
+def smoke_gpu_hours(s: ServiceTransitions) -> float:
+    return s.smoke_timeout_seconds * s.default_gpu_count / 3600.0
 
 
 def _fresh_execution_output_path(runtime_root: str, execution_id: str) -> Path:
@@ -795,49 +1223,69 @@ def _execute(s: ServiceTransitions) -> Transition:
             spec = _spec(s, state)
             registration = s.run_store.get_source_registration(spec.experiment_id)
             assignment = s.run_store.get_worktree_assignment(spec.experiment_id)
-            if registration is None or assignment is None:
-                raise MissingAuthorityError("source or worktree authority is absent")
-            reservation_id = f"reservation-{state['run_id']}-{spec.experiment_id}"
+            manifest = s.run_store.get_dataset_manifest_identity()
+            if registration is None or assignment is None or manifest is None:
+                raise MissingAuthorityError("source, worktree, or dataset authority is absent")
+            execution_id = (
+                f"execution-{state['run_id']}-{spec.experiment_id}-{state['state_version']}"
+            )
+            command = (
+                "python",
+                "-m",
+                "tiktok2026.experiment.train",
+                "--output-dir=/output",
+                f"--seed={_deterministic_seed(state['run_id'], spec.experiment_id)}",
+                f"--fidelity={spec.fidelity.value}",
+                f"--source-commit={registration.source_commit}",
+                f"--execution-id={execution_id}",
+            )
+            result = s.run_store.get_execution_result(execution_id)
+            if result is not None and (
+                result.experiment_id != spec.experiment_id
+                or result.source_registration_id != registration.registration_id
+                or result.source_commit != registration.source_commit
+                or result.command != command
+            ):
+                raise MissingAuthorityError(
+                    "persisted execution result does not match the requested execution"
+                )
+            reservation_id = f"reservation-{execution_id}"
+            reserved_wall_seconds = float(s.default_timeout_seconds + 5)
             reservation = ResourceReservation(
                 reservation_id=reservation_id,
                 run_id=state["run_id"],
                 experiment_id=spec.experiment_id,
-                gpu_hours=spec.predicted_gpu_hours,
-                wall_seconds=float(s.default_timeout_seconds),
+                gpu_hours=max(
+                    spec.predicted_gpu_hours,
+                    reserved_wall_seconds * s.default_gpu_count / 3600.0,
+                ),
+                wall_seconds=reserved_wall_seconds,
                 tokens=0,
                 disk_bytes=0,
             )
             if s.resource_accountant is not None and not s.resource_accountant.reserve(reservation):
                 return _failure(state, FailureKind.DISK, "resource reservation was denied")
-            execution_id = (
-                f"execution-{state['run_id']}-{spec.experiment_id}-{state['state_version']}"
-            )
-            output_path = _fresh_execution_output_path(s.runtime_root, execution_id)
-            request = ExecutionRequest(
-                run_id=state["run_id"],
-                execution_id=execution_id,
-                experiment_id=spec.experiment_id,
-                source_commit=registration.source_commit,
-                command=(
-                    "python",
-                    "-m",
-                    "tiktok2026.experiment.train",
-                    "--output-dir=/output",
-                    f"--seed={_deterministic_seed(state['run_id'], spec.experiment_id)}",
-                    f"--fidelity={spec.fidelity.value}",
-                    f"--source-commit={registration.source_commit}",
-                    f"--execution-id={execution_id}",
-                ),
-                image=s.docker_image or "",
-                source_path=assignment.path,
-                dataset_path=Path(s.dataset_root),
-                output_path=output_path,
-                timeout_seconds=s.default_timeout_seconds,
-                memory_bytes=s.default_memory_bytes,
-                cpus=s.default_cpus,
-            )
-            result = await s.executor.execute(request)
-            s.run_store.put_execution_result(result)
+            if result is None:
+                output_path = _fresh_execution_output_path(s.runtime_root, execution_id)
+                request = ExecutionRequest(
+                    run_id=state["run_id"],
+                    execution_id=execution_id,
+                    experiment_id=spec.experiment_id,
+                    source_registration_id=registration.registration_id,
+                    source_commit=registration.source_commit,
+                    command=command,
+                    image=s.docker_image or "",
+                    source_path=assignment.path,
+                    dataset_path=Path(s.dataset_root),
+                    dataset_manifest_sha256=manifest.manifest_sha256,
+                    output_path=output_path,
+                    timeout_seconds=s.default_timeout_seconds,
+                    memory_bytes=s.default_memory_bytes,
+                    cpus=s.default_cpus,
+                    gpu_count=s.default_gpu_count,
+                )
+                result = await s.executor.execute(request)
+                s.run_store.put_execution_result(result)
             if s.resource_accountant is not None:
                 s.resource_accountant.consume(
                     reservation_id,
@@ -856,7 +1304,12 @@ def _execute(s: ServiceTransitions) -> Transition:
         except (MissingAuthorityError, ValueError) as error:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         if result.failure_kind is not None:
-            return _failure(state, result.failure_kind, "execution failed", (result.execution_id,))
+            return _failure(
+                state,
+                result.failure_kind,
+                result.failure_message or "execution failed",
+                (result.execution_id,),
+            )
         return {
             "phase": RunPhase.EXECUTE,
             "latest_execution_result_id": result.execution_id,
@@ -877,18 +1330,30 @@ def _evaluate(s: ServiceTransitions) -> Transition:
             if not execution_id:
                 raise MissingAuthorityError("execution result identity is absent")
             execution = s.run_store.get_execution_result(execution_id)
-            registration = s.run_store.get_source_registration(_exp_id(state))
+            if execution is None:
+                raise MissingAuthorityError("execution provenance record is absent")
+            registration = s.run_store.get_source_registration_by_id(
+                execution.source_registration_id
+            )
             manifest = s.run_store.get_dataset_manifest_identity()
             evaluator = s.run_store.get_evaluator_identity(s.evaluator_id)
-            if execution is None or registration is None or manifest is None or evaluator is None:
+            if registration is None or manifest is None or evaluator is None:
                 raise MissingAuthorityError("evaluation provenance record is absent")
-            if execution.source_commit != registration.source_commit:
+            if (
+                execution.source_registration_id != registration.registration_id
+                or execution.source_commit != registration.source_commit
+            ):
                 raise MissingAuthorityError("execution source does not match registered source")
             checkpoint_id = execution.checkpoint_id
             if checkpoint_id is None:
                 raise MissingAuthorityError("execution did not return a checkpoint identity")
             prediction = next(
-                (s.run_store.get_prediction_artifact(item) for item in execution.artifact_ids), None
+                (
+                    artifact
+                    for artifact_id in execution.artifact_ids
+                    if (artifact := s.run_store.get_prediction_artifact(artifact_id)) is not None
+                ),
+                None,
             )
             if prediction is None:
                 raise MissingAuthorityError(
@@ -1272,7 +1737,10 @@ def _mark_terminal_failure(
         failure_id=f"failure-{state['run_id']}-{state['state_version']}-terminal",
         experiment_id=state.get("current_experiment_id"),
         kind=kind,
-        evidence_refs=evidence or (message,),
+        evidence_refs=tuple(
+            item[:MAX_EVIDENCE_REF_LENGTH]
+            for item in (evidence or (message,))[:MAX_EVIDENCE_REFS]
+        ),
         repair_attempt=state["repair_attempts"],
     )
     if s.run_store is not None:

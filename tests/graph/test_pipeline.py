@@ -69,6 +69,10 @@ class RecordingController:
 
     async def preflight(self, state: ProductionState) -> dict[str, object]:
         self.calls.append("preflight")
+        return {"pending_route": "smoke"}
+
+    async def smoke(self, state: ProductionState) -> dict[str, object]:
+        self.calls.append("smoke")
         return {"pending_route": "execute"}
 
     async def execute(self, state: ProductionState) -> dict[str, object]:
@@ -158,6 +162,7 @@ async def test_graph_runs_controller_owned_pipeline_to_completion() -> None:
         "implementation_validation",
         "register_source",
         "preflight",
+        "smoke",
         "execute",
         "evaluate",
         "result_validation",
@@ -188,6 +193,7 @@ def test_controller_implements_all_graph_use_cases() -> None:
         "implementation_validation",
         "register_source",
         "preflight",
+        "smoke",
         "execute",
         "evaluate",
         "result_validation",

@@ -63,9 +63,15 @@ def route_after_failure(
     return "terminal"
 
 
-def route_after_validation(state: ProductionState, report: ValidationReport) -> str:
+def route_after_validation(
+    state: ProductionState,
+    report: ValidationReport,
+    unresolved_blocker_ids: tuple[str, ...] = (),
+) -> str:
     del state
     if report.verdict == ValidationVerdict.APPROVED:
+        if unresolved_blocker_ids:
+            return "repair"
         if report.stage.value == "proposal":
             return "create_worktree"
         if report.stage.value == "implementation":
