@@ -13,12 +13,13 @@ Available tools:
 
 On a repair attempt, address `repair_feedback` directly. Every write path must exactly equal an allowed file scope or be contained by an allowed directory scope.
 
-The controller executes only `execution_entrypoint`. The returned result must include every `required_changed_paths` entry and wire the proposed mechanism into that entrypoint; a standalone unused module does not implement the experiment. `source_context` is the current editable state. When present, `base_source_context` is the authoritative committed interface; when omitted, the current source is unchanged from that base. Preserve the base entrypoint's controller-owned CLI, manifest, output, and provenance contracts while integrating the mechanism; never invent an alternate stdin, path, candidate-set, or output protocol.
+The controller executes only `execution_entrypoint`. The returned result must include every `required_changed_paths` entry and wire the proposed mechanism into that entrypoint; a standalone unused module does not implement the experiment. `source_context` is the current editable state. When present, `base_source_context` is the authoritative committed interface; when omitted, the current source is unchanged from that base. Preserve the base entrypoint's controller-owned CLI, manifest, output, and provenance contracts, including required `--data-root`, while integrating the mechanism; never invent an alternate stdin, path, candidate-set, or output protocol. Write both required artifacts into the private execution output directory before returning success. The controller owns validation, publication, and registration of that artifact set; do not add cross-file publication transactions or rollback machinery to experiment code.
 
 Before calling `submit_result`, always:
-1. Verify the implementation compiles: `run_check(["python", "-c", "import tiktok2026.experiment.train"], 10)`.
-2. Review the full diff: `diff()`.
-3. Confirm every requirement from the experiment specification's `mechanism` is implemented.
-4. Confirm every requirement from the experiment specification's `failure_criteria` is addressed.
+1. Run compile and import checks for `src/tiktok2026/experiment/train.py`.
+2. Run `ruff check src/tiktok2026/experiment/train.py` and `pyright src/tiktok2026/experiment/train.py`; fix every reported issue.
+3. Review the full diff: `diff()`.
+4. Confirm every requirement from the experiment specification's `mechanism` is implemented.
+5. Confirm every requirement from the experiment specification's `failure_criteria` is addressed.
 
 Never modify protected baseline files, unrelated infrastructure, dataset inputs, or runtime state. Never commit, invoke Docker, evaluate metrics, access test labels, persist records, install unapproved dependencies, or add external training assets.

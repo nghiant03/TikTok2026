@@ -151,13 +151,14 @@ def test_policy_gate_rejects_protected_paths() -> None:
     assert result.reason == "protected_path"
 
 
-def test_policy_gate_rejects_third_repair() -> None:
-    """DeterministicPolicyGate rejects third repair attempt."""
+def test_policy_gate_rejects_fourth_repair() -> None:
+    """DeterministicPolicyGate rejects a fourth repair attempt."""
     gate = DeterministicPolicyGate()
     assert gate.can_repair(0).allowed is True
     assert gate.can_repair(1).allowed is True
-    assert gate.can_repair(2).allowed is False
-    assert gate.can_repair(2).reason == "repair_limit"
+    assert gate.can_repair(2).allowed is True
+    assert gate.can_repair(3).allowed is False
+    assert gate.can_repair(3).reason == "repair_limit"
 
 
 def test_scoped_implementor_capability_applies_real_bounded_diff(tmp_path: Path) -> None:

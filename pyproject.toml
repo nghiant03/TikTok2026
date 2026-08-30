@@ -15,6 +15,7 @@ dependencies = [
     "openai>=1.100",
     "pandas>=2.3,<3",
     "pydantic>=2.11",
+    "python-dotenv>=1.0",
     "pydantic-settings>=2.10",
     "scikit-learn>=1.9.0",
     "torch>=2.13.0",

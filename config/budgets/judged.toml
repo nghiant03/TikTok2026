@@ -6,4 +6,4 @@ tokens = 0
 disk_bytes = 0
 reserved_final_gpu_hours = 0.0
 frontier_capacity = 4
-max_repairs = 2
+max_repairs = 3

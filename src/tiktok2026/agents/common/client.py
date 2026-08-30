@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections.abc import Mapping, Sequence
 from typing import Protocol, cast
@@ -11,11 +12,31 @@ from loguru import logger
 
 from tiktok2026.config import ModelSettings
 
+_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
+
+
+def _extract_json(content: str) -> dict[str, object] | None:
+    text = content.strip()
+    fence = _FENCE_RE.match(text)
+    if fence is not None:
+        text = fence.group(1).strip()
+    try:
+        candidate = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(candidate, dict):
+        return None
+    return cast(dict[str, object], candidate)
+
 
 class ChatTransport(Protocol):
     async def post_json(
         self, url: str, payload: dict[str, object], headers: dict[str, str], timeout: float
     ) -> dict[str, object]: ...
+
+
+class EmptyChoicesError(ValueError):
+    """The provider returned no assistant choices for a successful request."""
 
 
 class HttpxChatTransport:
@@ -51,6 +72,27 @@ class OpenAICompatibleClient:
         self.settings = settings
         self.transport = transport or HttpxChatTransport()
 
+    async def _post_json(
+        self,
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+    ) -> dict[str, object]:
+        for attempt in range(2):
+            try:
+                return await self.transport.post_json(
+                    url, payload, headers, self.settings.timeout_seconds
+                )
+            except httpx.ReadTimeout:
+                if attempt == 1:
+                    raise
+                logger.warning(
+                    "Model response timed out; retrying model={} timeout={}",
+                    self.settings.model,
+                    self.settings.timeout_seconds,
+                )
+        raise AssertionError("unreachable")
+
     async def complete(
         self,
         system: str,
@@ -73,6 +115,8 @@ class OpenAICompatibleClient:
             "max_tokens": self.settings.max_tokens,
             "response_format": {"type": "json_object"},
         }
+        if self.settings.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.settings.reasoning_effort
         logger.info(
             "Model request started request_id={} role={} attempt={} model={} "
             "timeout={} max_tokens={} system_chars={} user_chars={}",
@@ -86,16 +130,19 @@ class OpenAICompatibleClient:
             len(user),
         )
         started = time.monotonic()
-        response = await self.transport.post_json(
+        response = await self._post_json(
             f"{self.settings.base_url.rstrip('/')}/chat/completions",
             payload,
             {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            self.settings.timeout_seconds,
         )
         elapsed_seconds = time.monotonic() - started
         choices_value = response.get("choices")
         if not isinstance(choices_value, list) or not choices_value:
-            raise ValueError("chat response has no choices")
+            raise EmptyChoicesError(
+                "chat response has no choices "
+                f"(response_id={response.get('id')}, model={response.get('model')}, "
+                f"keys={tuple(sorted(response))})"
+            )
         choices = cast(list[object], choices_value)
         usage = response.get("usage")
         usage_details: Mapping[str, object] = (
@@ -126,13 +173,10 @@ class OpenAICompatibleClient:
             )
             if not isinstance(content, str) or not content:
                 continue
-            try:
-                candidate = json.loads(content)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(candidate, dict):
+            candidate = _extract_json(content)
+            if candidate is not None:
                 selected_index = index
-                parsed = cast(dict[str, object], candidate)
+                parsed = candidate
                 break
         metadata_value = response.get("_tiktok2026_proxy_metadata")
         metadata: Mapping[str, object] = (
@@ -206,6 +250,8 @@ class OpenAICompatibleClient:
             "temperature": self.settings.temperature,
             "max_tokens": self.settings.max_tokens,
         }
+        if self.settings.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.settings.reasoning_effort
         system_chars = sum(
             len(str(m.get("content", ""))) for m in messages if m.get("role") == "system"
         )
@@ -225,16 +271,19 @@ class OpenAICompatibleClient:
             user_chars,
         )
         started = time.monotonic()
-        response = await self.transport.post_json(
+        response = await self._post_json(
             f"{self.settings.base_url.rstrip('/')}/chat/completions",
             payload,
             {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            self.settings.timeout_seconds,
         )
         elapsed_seconds = time.monotonic() - started
         choices_value = response.get("choices")
         if not isinstance(choices_value, list) or not choices_value:
-            raise ValueError("chat response has no choices")
+            raise EmptyChoicesError(
+                "chat response has no choices "
+                f"(response_id={response.get('id')}, model={response.get('model')}, "
+                f"keys={tuple(sorted(response))})"
+            )
         choices = cast(list[object], choices_value)
         usage = response.get("usage")
         usage_details: Mapping[str, object] = (

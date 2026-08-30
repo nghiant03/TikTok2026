@@ -3,6 +3,7 @@ import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
+import httpx
 from pytest import MonkeyPatch, raises
 
 from tiktok2026.adapters import RoleSpecificAgentClient
@@ -27,7 +28,7 @@ from tiktok2026.contracts import (
 
 
 class RecordingTransport(ChatTransport):
-    def __init__(self, responses: Sequence[dict[str, object]]) -> None:
+    def __init__(self, responses: Sequence[dict[str, object] | Exception]) -> None:
         self.responses = list(responses)
         self.requests: list[tuple[str, dict[str, object], dict[str, str]]] = []
 
@@ -35,7 +36,10 @@ class RecordingTransport(ChatTransport):
         self, url: str, payload: dict[str, object], headers: dict[str, str], timeout: float
     ) -> dict[str, object]:
         self.requests.append((url, payload, headers))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class Reader:
@@ -82,6 +86,34 @@ async def test_openai_compatible_client_uses_configured_endpoint(
     assert transport.requests[0][0] == "https://example.test/v1/chat/completions"
     assert transport.requests[0][1]["model"] == "gpt-4.1"
     assert transport.requests[0][2]["Authorization"] == "Bearer secret"
+    assert "reasoning_effort" not in transport.requests[0][1]
+
+
+async def test_openai_compatible_client_sends_reasoning_effort_when_set(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    transport = RecordingTransport(
+        [{"choices": [{"message": {"content": json.dumps({"message": "ok"})}}]}]
+    )
+    client = OpenAICompatibleClient(
+        ModelSettings(model="deepseek-v4-pro", reasoning_effort="xhigh"), transport
+    )
+    await client.complete("system", "user")
+    assert transport.requests[0][1]["reasoning_effort"] == "xhigh"
+
+
+async def test_openai_compatible_client_strips_markdown_fences(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    fenced = '```json\n{"message": "ok"}\n```'
+    transport = RecordingTransport(
+        [{"choices": [{"message": {"content": fenced}}]}]
+    )
+    client = OpenAICompatibleClient(ModelSettings(), transport)
+    output = await client.complete("system", "user")
+    assert output == {"message": "ok"}
 
 
 async def test_openai_compatible_client_reports_empty_reasoning_response(
@@ -128,6 +160,39 @@ async def test_openai_compatible_client_selects_last_json_choice(
     )
 
     assert result == {"message": "implemented"}
+
+
+async def test_openai_compatible_client_retries_read_timeout_once(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    transport = RecordingTransport(
+        [
+            httpx.ReadTimeout("provider timed out"),
+            _final_response({"message": "recovered"}),
+        ]
+    )
+
+    result = await OpenAICompatibleClient(ModelSettings(), transport).complete_with_tools(
+        [], []
+    )
+
+    assert result["content"] == json.dumps({"message": "recovered"})
+    assert len(transport.requests) == 2
+
+
+async def test_openai_compatible_client_stops_after_second_read_timeout(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    transport = RecordingTransport(
+        [httpx.ReadTimeout("first timeout"), httpx.ReadTimeout("second timeout")]
+    )
+
+    with raises(httpx.ReadTimeout, match="second timeout"):
+        await OpenAICompatibleClient(ModelSettings(), transport).complete_with_tools([], [])
+
+    assert len(transport.requests) == 2
 
 
 async def test_research_repairs_invalid_response_once(monkeypatch: MonkeyPatch) -> None:
@@ -301,7 +366,7 @@ async def test_agentic_loop_turn_limit(monkeypatch: MonkeyPatch) -> None:
 
 async def test_agentic_loop_model_error(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
-    transport = RecordingTransport([{"choices": []}])  # no choices → ValueError
+    transport = RecordingTransport([{"choices": []}, {"choices": []}])
 
     def handler(name: str, args: dict[str, object]) -> str:
         return "ok"
@@ -319,6 +384,36 @@ async def test_agentic_loop_model_error(monkeypatch: MonkeyPatch) -> None:
     )
     assert isinstance(result, AgentFailure)
     assert result.kind == "model"
+    assert "no choices" in result.message
+    assert len(transport.requests) == 2
+
+
+async def test_agentic_loop_retries_empty_choices_without_consuming_turn(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    transport = RecordingTransport(
+        [{"choices": []}, _final_response({"message": "recovered"})]
+    )
+
+    def handler(name: str, args: dict[str, object]) -> str:
+        return "ok"
+
+    client = OpenAICompatibleClient(ModelSettings(), transport)
+    result = await invoke_agentic(
+        client,
+        AgentRole.VALIDATOR,
+        "test-empty-choices",
+        _FakeResult,
+        "system prompt",
+        {},
+        [],
+        handler,
+        max_turns=1,
+    )
+    assert isinstance(result, _FakeResult)
+    assert result.message == "recovered"
+    assert len(transport.requests) == 2
 
 
 async def test_agentic_loop_final_schema_error(monkeypatch: MonkeyPatch) -> None:
@@ -484,6 +579,44 @@ async def test_validator_agentic_tools_are_read_only_and_can_run_checks(
     }
     assert tool_names == {"read_file", "run_check", "diff", "submit_result"}
     assert "compile_entrypoint" in str(transport.requests[2][1]["messages"])
+    assert "controller_check_results" in str(transport.requests[0][1]["messages"])
+
+
+async def test_validator_cannot_approve_failed_controller_checks(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    repository = tmp_path / "repo"
+    target = repository / "src/tiktok2026/experiment"
+    target.mkdir(parents=True)
+    (target / "train.py").write_text("def broken(:\n", encoding="utf-8")
+    report = ValidationReport(
+        report_id="report-1",
+        experiment_id="exp-1",
+        stage=ValidationStage.IMPLEMENTATION,
+        verdict=ValidationVerdict.APPROVED,
+        leakage_risk="none",
+    ).model_dump(mode="json")
+    transport = RecordingTransport([_tool_calls_response("submit_result", report)])
+    validator = RoleSpecificAgentClient(
+        OpenAICompatibleClient(ModelSettings(), transport),
+        AgentRole.VALIDATOR,
+        "validate",
+    )
+    validator.bind_worktree(repository, ("src/tiktok2026/experiment",))
+
+    result = await validator.invoke(
+        ValidationRequest(
+            request_id="validation-1",
+            experiment_id="exp-1",
+            stage=ValidationStage.IMPLEMENTATION,
+            subject={},
+        )
+    )
+
+    assert isinstance(result, ValidationReport)
+    assert result.verdict == ValidationVerdict.REPAIRABLE
+    assert any("controller-owned check failed" in blocker for blocker in result.blockers)
 
 
 async def test_bound_validator_uses_single_shot_path_outside_implementation(

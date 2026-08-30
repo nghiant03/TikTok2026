@@ -376,7 +376,7 @@ async def test_repair_at_limit_routes_to_persist_failure() -> None:
         minimal_state(
             phase=RunPhase.IMPLEMENT,
             current_experiment_id="exp-1",
-            repair_attempts=2,
+            repair_attempts=3,
         )
     )
 
@@ -1117,11 +1117,11 @@ async def test_persist_failure_repairs_then_abandons_exhausted_experiment() -> N
     # The transition should record a failure and set pending_route
     assert result["pending_route"] in ("repair", "persist_failure", "orchestrate")
 
-    # With 2 attempts, repair is exhausted and the experiment is abandoned.
+    # With 3 attempts, repair is exhausted and the experiment is abandoned.
     state_exhausted = minimal_state(
         phase=RunPhase.IMPLEMENT,
         current_experiment_id="exp-1",
-        repair_attempts=2,
+        repair_attempts=3,
     )
     result = await controller.persist_failure(state_exhausted)
 

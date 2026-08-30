@@ -46,6 +46,7 @@ from tiktok2026.contracts import (
     ValidationReport,
     ValidationRequest,
     ValidationStage,
+    ValidationVerdict,
     WorktreeAssignment,
 )
 from tiktok2026.observability.exports import export_records
@@ -142,6 +143,28 @@ _DIFF_TOOL = _tool(
     "Return the current git diff of all changes in the worktree.",
     {},
 )
+
+
+def _validator_check_commands() -> dict[str, tuple[str, ...]]:
+    entrypoint = "src/tiktok2026/experiment/train.py"
+    return {
+        "compile_entrypoint": (
+            "python",
+            "-c",
+            (
+                "from pathlib import Path; "
+                f"source=Path('{entrypoint}').read_text(); "
+                f"compile(source, '{entrypoint}', 'exec')"
+            ),
+        ),
+        "import_entrypoint": (
+            "python",
+            "-c",
+            "import sys; sys.path.insert(0, 'src'); import tiktok2026.experiment.train",
+        ),
+        "ruff_entrypoint": ("ruff", "check", entrypoint),
+        "pyright_entrypoint": ("pyright", entrypoint),
+    }
 
 
 def _submit_tool(model_type: type[ContractModel]) -> dict[str, object]:
@@ -439,6 +462,16 @@ class RoleSpecificAgentClient:
                 repair_attempts=0,
             )
 
+        check_commands = _validator_check_commands()
+        check_results: dict[str, str] = {}
+        failed_checks: list[str] = []
+        for check, command in check_commands.items():
+            try:
+                check_results[check] = repository.run_check(command, 30)[-4_000:]
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                check_results[check] = str(error)[-4_000:]
+                failed_checks.append(check)
+
         def _handle(tool_name: str, arguments: dict[str, object]) -> str:
             if tool_name == "read_file":
                 path = str(arguments.get("path", ""))
@@ -447,26 +480,7 @@ class RoleSpecificAgentClient:
             if tool_name == "run_check":
                 check = str(arguments.get("check", ""))
                 timeout = int(str(arguments.get("timeout_seconds", "30")))
-                entrypoint = "src/tiktok2026/experiment/train.py"
-                commands = {
-                    "compile_entrypoint": (
-                        "python",
-                        "-c",
-                        (
-                            "from pathlib import Path; "
-                            f"source=Path('{entrypoint}').read_text(); "
-                            f"compile(source, '{entrypoint}', 'exec')"
-                        ),
-                    ),
-                    "import_entrypoint": (
-                        "python",
-                        "-c",
-                        "import tiktok2026.experiment.train",
-                    ),
-                    "ruff_entrypoint": ("ruff", "check", entrypoint),
-                    "pyright_entrypoint": ("pyright", entrypoint),
-                }
-                command = commands.get(check)
+                command = check_commands.get(check)
                 if command is None:
                     raise ValueError(f"unsupported validator check: {check}")
                 return repository.run_check(command, timeout)
@@ -474,17 +488,33 @@ class RoleSpecificAgentClient:
                 return repository.diff()
             return f"error: unknown tool {tool_name!r}"
 
-        return await invoke_agentic(
+        subject = request.model_dump(mode="json")
+        subject["controller_check_results"] = check_results
+        result = await invoke_agentic(
             self._client,
             self.role,
             request_id,
             ValidationReport,
             self.prompt,
-            request.model_dump(mode="json"),
+            subject,
             _validator_tools(),
             _handle,
             max_turns=8,
             terminal_tool="submit_result",
+        )
+        if not failed_checks or not isinstance(result, ValidationReport):
+            return result
+        blockers = result.blockers + tuple(
+            f"controller-owned check failed: {check}: {check_results[check]}"
+            for check in failed_checks
+        )
+        verdict = (
+            ValidationVerdict.REPAIRABLE
+            if result.verdict == ValidationVerdict.APPROVED
+            else result.verdict
+        )
+        return result.model_copy(
+            update={"verdict": verdict, "blockers": blockers}
         )
 
 

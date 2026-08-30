@@ -19,6 +19,7 @@ class ModelSettings(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     max_tokens: int = Field(default=4096, gt=0)
     timeout_seconds: float = Field(default=120.0, gt=0.0)
+    reasoning_effort: str | None = Field(default=None)
 
 
 class BudgetSettings(BaseModel):
@@ -30,7 +31,7 @@ class BudgetSettings(BaseModel):
     disk_bytes: int = Field(default=104_857_600, ge=0)
     reserved_final_gpu_hours: float = Field(default=0.0, ge=0.0)
     frontier_capacity: int = Field(default=4, gt=0)
-    max_repairs: int = Field(default=2, ge=0, le=2)
+    max_repairs: int = Field(default=3, ge=0, le=3)
 
 
 class ExecutionSettings(BaseModel):

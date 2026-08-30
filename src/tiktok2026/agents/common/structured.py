@@ -8,7 +8,7 @@ from typing import TypeVar, cast
 from loguru import logger
 from pydantic import ValidationError
 
-from tiktok2026.agents.common.client import OpenAICompatibleClient
+from tiktok2026.agents.common.client import EmptyChoicesError, OpenAICompatibleClient
 from tiktok2026.contracts import AgentFailure, AgentRole, ContractModel
 
 ModelT = TypeVar("ModelT", bound=ContractModel)
@@ -141,30 +141,61 @@ async def invoke_agentic(
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    request_attempt = 0
     for turn in range(1, max_turns + 1):
-        try:
-            assistant = await client.complete_with_tools(
-                messages,
-                list(tools),
-                request_id=request_id,
-                role=role.value,
-                attempt=turn,
-            )
-        except Exception as error:
-            logger.warning(
-                "Agentic turn failed request_id={} role={} turn={} error_type={}",
-                request_id,
-                role.value,
-                turn,
-                type(error).__name__,
-            )
-            return AgentFailure(
-                request_id=request_id,
-                role=role,
-                kind="model",
-                message=str(error),
-                repair_attempts=min(turn - 1, 1),
-            )
+        assistant: dict[str, object] = {}
+        for response_attempt in range(2):
+            request_attempt += 1
+            try:
+                assistant = await client.complete_with_tools(
+                    messages,
+                    list(tools),
+                    request_id=request_id,
+                    role=role.value,
+                    attempt=request_attempt,
+                )
+                break
+            except EmptyChoicesError as error:
+                if response_attempt == 0:
+                    logger.warning(
+                        "Empty model response; retrying request_id={} role={} turn={} "
+                        "request_attempt={} error={}",
+                        request_id,
+                        role.value,
+                        turn,
+                        request_attempt,
+                        str(error),
+                    )
+                    continue
+                logger.warning(
+                    "Agentic turn failed request_id={} role={} turn={} error_type={}",
+                    request_id,
+                    role.value,
+                    turn,
+                    type(error).__name__,
+                )
+                return AgentFailure(
+                    request_id=request_id,
+                    role=role,
+                    kind="model",
+                    message=str(error),
+                    repair_attempts=min(turn - 1, 1),
+                )
+            except Exception as error:
+                logger.warning(
+                    "Agentic turn failed request_id={} role={} turn={} error_type={}",
+                    request_id,
+                    role.value,
+                    turn,
+                    type(error).__name__,
+                )
+                return AgentFailure(
+                    request_id=request_id,
+                    role=role,
+                    kind="model",
+                    message=str(error),
+                    repair_attempts=min(turn - 1, 1),
+                )
         messages.append(assistant)
         tool_calls = assistant.get("tool_calls")
         if not tool_calls:

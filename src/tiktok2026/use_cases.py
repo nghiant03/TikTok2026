@@ -145,7 +145,7 @@ class ServiceTransitions:
     default_timeout_seconds: int = 300
     default_memory_bytes: int = 1 << 30
     default_cpus: float = 1.0
-    max_repairs: int = 2
+    max_repairs: int = 3
 
 
 def make_service_transitions(
@@ -170,7 +170,7 @@ def make_service_transitions(
     default_timeout_seconds: int = 300,
     default_memory_bytes: int = 1 << 30,
     default_cpus: float = 1.0,
-    max_repairs: int = 2,
+    max_repairs: int = 3,
 ) -> Mapping[str, Transition]:
     s = ServiceTransitions(
         agent_client=agent_client,

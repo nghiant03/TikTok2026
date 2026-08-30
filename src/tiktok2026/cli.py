@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
+from dotenv import load_dotenv
+from typer import Typer
 
 from tiktok2026.bootstrap import (
     ProductionOperations,
@@ -13,7 +15,9 @@ from tiktok2026.bootstrap import (
 from tiktok2026.contracts import OperationResult
 from tiktok2026.logging import configure_logging
 
-app = typer.Typer(no_args_is_help=True)
+load_dotenv()
+
+app = Typer(no_args_is_help=True)
 
 
 def _fail(error: Exception) -> NoReturn:

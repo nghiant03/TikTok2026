@@ -4,7 +4,7 @@ from tiktok2026.contracts import Fidelity
 from tiktok2026.policies.paths import PolicyDecision
 
 
-def can_repair(repair_attempts: int, maximum: int = 2) -> PolicyDecision:
+def can_repair(repair_attempts: int, maximum: int = 3) -> PolicyDecision:
     return PolicyDecision(
         repair_attempts < maximum, "allowed" if repair_attempts < maximum else "repair_limit"
     )

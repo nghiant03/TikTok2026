@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from tiktok2026.config import AppSettings, ExecutionSettings, ModelSettings
+from tiktok2026.config import AppSettings, BudgetSettings, ExecutionSettings, ModelSettings
 from tiktok2026.contracts import RuntimePaths
 
 
@@ -20,6 +20,16 @@ def test_model_settings_support_common_openai_endpoints() -> None:
     )
     assert settings.base_url == "https://api.openai.com/v1"
     assert settings.model == "gpt-4.1"
+
+
+def test_model_settings_reasoning_effort_defaults_none() -> None:
+    settings = ModelSettings()
+    assert settings.reasoning_effort is None
+
+
+def test_model_settings_accepts_reasoning_effort() -> None:
+    settings = ModelSettings(reasoning_effort="high")
+    assert settings.reasoning_effort == "high"
 
 
 def test_settings_reject_unknown_fields(tmp_path: Path) -> None:
@@ -58,6 +68,13 @@ def test_execution_settings_have_safe_defaults_and_validate_values() -> None:
     assert settings.cpus == 1.0
     with pytest.raises(ValidationError):
         ExecutionSettings(memory_bytes=0)
+
+
+def test_budget_allows_three_repairs() -> None:
+    assert BudgetSettings().max_repairs == 3
+    assert BudgetSettings(max_repairs=3).max_repairs == 3
+    with pytest.raises(ValidationError):
+        BudgetSettings(max_repairs=4)
 
 
 def test_development_profile_configures_execution_resources() -> None:

@@ -257,7 +257,7 @@ class ImplementationAttemptRecord(ContractModel):
     """Immutable implementor output for one bounded repair attempt."""
 
     experiment_id: str
-    repair_attempt: Annotated[int, Field(ge=0, le=2)]
+    repair_attempt: Annotated[int, Field(ge=0, le=3)]
     result: ImplementationResult
 
     @model_validator(mode="after")
@@ -582,7 +582,7 @@ class FailureRecord(ContractModel):
     experiment_id: str | None = None
     kind: FailureKind
     evidence_refs: tuple[str, ...]
-    repair_attempt: Annotated[int, Field(ge=0, le=2)]
+    repair_attempt: Annotated[int, Field(ge=0, le=3)]
     scientific_evidence: bool = False
 
 
@@ -663,6 +663,10 @@ class ExperimentExecutionContract(ContractModel):
         "predictions.json",
         "checkpoint_bundle.json",
     )
+    output_visibility: Literal["private_until_controller_validation"] = (
+        "private_until_controller_validation"
+    )
+    artifact_publication_owner: Literal["controller"] = "controller"
     separate_candidate_input: Literal[False] = False
     valid_labels_may_influence_scores: Literal[False] = False
 
@@ -814,7 +818,7 @@ class GraphStateReference(ContractModel):
     run_id: str
     phase: RunPhase
     current_experiment_id: str | None = None
-    repair_attempts: Annotated[int, Field(ge=0, le=2)] = 0
+    repair_attempts: Annotated[int, Field(ge=0, le=3)] = 0
     terminal_reason: str | None = None
 
 

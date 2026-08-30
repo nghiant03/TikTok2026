@@ -45,7 +45,7 @@ ACTION_ROUTES = {
 def route_after_failure(
     state: ProductionState,
     failure: FailureRecord,
-    max_repairs: int = 2,
+    max_repairs: int = 3,
 ) -> str:
     if (
         failure.kind in REPAIRABLE_FAILURES

@@ -69,8 +69,8 @@ def test_graph_state_contains_references_not_artifacts() -> None:
 
 
 def test_repairable_failure_routes_to_repair_until_limit() -> None:
-    assert route_after_failure(state(repair_attempts=1), repairable_failure(1)) == "repair"
-    assert route_after_failure(state(repair_attempts=2), repairable_failure(2)) == "orchestrate"
+    assert route_after_failure(state(repair_attempts=2), repairable_failure(2)) == "repair"
+    assert route_after_failure(state(repair_attempts=3), repairable_failure(3)) == "orchestrate"
 
 
 def test_repair_limit_is_configurable() -> None:
@@ -82,7 +82,7 @@ def test_repair_limit_is_configurable() -> None:
     )
     assert (
         route_after_failure(
-            state(repair_attempts=1), repairable_failure(1), max_repairs=2
+            state(repair_attempts=2), repairable_failure(2), max_repairs=3
         )
         == "repair"
     )

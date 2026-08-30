@@ -53,7 +53,7 @@ def run_training(
     data_manifest: Path,
     source_commit: FullCommitSha,
     execution_id: str,
-    data_root: Path | None = None,
+    data_root: Path,
 ) -> Path:
     if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
         raise ValueError("source_commit must be a 40-character hexadecimal commit")
@@ -158,7 +158,7 @@ def main() -> None:
     parser.add_argument("--data-manifest", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--execution-id", required=True)
-    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--data-root", type=Path, required=True)
     arguments = parser.parse_args()
     run_training(
         arguments.output_dir,

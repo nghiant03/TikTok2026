@@ -38,7 +38,7 @@ tokens = 200000
 disk_bytes = 21474836480
 reserved_final_gpu_hours = 0.25
 frontier_capacity = 4
-max_repairs = 2
+max_repairs = 3
 
 [models.orchestration]
 base_url = "https://provider.example/v1"

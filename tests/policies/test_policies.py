@@ -38,7 +38,7 @@ def test_final_reserve_cannot_fund_iteration() -> None:
 
 
 def test_repairs_and_fidelity_are_bounded() -> None:
-    assert can_repair(1).allowed
-    assert not can_repair(2).allowed
+    assert can_repair(2).allowed
+    assert not can_repair(3).allowed
     assert valid_fidelity_transition(Fidelity.SMOKE, Fidelity.PROXY).allowed
     assert not valid_fidelity_transition(Fidelity.FULL, Fidelity.SMOKE).allowed

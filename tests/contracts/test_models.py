@@ -6,8 +6,13 @@ from tiktok2026.contracts import (
     EvaluationResult,
     ExecutionResult,
     FailureKind,
+    FailureRecord,
+    GraphStateReference,
+    ImplementationAttemptRecord,
+    ImplementationResult,
     MetricValue,
     ResourceState,
+    RunPhase,
 )
 
 
@@ -19,6 +24,34 @@ def test_controller_context_exposes_the_concrete_experiment_interface() -> None:
     assert contract.separate_candidate_input is False
     assert contract.valid_labels_may_influence_scores is False
     assert contract.required_artifacts == ("predictions.json", "checkpoint_bundle.json")
+    assert contract.output_visibility == "private_until_controller_validation"
+    assert contract.artifact_publication_owner == "controller"
+
+
+def test_lifecycle_contracts_allow_three_repairs_but_not_four() -> None:
+    result = ImplementationResult(
+        experiment_id="experiment-1",
+        patch_artifact_id="patch-1",
+        changed_files=("src/tiktok2026/experiment/train.py",),
+    )
+    assert (
+        ImplementationAttemptRecord(
+            experiment_id="experiment-1", repair_attempt=3, result=result
+        ).repair_attempt
+        == 3
+    )
+    assert FailureRecord(
+        failure_id="failure-3",
+        experiment_id="experiment-1",
+        kind=FailureKind.SCHEMA_MISMATCH,
+        evidence_refs=("evidence-1",),
+        repair_attempt=3,
+    ).repair_attempt == 3
+    assert GraphStateReference(
+        run_id="run-1", phase=RunPhase.IMPLEMENT, repair_attempts=3
+    ).repair_attempts == 3
+    with pytest.raises(ValidationError):
+        GraphStateReference(run_id="run-1", phase=RunPhase.IMPLEMENT, repair_attempts=4)
 
 
 def test_validation_score_uses_equal_weight_judging_metrics() -> None:
