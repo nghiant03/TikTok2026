@@ -55,7 +55,7 @@ def test_run_synthetic_exits_zero(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0, result.output
-    output_data = json.loads(result.output)
+    output_data = json.loads(result.stdout)
     assert output_data.get("phase") == "complete"
     # Verify graph DB was created
     assert (runtime_root / "graph.sqlite3").exists()
@@ -96,7 +96,7 @@ def test_resume_on_clean_synthetic_run_succeeds(tmp_path: Path) -> None:
     assert run_result.exit_code == 0, run_result.output
 
     # Parse the run_id from the output
-    output_data = json.loads(run_result.output)
+    output_data = json.loads(run_result.stdout)
     run_id = output_data.get("run_id", "test-run")
 
     # Now resume
@@ -162,7 +162,7 @@ def test_finalize_on_synthetic_run_succeeds(tmp_path: Path) -> None:
     )
     assert run_result.exit_code == 0, run_result.output
 
-    output_data = json.loads(run_result.output)
+    output_data = json.loads(run_result.stdout)
     run_id = output_data.get("run_id", "test-run")
 
     # Finalize
@@ -180,7 +180,7 @@ def test_finalize_on_synthetic_run_succeeds(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "provisional" in result.output.lower()
+    assert "provisional" in result.stdout.lower()
 
 
 def test_finalize_rejects_nonexistent_run(tmp_path: Path) -> None:
@@ -229,7 +229,7 @@ def test_export_on_synthetic_run_succeeds(tmp_path: Path) -> None:
     )
     assert run_result.exit_code == 0, run_result.output
 
-    output_data = json.loads(run_result.output)
+    output_data = json.loads(run_result.stdout)
     run_id = output_data.get("run_id", "test-run")
 
     # Export
@@ -248,7 +248,7 @@ def test_export_on_synthetic_run_succeeds(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     # Should print paths to exported files
-    assert ".jsonl" in result.output or ".md" in result.output
+    assert ".jsonl" in result.stdout or ".md" in result.stdout
 
 
 def test_export_rejects_nonexistent_run(tmp_path: Path) -> None:

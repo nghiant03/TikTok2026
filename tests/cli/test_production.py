@@ -292,7 +292,7 @@ def test_synthetic_resume_records_accepted(tmp_path: Path) -> None:
     )
     assert run_result.exit_code == 0, run_result.output
 
-    output_data = json.loads(run_result.output)
+    output_data = json.loads(run_result.stdout)
     run_id = output_data.get("run_id", "test-run")
 
     resume_result = CliRunner().invoke(
