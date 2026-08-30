@@ -110,6 +110,11 @@ class AuthorizedTrainingView(BaseModel):
     host_root: Path
     container_root: Literal["/dataset"] = "/dataset"
     files: tuple[DatasetFile, ...]
+    row_identity_columns: tuple[str, ...] = ("row_id", "user_id", "item_id")
+    user_id_column: str = "user_id"
+    item_id_column: str = "item_id"
+    label_column: str = "label"
+    non_label_feature_columns: tuple[str, ...] = ()
 
     @property
     def container_paths(self) -> tuple[Path, ...]:
@@ -134,6 +139,11 @@ def authorized_training_view(verified: VerifiedDataset) -> AuthorizedTrainingVie
         manifest_sha256=verified.manifest_sha256,
         host_root=verified.root,
         files=files,
+        row_identity_columns=verified.manifest.row_identity_columns,
+        user_id_column=verified.manifest.user_id_column,
+        item_id_column=verified.manifest.item_id_column,
+        label_column=verified.manifest.label_column,
+        non_label_feature_columns=verified.manifest.non_label_feature_columns,
     )
 
 

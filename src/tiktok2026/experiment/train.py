@@ -12,7 +12,6 @@ from tiktok2026.benchmark.kuaireand_pure.manifest import (
     AuthorizedTrainingView,
     DatasetManifest,
     authorized_training_view,
-    canonical_manifest_sha256,
     encode_row_identity,
     load_dataset_manifest,
     verify_dataset_manifest,
@@ -53,7 +52,9 @@ def run_training(
     data_manifest: Path,
     source_commit: FullCommitSha,
     execution_id: str,
+    dataset_manifest_sha256: str,
     data_root: Path,
+    dataset_view_sha256: str | None = None,
 ) -> Path:
     if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
         raise ValueError("source_commit must be a 40-character hexadecimal commit")
@@ -66,7 +67,11 @@ def run_training(
     valid_rows = _read_rows(manifest, training_view, "valid")
     if not train_rows or not valid_rows:
         raise ValueError("training manifest must contain nonempty train and valid splits")
-    manifest_hash = canonical_manifest_sha256(manifest)
+    if not re.fullmatch(r"[0-9a-f]{64}", dataset_manifest_sha256):
+        raise ValueError("dataset_manifest_sha256 must be a lowercase SHA-256 digest")
+    if dataset_view_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", dataset_view_sha256):
+        raise ValueError("dataset_view_sha256 must be a lowercase SHA-256 digest")
+    manifest_hash = dataset_manifest_sha256
     train_label_rate = sum(int(row[manifest.label_column]) for row in train_rows) / len(train_rows)
     required = (
         set(manifest.row_identity_columns)
@@ -88,6 +93,7 @@ def run_training(
         "schema_version": "1",
         "manifest_id": manifest.manifest_id,
         "manifest_sha256": manifest_hash,
+        "dataset_view_sha256": dataset_view_sha256,
         "source_commit": source_commit,
         "execution_id": execution_id,
         "split": "valid",
@@ -144,6 +150,7 @@ def run_training(
         "prediction_artifact_id": prediction_artifact_id,
         "prediction_artifact": predictions.name,
         "prediction_sha256": prediction_sha256,
+        "dataset_view_sha256": dataset_view_sha256,
     }
     bundle = output_dir / "checkpoint_bundle.json"
     bundle.write_bytes(_canonical_json(bundle_payload))
@@ -158,6 +165,8 @@ def main() -> None:
     parser.add_argument("--data-manifest", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--execution-id", required=True)
+    parser.add_argument("--dataset-manifest-sha256", required=True)
+    parser.add_argument("--dataset-view-sha256")
     parser.add_argument("--data-root", type=Path, required=True)
     arguments = parser.parse_args()
     run_training(
@@ -167,7 +176,9 @@ def main() -> None:
         arguments.data_manifest,
         arguments.source_commit,
         arguments.execution_id,
+        arguments.dataset_manifest_sha256,
         arguments.data_root,
+        arguments.dataset_view_sha256,
     )
 
 

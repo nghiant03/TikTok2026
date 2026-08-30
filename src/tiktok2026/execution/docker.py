@@ -14,17 +14,20 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol, cast
 
 from tiktok2026.benchmark.kuaireand_pure.manifest import (
     AuthorizedTrainingView,
     DatasetFile,
     DatasetManifest,
     canonical_manifest_bytes,
+    canonical_manifest_sha256,
     encode_row_identity,
 )
 from tiktok2026.contracts import (
     ArtifactRetention,
+    DatasetViewProvenance,
+    DatasetViewRow,
     ExecutionRequest,
     ExecutionResult,
     SourceRegistration,
@@ -63,6 +66,17 @@ class FinalTestAuthorizationAdapter(Protocol):
     def authorize(self, request: ExecutionRequest, view: DatasetView) -> bool: ...
 
 
+@dataclass(frozen=True)
+class ResourceSample:
+    peak_memory_bytes: int | None
+    gpu_hours: float | None
+    gpu_status: Literal["measured", "unavailable"]
+
+
+class ResourceTelemetry(Protocol):
+    async def sample(self, container_name: str) -> ResourceSample: ...
+
+
 class ContainerLifecycle(Protocol):
     async def kill(self, name: str) -> None: ...
 
@@ -76,9 +90,11 @@ class DatasetView:
     path: Path
     manifest_id: str
     manifest_sha256: str
+    view_sha256: str
     manifest_files: tuple[str, ...]
     train_files: tuple[str, ...]
     valid_files: tuple[str, ...]
+    valid_rows: tuple[DatasetViewRow, ...] = ()
     test_files: tuple[str, ...] = ()
 
     @property
@@ -109,6 +125,8 @@ class AuthorizedTrainingDatasetProvider:
             files = tuple(self.view.files)
             if len({file.path for file in files}) != len(files):
                 raise ExecutionPolicyError("authorized training view contains duplicate files")
+            remaining = {"train": 32, "valid": 32} if request.execution_kind == "smoke" else None
+            staged_files: list[DatasetFile] = []
             for file in files:
                 if not _authorized_relative_path(file.path) or file.path == "manifest.json":
                     raise ExecutionPolicyError("authorized dataset file has an unsafe path")
@@ -126,15 +144,33 @@ class AuthorizedTrainingDatasetProvider:
                     raise ExecutionPolicyError(
                         "authorized dataset file failed checksum verification"
                     )
-                shutil.copyfile(source, destination)
-                if _sha256_file(destination) != file.sha256:
+                if remaining is None:
+                    shutil.copyfile(source, destination)
+                else:
+                    _write_bounded_csv(source, destination, remaining, file.split)
+                staged_hash = _sha256_file(destination)
+                if remaining is None and staged_hash != file.sha256:
                     raise ExecutionPolicyError("staged dataset file failed checksum verification")
+                if remaining is not None:
+                    with destination.open(newline="", encoding="utf-8") as handle:
+                        row_count = max(0, sum(1 for _ in csv.DictReader(handle)))
+                    remaining[file.split] = max(0, remaining[file.split] - row_count)
+                staged_files.append(
+                    DatasetFile.model_validate(
+                        {
+                            "path": file.path,
+                            "sha256": staged_hash,
+                            "schema": file.columns,
+                            "split": file.split,
+                        }
+                    )
+                )
                 destination.chmod(0o444)
                 for parent in destination.parents:
                     if parent == stage:
                         break
                     parent.chmod(0o755)
-            manifest = _staged_manifest(self.view, files, stage)
+            manifest = _staged_manifest(self.view, tuple(staged_files), stage)
             (stage / "manifest.json").write_bytes(canonical_manifest_bytes(manifest))
             (stage / "manifest.json").chmod(0o444)
             stage.chmod(0o755)
@@ -149,6 +185,8 @@ class AuthorizedTrainingDatasetProvider:
             manifest_files=("manifest.json",),
             train_files=train_files,
             valid_files=valid_files,
+            view_sha256=canonical_manifest_sha256(manifest),
+            valid_rows=_staged_valid_rows(self.view, tuple(staged_files), stage),
         )
 
     def cleanup(self, view: DatasetView) -> None:
@@ -157,6 +195,18 @@ class AuthorizedTrainingDatasetProvider:
             raise ExecutionPolicyError("dataset stage is not owned by this provider")
         shutil.rmtree(stage, ignore_errors=False)
         self._stages.remove(stage)
+
+    def provenance(self, request: ExecutionRequest) -> DatasetViewProvenance:
+        view = self.provide(request)
+        try:
+            return DatasetViewProvenance(
+                manifest_id=view.manifest_id,
+                manifest_sha256=view.manifest_sha256,
+                view_sha256=view.view_sha256,
+                valid_rows=view.valid_rows,
+            )
+        finally:
+            self.cleanup(view)
 
 
 class RegisteredGitSourceVerifier:
@@ -167,7 +217,9 @@ class RegisteredGitSourceVerifier:
         self.assignment = assignment
 
     def verify(self, request: ExecutionRequest) -> None:
-        registration = self.repository.get_source_registration(request.experiment_id)
+        registration = self.repository.get_source_registration_by_id(
+            request.source_registration_id
+        )
         if registration is None:
             raise ExecutionPolicyError("source registration is unavailable")
         self._verify_registration(request, registration)
@@ -190,6 +242,7 @@ class RegisteredGitSourceVerifier:
     ) -> None:
         if (
             not registration.eligible
+            or registration.registration_id != request.source_registration_id
             or registration.experiment_id != request.experiment_id
             or registration.run_id != self.assignment.run_id
             or registration.source_commit != request.source_commit
@@ -269,7 +322,7 @@ def _staged_manifest(
         split: {
             "files": paths,
             "identity_sha256": _staged_split_identity(
-                stage, tuple(path for path in paths)
+                stage, tuple(path for path in paths), view.row_identity_columns
             ),
         }
         for split, paths in split_files.items()
@@ -281,12 +334,58 @@ def _staged_manifest(
             "data_root_env": "TIKTOK2026_FIXED_DATA_ROOT",
             "files": dataset_files,
             "splits": splits,
+            "row_identity_columns": view.row_identity_columns,
+            "user_id_column": view.user_id_column,
+            "item_id_column": view.item_id_column,
+            "label_column": view.label_column,
+            "non_label_feature_columns": view.non_label_feature_columns,
         }
     )
 
 
-def _staged_split_identity(stage: Path, paths: tuple[str, ...]) -> str:
-    identity_columns = ("row_id", "user_id", "item_id")
+def _write_bounded_csv(
+    source: Path, destination: Path, remaining: dict[str, int], split: str
+) -> None:
+    with source.open(newline="", encoding="utf-8") as source_handle:
+        reader = csv.DictReader(source_handle)
+        fieldnames = tuple(reader.fieldnames or ())
+        if not fieldnames:
+            raise ExecutionPolicyError("dataset file has no schema")
+        rows: list[dict[str, str]] = []
+        for row in reader:
+            if len(rows) >= remaining[split]:
+                break
+            rows.append(row)
+    with destination.open("w", newline="", encoding="utf-8") as destination_handle:
+        writer = csv.DictWriter(destination_handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _staged_valid_rows(
+    view: AuthorizedTrainingView, files: tuple[DatasetFile, ...], stage: Path
+) -> tuple[DatasetViewRow, ...]:
+    rows: list[DatasetViewRow] = []
+    for file in files:
+        if file.split != "valid":
+            continue
+        with (stage / file.path).open(newline="", encoding="utf-8") as handle:
+            for raw in csv.DictReader(handle):
+                identity = tuple(raw[column] for column in view.row_identity_columns)
+                rows.append(
+                    DatasetViewRow(
+                        row_id=encode_row_identity(identity),
+                        row_identity=identity,
+                        user_id=raw[view.user_id_column],
+                        item_id=raw[view.item_id_column],
+                    )
+                )
+    return tuple(rows)
+
+
+def _staged_split_identity(
+    stage: Path, paths: tuple[str, ...], identity_columns: tuple[str, ...]
+) -> str:
     digest = hashlib.sha256()
     try:
         for relative in paths:
@@ -455,8 +554,14 @@ def validate_dataset_view(
     """Verify that a controller-provided view contains exactly authorized files."""
 
     dataset = _resolved_directory(view.path, "dataset view")
-    if not view.manifest_id or not _SHA256_RE.fullmatch(view.manifest_sha256):
+    if (
+        not view.manifest_id
+        or not _SHA256_RE.fullmatch(view.manifest_sha256)
+        or not _SHA256_RE.fullmatch(view.view_sha256)
+    ):
         raise ExecutionPolicyError("dataset view provenance is invalid")
+    if view.manifest_sha256 != request.dataset_manifest_sha256:
+        raise ExecutionPolicyError("dataset view does not match the requested manifest identity")
     request_dataset = _resolved_directory(request.dataset_path, "dataset request")
     if dataset == request_dataset:
         # The request path is permitted only when the controller has explicitly
@@ -537,7 +642,14 @@ def validate_execution_request(
         raise ExecutionPolicyError("command module is not allowlisted")
     for argument in request.command[3:]:
         safe_flag = argument.startswith("--") and "=" in argument
-        if argument.startswith(("--data-root=", "--data-manifest=")):
+        if argument.startswith(
+            (
+                "--data-root=",
+                "--data-manifest=",
+                "--dataset-manifest-sha256=",
+                "--dataset-view-sha256=",
+            )
+        ):
             raise ExecutionPolicyError("data root and manifest are executor-controlled")
         if (
             not argument
@@ -631,7 +743,7 @@ def build_docker_command(
         "--mount",
         f"type=bind,source={dataset},target=/dataset,readonly,bind-recursive=disabled",
         "--mount",
-        f"type=bind,source={output},target=/output,rw,bind-recursive=disabled",
+        f"type=bind,source={output},target=/output,bind-recursive=disabled",
         "--tmpfs",
         "/tmp:rw,noexec,nosuid,size=67108864",
         "--workdir",
@@ -653,8 +765,11 @@ def build_docker_command(
             *request.command[1:],
             "--data-root=/dataset",
             "--data-manifest=/dataset/manifest.json",
+            f"--dataset-manifest-sha256={request.dataset_manifest_sha256}",
         )
     )
+    if request.dataset_view_sha256 is not None:
+        command += (f"--dataset-view-sha256={request.dataset_view_sha256}",)
     return tuple(command)
 
 
@@ -730,6 +845,84 @@ class DockerContainerLifecycle:
         await _run_docker_control(("rm", "--force", name))
 
 
+class DockerResourceTelemetry:
+    """Read container memory from Docker's documented stats API."""
+
+    async def sample(self, container_name: str) -> ResourceSample:
+        process = await asyncio.create_subprocess_exec(
+            "docker",
+            "stats",
+            "--no-stream",
+            "--format",
+            "{{json .}}",
+            container_name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5.0)
+        if process.returncode != 0:
+            raise RuntimeError("Docker stats failed")
+        payload = json.loads(stdout.decode("utf-8"))
+        payload_data = cast(dict[str, object], payload) if isinstance(payload, dict) else {}
+        memory_usage = payload_data.get("MemUsage")
+        if not isinstance(memory_usage, str):
+            raise RuntimeError("Docker stats memory measurement was unavailable")
+        value = _parse_docker_bytes(memory_usage.split("/", 1)[0].strip())
+        return ResourceSample(value, None, "unavailable")
+
+
+class UnavailableResourceTelemetry:
+    """Non-blocking fallback when no authoritative telemetry adapter is injected."""
+
+    async def sample(self, container_name: str) -> ResourceSample:
+        del container_name
+        return ResourceSample(None, None, "unavailable")
+
+
+def _parse_docker_bytes(value: str) -> int:
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)", value)
+    if match is None:
+        raise ValueError("Docker stats returned an invalid memory value")
+    multiplier = {
+        "B": 1,
+        "kB": 1_000,
+        "KB": 1_000,
+        "KiB": 1 << 10,
+        "MB": 1_000_000,
+        "MiB": 1 << 20,
+        "GB": 1_000_000_000,
+        "GiB": 1 << 30,
+    }.get(match.group(2))
+    if multiplier is None:
+        raise ValueError("Docker stats returned an unknown memory unit")
+    return int(float(match.group(1)) * multiplier)
+
+
+async def monitor_resource_telemetry(
+    telemetry: ResourceTelemetry, name: str, stop: asyncio.Event
+) -> ResourceSample:
+    peak_memory: int | None = None
+    gpu_hours: float | None = None
+    gpu_status: Literal["measured", "unavailable"] = "unavailable"
+    while not stop.is_set():
+        try:
+            sample = await telemetry.sample(name)
+            if sample.peak_memory_bytes is not None:
+                peak_memory = max(peak_memory or 0, sample.peak_memory_bytes)
+            if sample.gpu_hours is not None:
+                gpu_hours = max(gpu_hours or 0.0, sample.gpu_hours)
+            if sample.gpu_status == "measured":
+                gpu_status = "measured"
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=0.1)
+        except TimeoutError:
+            continue
+    return ResourceSample(peak_memory, gpu_hours, gpu_status)
+
+
 def _directory_size(path: Path) -> int:
     total = 0
     for entry in path.rglob("*"):
@@ -770,6 +963,7 @@ class DockerExecutor:
         source_verifier: SourceIdentityVerifier | None = None,
         final_test_authorizer: FinalTestAuthorizationAdapter | None = None,
         lifecycle: ContainerLifecycle | None = None,
+        resource_telemetry: ResourceTelemetry | None = None,
     ) -> None:
         self.policy = policy
         self.publisher = publisher
@@ -777,6 +971,7 @@ class DockerExecutor:
         self.source_verifier = source_verifier
         self.final_test_authorizer = final_test_authorizer
         self.lifecycle = lifecycle or DockerContainerLifecycle()
+        self.resource_telemetry = resource_telemetry or UnavailableResourceTelemetry()
 
     def _publish(
         self, execution_id: str, kind: str, path: Path, sha256: str, size_bytes: int
@@ -845,6 +1040,9 @@ class DockerExecutor:
         cleanup_errors: list[str] = []
         monitor: asyncio.Task[bool] | None = None
         monitor_stop = asyncio.Event()
+        resource_monitor: asyncio.Task[ResourceSample] | None = None
+        resource_monitor_stop = asyncio.Event()
+        resource_sample = ResourceSample(None, None, "unavailable")
 
         async def cleanup_container() -> None:
             for operation in (self.lifecycle.kill, self.lifecycle.remove):
@@ -882,6 +1080,11 @@ class DockerExecutor:
                         self.policy.termination_grace_seconds,
                     )
                 )
+                resource_monitor = asyncio.create_task(
+                    monitor_resource_telemetry(
+                        self.resource_telemetry, name, resource_monitor_stop
+                    )
+                )
                 try:
                     await asyncio.wait_for(process.wait(), timeout=request.timeout_seconds)
                 except TimeoutError:
@@ -894,6 +1097,9 @@ class DockerExecutor:
                 finally:
                     monitor_stop.set()
                     quota_exceeded = await monitor
+                    resource_monitor_stop.set()
+                    assert resource_monitor is not None
+                    resource_sample = await resource_monitor
                     await asyncio.gather(*readers)
         except asyncio.CancelledError:
             if process is not None:
@@ -977,6 +1183,7 @@ class DockerExecutor:
             "source_commit": request.source_commit,
             "dataset_manifest_id": dataset_view.manifest_id,
             "dataset_manifest_sha256": dataset_view.manifest_sha256,
+            "dataset_view_sha256": dataset_view.view_sha256,
             "dataset_authorized_files": list(dataset_view.authorized_files),
             "container_mounts": {
                 "source": {"target": "/workspace", "read_only": True},
@@ -986,11 +1193,18 @@ class DockerExecutor:
             "memory_limit_bytes": request.memory_bytes,
             "cpu_limit": request.cpus,
             "gpu_count": request.gpu_count,
-            "resource_measurement_basis": "allocated_limits_only",
+            "resource_measurement_basis": (
+                "docker_stats" if resource_sample.peak_memory_bytes is not None else "unavailable"
+            ),
             "allocated_gpu_hours": gpu_hours,
-            "measured_gpu_hours": None,
-            "measured_peak_cpu": None,
-            "measured_peak_memory_bytes": None,
+            "measured_gpu_hours": resource_sample.gpu_hours,
+            "measured_peak_memory_bytes": resource_sample.peak_memory_bytes,
+            "memory_measurement_status": (
+                "measured" if resource_sample.peak_memory_bytes is not None else "unavailable"
+            ),
+            "gpu_telemetry_status": (
+                resource_sample.gpu_status if request.gpu_count else "not_requested"
+            ),
             "disk_limit_bytes": self.policy.disk_bytes,
             "artifact_quota_bytes": self.policy.artifact_quota_bytes,
             "artifact_output_bytes": artifact_bytes,
@@ -1027,11 +1241,30 @@ class DockerExecutor:
         return ExecutionResult(
             execution_id=request.execution_id,
             experiment_id=request.experiment_id,
+            source_registration_id=request.source_registration_id,
             source_commit=request.source_commit,
             command=request.command,
             exit_code=exit_code,
             elapsed_seconds=elapsed,
             gpu_hours=gpu_hours,
+            artifact_output_bytes=artifact_bytes,
             artifact_ids=(stdout_id, stderr_id, evidence_id),
             failure_kind=failure,
+            execution_kind=request.execution_kind,
+            dataset_manifest_id=dataset_view.manifest_id,
+            dataset_manifest_sha256=dataset_view.manifest_sha256,
+            dataset_view_sha256=dataset_view.view_sha256,
+            dataset_valid_rows=dataset_view.valid_rows,
+            measured_peak_memory_bytes=resource_sample.peak_memory_bytes,
+            memory_measurement_status=(
+                "measured" if resource_sample.peak_memory_bytes is not None else "unavailable"
+            ),
+            resource_measurement_basis=(
+                "docker_stats" if resource_sample.peak_memory_bytes is not None else "unavailable"
+            ),
+            measured_gpu_hours=resource_sample.gpu_hours,
+            gpu_telemetry_status=(
+                resource_sample.gpu_status if request.gpu_count else "not_requested"
+            ),
+            scientific_evidence=request.execution_kind != "smoke",
         )

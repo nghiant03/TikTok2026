@@ -40,6 +40,10 @@ class ExecutionSettings(BaseModel):
     timeout_seconds: int = Field(default=300, gt=0)
     memory_bytes: int = Field(default=1 << 30, gt=0)
     cpus: float = Field(default=1.0, gt=0.0)
+    gpu_count: int = Field(default=0, ge=0)
+    smoke_timeout_seconds: int = Field(default=30, gt=0)
+    smoke_memory_bytes: int = Field(default=512 * 1024 * 1024, gt=0)
+    smoke_disk_bytes: int = Field(default=64 * 1024 * 1024, gt=0)
 
 
 class AppSettings(BaseModel):

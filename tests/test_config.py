@@ -66,6 +66,7 @@ def test_execution_settings_have_safe_defaults_and_validate_values() -> None:
     assert settings.timeout_seconds == 300
     assert settings.memory_bytes == 1 << 30
     assert settings.cpus == 1.0
+    assert settings.gpu_count == 0
     with pytest.raises(ValidationError):
         ExecutionSettings(memory_bytes=0)
 
@@ -84,5 +85,6 @@ def test_development_profile_configures_execution_resources() -> None:
         overrides={"runtime_root": Path("/tmp/tiktok2026-test-runtime")},
     )
     assert settings.execution.memory_bytes == 4_294_967_296
-    assert settings.execution.timeout_seconds == 300
+    assert settings.execution.timeout_seconds == 900
     assert settings.execution.cpus == 1.0
+    assert settings.execution.gpu_count == 1

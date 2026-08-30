@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import hashlib
 import subprocess
 import sys
@@ -20,10 +21,12 @@ from tiktok2026.execution.docker import (
     DatasetView,
     DockerExecutor,
     ExecutionPolicyError,
+    ResourceSample,
     build_docker_command,
     container_name,
     git_output,
     monitor_artifact_quota,
+    monitor_resource_telemetry,
     terminate_process_group,
 )
 from tiktok2026.execution.failures import classify_failure
@@ -47,6 +50,7 @@ def request(tmp_path: Path) -> ExecutionRequest:
         image=DEFAULT_POLICY.allowed_image_digests[0],
         source_path=source,
         dataset_path=dataset,
+        dataset_manifest_sha256="a" * 64,
         output_path=output,
         timeout_seconds=60,
         memory_bytes=1_000_000,
@@ -59,6 +63,7 @@ def dataset_view(dataset: Path) -> DatasetView:
         path=dataset,
         manifest_id="manifest-1",
         manifest_sha256="a" * 64,
+        view_sha256="b" * 64,
         manifest_files=("manifest.json",),
         train_files=("train.csv",),
         valid_files=("valid.csv",),
@@ -82,6 +87,18 @@ class FakeProvider:
 class FakeVerifier:
     def verify(self, request: ExecutionRequest) -> None:
         del request
+
+
+class FakeTelemetry:
+    def __init__(self, stop: asyncio.Event) -> None:
+        self.stop = stop
+        self.samples = 0
+
+    async def sample(self, container_name: str) -> ResourceSample:
+        assert container_name
+        self.samples += 1
+        self.stop.set()
+        return ResourceSample(8 * 1024 * 1024, None, "unavailable")
 
 
 class FakePublisher:
@@ -150,14 +167,19 @@ def test_docker_command_disables_network_and_mounts_data_read_only(tmp_path: Pat
         "target=/output" in mount
         and f"source={current.output_path.resolve()}" in mount
         and "type=bind" in mount
-        and ",rw," in mount
+        and "readonly" not in mount
+        and ",rw," not in mount
         for mount in output_mounts
     )
     assert not any(item.startswith("/output") for item in command)
     env_index = command.index("--env")
     assert command[env_index + 1] == "HOME=/tmp"
     assert "PYTHONPATH=/workspace/src" in command
-    assert command[-2:] == ("--data-root=/dataset", "--data-manifest=/dataset/manifest.json")
+    assert command[-3:] == (
+        "--data-root=/dataset",
+        "--data-manifest=/dataset/manifest.json",
+        f"--dataset-manifest-sha256={current.dataset_manifest_sha256}",
+    )
     dataset_mount = command[command.index("--mount") + 1]
     assert "readonly" in dataset_mount or any(
         "dataset" in item and "readonly" in item for item in command
@@ -169,6 +191,15 @@ def test_docker_command_disables_network_and_mounts_data_read_only(tmp_path: Pat
 
 def test_cuda_oom_evidence_is_classified() -> None:
     assert classify_failure(137, "CUDA out of memory", timed_out=False) == FailureKind.CUDA_OOM
+
+
+def test_docker_command_requests_configured_gpu_count(tmp_path: Path) -> None:
+    current = request(tmp_path).model_copy(update={"gpu_count": 1})
+
+    command = build_docker_command(current, dataset_view=dataset_view(current.dataset_path))
+
+    gpu_index = command.index("--gpus")
+    assert command[gpu_index + 1] == "1"
 
 
 def test_timeout_takes_priority() -> None:
@@ -215,6 +246,28 @@ def test_alternative_data_root_is_rejected(tmp_path: Path) -> None:
         build_docker_command(invalid, dataset_view=dataset_view(current.dataset_path))
 
 
+def test_caller_cannot_override_dataset_manifest_identity(tmp_path: Path) -> None:
+    current = request(tmp_path)
+    invalid = current.model_copy(
+        update={
+            "command": (
+                "python",
+                "-m",
+                "tiktok2026.experiment.train",
+                f"--dataset-manifest-sha256={'b' * 64}",
+            )
+        }
+    )
+    with pytest.raises(ExecutionPolicyError, match="executor-controlled"):
+        build_docker_command(invalid, dataset_view=dataset_view(current.dataset_path))
+
+
+def test_dataset_view_must_match_requested_manifest_identity(tmp_path: Path) -> None:
+    current = request(tmp_path).model_copy(update={"dataset_manifest_sha256": "b" * 64})
+    with pytest.raises(ExecutionPolicyError, match="requested manifest identity"):
+        build_docker_command(current, dataset_view=dataset_view(current.dataset_path))
+
+
 def test_dataset_view_rejects_unauthorized_and_test_files(tmp_path: Path) -> None:
     current = request(tmp_path)
     (current.dataset_path / "test.csv").write_text("forbidden", encoding="utf-8")
@@ -259,6 +312,52 @@ def test_authorized_training_view_isolated_from_test_files(tmp_path: Path) -> No
         assert load_dataset_manifest(staged.path / "manifest.json").manifest_id == "manifest-1"
     finally:
         provider.cleanup(staged)
+
+
+def test_smoke_dataset_view_is_deterministic_bounded_and_excludes_test(
+    tmp_path: Path,
+) -> None:
+    current = request(tmp_path)
+    schema = ("row_id", "user_id", "item_id", "label", "feature")
+    rows = "row_id,user_id,item_id,label,feature\n" + "".join(
+        f"r{index},u{index},i{index},{index % 2},{index}.0\n" for index in range(40)
+    )
+    files: list[DatasetFile] = []
+    for filename, split in (("train.csv", "train"), ("valid.csv", "valid")):
+        path = current.dataset_path / filename
+        path.write_text(rows, encoding="utf-8")
+        files.append(
+            DatasetFile.model_validate(
+                {
+                    "path": filename,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "schema": schema,
+                    "split": split,
+                }
+            )
+        )
+    verified = AuthorizedTrainingView(
+        manifest_id="manifest-1",
+        manifest_sha256="a" * 64,
+        host_root=current.dataset_path,
+        files=tuple(files),
+        non_label_feature_columns=("feature",),
+    )
+    provider = AuthorizedTrainingDatasetProvider(verified)
+    smoke_request = current.model_copy(update={"execution_kind": "smoke"})
+    first = provider.provide(smoke_request)
+    second = provider.provide(smoke_request)
+    try:
+        assert first.manifest_sha256 == "a" * 64
+        assert first.view_sha256 == second.view_sha256
+        assert first.view_sha256 != first.manifest_sha256
+        for filename in ("train.csv", "valid.csv"):
+            with (first.path / filename).open(newline="", encoding="utf-8") as handle:
+                assert sum(1 for _ in csv.DictReader(handle)) <= 32
+        assert not (first.path / "test.csv").exists()
+    finally:
+        provider.cleanup(first)
+        provider.cleanup(second)
 
 
 def test_git_head_output_accepts_trailing_newline(tmp_path: Path) -> None:
@@ -440,6 +539,19 @@ def test_output_is_bounded_without_buffering(tmp_path: Path) -> None:
         return capture_file.size, capture_file.truncated, capture_file.text()
 
     assert asyncio.run(capture()) == (4, True, "0123")
+
+
+def test_injected_resource_telemetry_records_peak_memory_and_unknown_gpu() -> None:
+    async def sample() -> ResourceSample:
+        stop = asyncio.Event()
+        telemetry = FakeTelemetry(stop)
+        result = await monitor_resource_telemetry(telemetry, "container-1", stop)
+        return result
+
+    result = asyncio.run(sample())
+    assert result.peak_memory_bytes == 8 * 1024 * 1024
+    assert result.gpu_hours is None
+    assert result.gpu_status == "unavailable"
 
 
 def test_process_group_cleanup_terminates_process() -> None:

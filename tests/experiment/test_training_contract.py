@@ -102,6 +102,7 @@ def test_training_writes_versioned_data_driven_bundle_without_test_evaluation(
         data_manifest=manifest,
         source_commit="a" * 40,
         execution_id="exec-1",
+        dataset_manifest_sha256="b" * 64,
         data_root=data_root,
     )
     payload = json.loads(bundle.read_text(encoding="utf-8"))
@@ -110,6 +111,7 @@ def test_training_writes_versioned_data_driven_bundle_without_test_evaluation(
     assert payload["data_manifest_id"] == "fixture-v1"
     assert payload["source_commit"] == "a" * 40
     assert payload["execution_id"] == "exec-1"
+    assert predictions["manifest_sha256"] == "b" * 64
     assert predictions["rows"][0]["row_id"] == '["va1","u1","i2"]'
     assert predictions["rows"][0]["row_identity"] == ["va1", "u1", "i2"]
     assert predictions["rows"][0]["score"] == 0.9
