@@ -1,7 +1,7 @@
 import json
 from collections.abc import Sequence
 
-from pytest import MonkeyPatch
+from pytest import MonkeyPatch, raises
 
 from tiktok2026.agents.common.client import ChatTransport, OpenAICompatibleClient
 from tiktok2026.agents.research.agent import ResearchAgent
@@ -72,6 +72,52 @@ async def test_openai_compatible_client_uses_configured_endpoint(
     assert transport.requests[0][0] == "https://example.test/v1/chat/completions"
     assert transport.requests[0][1]["model"] == "gpt-4.1"
     assert transport.requests[0][2]["Authorization"] == "Bearer secret"
+
+
+async def test_openai_compatible_client_reports_empty_reasoning_response(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    transport = RecordingTransport(
+        [
+            {
+                "choices": [{"finish_reason": "stop", "message": {"content": ""}}],
+                "usage": {
+                    "completion_tokens": 8192,
+                    "completion_tokens_details": {"reasoning_tokens": 8192},
+                },
+            }
+        ]
+    )
+
+    with raises(ValueError, match="reasoning_tokens=8192"):
+        await OpenAICompatibleClient(ModelSettings(), transport).complete("system", "user")
+
+
+async def test_openai_compatible_client_selects_last_json_choice(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    transport = RecordingTransport(
+        [
+            {
+                "choices": [
+                    {"finish_reason": "stop", "message": {"content": "I will inspect."}},
+                    {"finish_reason": "stop", "message": {"content": ""}},
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": json.dumps({"message": "implemented"})},
+                    },
+                ]
+            }
+        ]
+    )
+
+    result = await OpenAICompatibleClient(ModelSettings(), transport).complete(
+        "system", "user"
+    )
+
+    assert result == {"message": "implemented"}
 
 
 async def test_research_repairs_invalid_response_once(monkeypatch: MonkeyPatch) -> None:

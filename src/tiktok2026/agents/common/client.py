@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from collections.abc import Mapping
 from typing import Protocol, cast
 
 import httpx
@@ -26,6 +28,21 @@ class HttpxChatTransport:
             value = response.json()
         if not isinstance(value, dict):
             raise ValueError("chat response must be an object")
+        value["_tiktok2026_proxy_metadata"] = {
+            name: response.headers[name]
+            for name in (
+                "x-litellm-call-id",
+                "x-litellm-response-cost-original",
+                "x-litellm-response-duration-ms",
+                "x-litellm-attempted-retries",
+                "x-litellm-attempted-fallbacks",
+                "llm_provider-x-codex-primary-used-percent",
+                "llm_provider-x-codex-secondary-used-percent",
+                "llm_provider-x-codex-primary-reset-after-seconds",
+                "llm_provider-x-codex-secondary-reset-after-seconds",
+            )
+            if name in response.headers
+        }
         return cast(dict[str, object], value)
 
 
@@ -34,7 +51,15 @@ class OpenAICompatibleClient:
         self.settings = settings
         self.transport = transport or HttpxChatTransport()
 
-    async def complete(self, system: str, user: str) -> dict[str, object]:
+    async def complete(
+        self,
+        system: str,
+        user: str,
+        *,
+        request_id: str = "unscoped",
+        role: str = "unknown",
+        attempt: int = 1,
+    ) -> dict[str, object]:
         api_key = os.environ.get(self.settings.api_key_env)
         if not api_key:
             raise RuntimeError(f"missing model credential: {self.settings.api_key_env}")
@@ -48,38 +73,111 @@ class OpenAICompatibleClient:
             "max_tokens": self.settings.max_tokens,
             "response_format": {"type": "json_object"},
         }
-        logger.info("Request started mode={} timeout={}", self.settings.model, self.settings.timeout_seconds)
+        logger.info(
+            "Model request started request_id={} role={} attempt={} model={} "
+            "timeout={} max_tokens={} system_chars={} user_chars={}",
+            request_id,
+            role,
+            attempt,
+            self.settings.model,
+            self.settings.timeout_seconds,
+            self.settings.max_tokens,
+            len(system),
+            len(user),
+        )
+        started = time.monotonic()
         response = await self.transport.post_json(
             f"{self.settings.base_url.rstrip('/')}/chat/completions",
             payload,
             {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             self.settings.timeout_seconds,
         )
-        logger.debug(
-            "Response received choices_present={}",
-            bool(response.get("choices")),
-        )
+        elapsed_seconds = time.monotonic() - started
         choices_value = response.get("choices")
         if not isinstance(choices_value, list) or not choices_value:
             raise ValueError("chat response has no choices")
         choices = cast(list[object], choices_value)
-        choice_value = choices[0]
-        if not isinstance(choice_value, dict):
-            raise ValueError("chat response has no choice object")
-        choice = cast(dict[str, object], choice_value)
-        message_value = choice.get("message")
-        if not isinstance(message_value, dict):
-            raise ValueError("chat response has no message")
-        message = cast(dict[str, object], message_value)
-        content = message.get("content")
-        if not isinstance(content, str):
-            raise ValueError("chat response content must be text")
-        logger.debug(
-            "Model response finish_reason={} content_length={}",
-            choice.get("finish_reason"),
-            len(content),
+        usage = response.get("usage")
+        usage_details: Mapping[str, object] = (
+            cast(dict[str, object], usage) if isinstance(usage, dict) else {}
         )
-        parsed: object = json.loads(content)
-        if not isinstance(parsed, dict):
-            raise ValueError("structured response must be an object")
-        return cast(dict[str, object], parsed)
+        completion_details = usage_details.get("completion_tokens_details")
+        token_details: Mapping[str, object] = (
+            cast(dict[str, object], completion_details)
+            if isinstance(completion_details, dict)
+            else {}
+        )
+        choice_summaries: list[str] = []
+        selected_index: int | None = None
+        parsed: dict[str, object] | None = None
+        for index, choice_value in reversed(tuple(enumerate(choices))):
+            if not isinstance(choice_value, dict):
+                choice_summaries.append(f"{index}:invalid-choice")
+                continue
+            choice = cast(dict[str, object], choice_value)
+            message_value = choice.get("message")
+            if not isinstance(message_value, dict):
+                choice_summaries.append(f"{index}:missing-message")
+                continue
+            content = cast(dict[str, object], message_value).get("content")
+            content_length = len(content) if isinstance(content, str) else -1
+            choice_summaries.append(
+                f"{index}:{choice.get('finish_reason')}:{content_length}"
+            )
+            if not isinstance(content, str) or not content:
+                continue
+            try:
+                candidate = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                selected_index = index
+                parsed = cast(dict[str, object], candidate)
+                break
+        metadata_value = response.get("_tiktok2026_proxy_metadata")
+        metadata: Mapping[str, object] = (
+            cast(dict[str, object], metadata_value)
+            if isinstance(metadata_value, dict)
+            else {}
+        )
+        logger.info(
+            "Model response request_id={} role={} attempt={} response_id={} "
+            "model={} elapsed_seconds={:.3f} choices={} selected_choice={} "
+            "prompt_tokens={} completion_tokens={} reasoning_tokens={} cost={} "
+            "proxy_retries={} proxy_fallbacks={} quota_primary_percent={} "
+            "quota_secondary_percent={} quota_primary_reset_seconds={} "
+            "quota_secondary_reset_seconds={}",
+            request_id,
+            role,
+            attempt,
+            response.get("id"),
+            response.get("model", self.settings.model),
+            elapsed_seconds,
+            len(choices),
+            selected_index,
+            usage_details.get("prompt_tokens"),
+            usage_details.get("completion_tokens"),
+            token_details.get("reasoning_tokens"),
+            metadata.get("x-litellm-response-cost-original"),
+            metadata.get("x-litellm-attempted-retries"),
+            metadata.get("x-litellm-attempted-fallbacks"),
+            metadata.get("llm_provider-x-codex-primary-used-percent"),
+            metadata.get("llm_provider-x-codex-secondary-used-percent"),
+            metadata.get("llm_provider-x-codex-primary-reset-after-seconds"),
+            metadata.get("llm_provider-x-codex-secondary-reset-after-seconds"),
+        )
+        logger.debug(
+            "Model choice summary request_id={} role={} attempt={} choices={}",
+            request_id,
+            role,
+            attempt,
+            tuple(reversed(choice_summaries)),
+        )
+        if parsed is None:
+            raise ValueError(
+                "chat response contains no JSON object choice "
+                f"(choices={tuple(reversed(choice_summaries))}, "
+                f"completion_tokens={usage_details.get('completion_tokens')}, "
+                f"reasoning_tokens={token_details.get('reasoning_tokens')})"
+            )
+        return parsed
