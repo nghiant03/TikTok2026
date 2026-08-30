@@ -16,6 +16,7 @@ from tiktok2026.contracts import (
     ArtifactRetention,
     AuditEvent,
     BaselineCalibrationRecord,
+    BlockerResolution,
     ContractModel,
     DatasetManifestIdentity,
     EvaluationResult,
@@ -43,11 +44,14 @@ from tiktok2026.contracts import (
     RunRecord,
     ScopedRepository,
     SourceRegistration,
+    ValidationBlocker,
+    ValidationOperationIdentity,
     ValidationReport,
     ValidationRequest,
     ValidationStage,
     ValidationVerdict,
     WorktreeAssignment,
+    validation_blocker_id,
 )
 from tiktok2026.observability.exports import export_records
 from tiktok2026.persistence.repositories import ApplicationRepository
@@ -99,21 +103,20 @@ _WRITE_FILE_TOOL = _tool(
 
 _RUN_CHECK_TOOL = _tool(
     "run_check",
-    "Run a command in the worktree (e.g. python -c 'import ...'). Returns stdout. "
-    "Fails on non-zero exit or timeout.",
+    "Run one controller-owned, non-mutating implementation check.",
     {
-        "command": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Command and arguments as a list",
-        },
-        "timeout_seconds": {
-            "type": "integer",
-            "description": "Timeout in seconds (default 30)",
-            "default": 30,
+        "check": {
+            "type": "string",
+            "enum": [
+                "compile_entrypoint",
+                "import_entrypoint",
+                "ruff_entrypoint",
+                "pyright_entrypoint",
+                "diff_check",
+            ],
         },
     },
-    ("command",),
+    ("check",),
 )
 
 _VALIDATOR_CHECK_TOOL = _tool(
@@ -145,9 +148,9 @@ _DIFF_TOOL = _tool(
 )
 
 
-def _validator_check_commands() -> dict[str, tuple[str, ...]]:
+def _implementation_check_commands() -> dict[str, tuple[str, ...]]:
     entrypoint = "src/tiktok2026/experiment/train.py"
-    return {
+    commands: dict[str, tuple[str, ...]] = {
         "compile_entrypoint": (
             "python",
             "-c",
@@ -165,6 +168,17 @@ def _validator_check_commands() -> dict[str, tuple[str, ...]]:
         "ruff_entrypoint": ("ruff", "check", entrypoint),
         "pyright_entrypoint": ("pyright", entrypoint),
     }
+    commands["diff_check"] = ("git", "diff", "--check", "--", entrypoint)
+    return commands
+
+
+IMPLEMENTOR_CHECK_NAMES = tuple(_implementation_check_commands())
+
+
+def _validator_check_commands() -> dict[str, tuple[str, ...]]:
+    commands = _implementation_check_commands()
+    commands.pop("diff_check")
+    return commands
 
 
 def _submit_tool(model_type: type[ContractModel]) -> dict[str, object]:
@@ -390,6 +404,7 @@ class RoleSpecificAgentClient:
                 repair_attempts=0,
             )
         tools = _implementor_tools()
+        check_commands = _implementation_check_commands()
 
         def _handle(tool_name: str, arguments: dict[str, object]) -> str:
             if tool_name == "read_file":
@@ -402,13 +417,11 @@ class RoleSpecificAgentClient:
                 repository.write(path, content)
                 return f"written: {path}"
             if tool_name == "run_check":
-                command_raw = arguments.get("command", [])
-                timeout = int(str(arguments.get("timeout_seconds", "30")))
-                if isinstance(command_raw, list):
-                    command = tuple(str(c) for c in cast(list[object], command_raw))
-                else:
-                    command = (str(command_raw),)
-                return repository.run_check(command, timeout)
+                check = str(arguments.get("check", ""))
+                command = check_commands.get(check)
+                if command is None:
+                    raise ValueError(f"unsupported implementor check: {check}")
+                return repository.run_check(command, 30)
             if tool_name == "diff":
                 return repository.diff()
             return f"error: unknown tool {tool_name!r}"
@@ -422,6 +435,7 @@ class RoleSpecificAgentClient:
             request.model_dump(mode="json"),
             tools,
             _handle,
+            max_turns=32,
             terminal_tool="submit_result",
         )
         if isinstance(result, AgentFailure):
@@ -437,13 +451,24 @@ class RoleSpecificAgentClient:
                 message="implementor produced no real diff",
                 repair_attempts=0,
             )
+        for check in IMPLEMENTOR_CHECK_NAMES:
+            try:
+                repository.run_check(check_commands[check], 30)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                return AgentFailure(
+                    request_id=request_id,
+                    role=AgentRole.IMPLEMENTOR,
+                    kind="policy",
+                    message=f"controller-owned check failed: {check}: {error}",
+                    repair_attempts=0,
+                )
         return ImplementationResult(
             experiment_id=result.experiment_id,
             patch_artifact_id=result.patch_artifact_id,
             changed_files=tuple(changed_files),
             edits=result.edits,
             changed_symbols=result.changed_symbols,
-            checks=result.checks,
+            checks=IMPLEMENTOR_CHECK_NAMES,
             assumptions=result.assumptions,
             unresolved_issues=result.unresolved_issues,
         )
@@ -505,7 +530,18 @@ class RoleSpecificAgentClient:
         if not failed_checks or not isinstance(result, ValidationReport):
             return result
         blockers = result.blockers + tuple(
-            f"controller-owned check failed: {check}: {check_results[check]}"
+            ValidationBlocker(
+                blocker_id=validation_blocker_id(
+                    request_id,
+                    result.stage,
+                    f"controller-owned check failed: {check}: {check_results[check]}",
+                ),
+                experiment_id=result.experiment_id,
+                stage=result.stage,
+                text=f"controller-owned check failed: {check}: {check_results[check]}",
+                report_id=result.report_id,
+                evidence_refs=(f"controller-check-{check}",),
+            )
             for check in failed_checks
         )
         verdict = (
@@ -752,6 +788,11 @@ class RepositoryRunStore:
     def get_source_registration(self, experiment_id: str) -> SourceRegistration | None:
         return self._repo.get_source_registration(experiment_id)
 
+    def get_source_registration_by_id(
+        self, registration_id: str
+    ) -> SourceRegistration | None:
+        return self._repo.get_source_registration_by_id(registration_id)
+
     def persist_provisional_finalization(self, request: ContractModel) -> FinalizationRecord:
         from tiktok2026.contracts import ProvisionalFinalizationRequest
 
@@ -780,6 +821,68 @@ class RepositoryRunStore:
                 separators=(",", ":"),
             ),
         )
+
+    def put_validation_report(
+        self,
+        report: ValidationReport,
+        run_id: str,
+        operation: ValidationOperationIdentity,
+        subject: dict[str, object],
+    ) -> None:
+        self._repo.put_validation_report(report, run_id, operation, subject)
+
+    def get_validation_report(self, report_id: str) -> ValidationReport | None:
+        return self._repo.get_validation_report(report_id)
+
+    def get_validation_report_by_operation(
+        self, operation_id: str
+    ) -> ValidationReport | None:
+        return self._repo.get_validation_report_by_operation(operation_id)
+
+    def get_validation_report_for_attempt(
+        self, run_id: str, experiment_id: str, stage: ValidationStage, repair_attempt: int
+    ) -> ValidationReport | None:
+        return self._repo.get_validation_report_for_attempt(
+            run_id, experiment_id, stage, repair_attempt
+        )
+
+    def get_validation_operation(
+        self, operation_id: str
+    ) -> ValidationOperationIdentity | None:
+        return self._repo.get_validation_operation(operation_id)
+
+    def list_validation_reports(
+        self, experiment_id: str | None = None
+    ) -> tuple[ValidationReport, ...]:
+        return self._repo.list_validation_reports(experiment_id)
+
+    def list_validation_blockers(
+        self, experiment_id: str | None = None
+    ) -> tuple[ValidationBlocker, ...]:
+        return self._repo.list_validation_blockers(experiment_id)
+
+    def get_validation_blocker(self, blocker_id: str) -> ValidationBlocker | None:
+        return self._repo.get_validation_blocker(blocker_id)
+
+    def put_blocker_resolution(self, resolution: BlockerResolution, run_id: str) -> None:
+        self._repo.put_blocker_resolution(resolution, run_id)
+
+    def list_blocker_resolutions(
+        self, experiment_id: str | None = None
+    ) -> tuple[BlockerResolution, ...]:
+        return self._repo.list_blocker_resolutions(experiment_id)
+
+    def get_blocker_resolution(self, resolution_id: str) -> BlockerResolution | None:
+        return self._repo.get_blocker_resolution(resolution_id)
+
+    def get_unresolved_blockers(self, experiment_id: str) -> tuple[ValidationBlocker, ...]:
+        return self._repo.get_unresolved_blockers(experiment_id)
+
+    def get_unresolved_blocker_ids(self, experiment_id: str) -> tuple[str, ...]:
+        return self._repo.get_unresolved_blocker_ids(experiment_id)
+
+    def list_unresolved_blockers(self, experiment_id: str) -> tuple[ValidationBlocker, ...]:
+        return self._repo.list_unresolved_blockers(experiment_id)
 
     def put_failure(self, record: FailureRecord, run_id: str) -> None:
         payload = record.model_dump_json()

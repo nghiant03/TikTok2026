@@ -1,12 +1,17 @@
 import json
+import subprocess
 from pathlib import Path
 
 from pytest import MonkeyPatch
 
+import tiktok2026.adapters as adapters
 from tests.agents.test_agents import RecordingTransport
-from tiktok2026.adapters import RoleSpecificAgentClient
+from tiktok2026.adapters import (
+    IMPLEMENTOR_CHECK_NAMES,
+    RoleSpecificAgentClient,
+    ScopedWorktreeRepository,
+)
 from tiktok2026.agents.common.client import OpenAICompatibleClient
-from tiktok2026.agents.implementor.agent import ImplementorAgent
 from tiktok2026.agents.orchestration.agent import OrchestrationAgent
 from tiktok2026.agents.validator.agent import ValidatorAgent
 from tiktok2026.config import ModelSettings
@@ -19,6 +24,7 @@ from tiktok2026.contracts import (
     ImplementationEdit,
     ImplementationRequest,
     ImplementationResult,
+    ImplementationSubmission,
     OrchestrationDecision,
     OrchestrationRequest,
     ResearchDecision,
@@ -231,21 +237,6 @@ async def test_proposal_request_repairs_evidence_request(monkeypatch: MonkeyPatc
     assert len(transport.requests) == 2
 
 
-async def test_implementor_cannot_write_protected_path(monkeypatch: MonkeyPatch) -> None:
-    payload = ImplementationResult(
-        experiment_id="exp-1",
-        patch_artifact_id="patch-1",
-        changed_files=("baseline/data.py",),
-    ).model_dump(mode="json")
-    repository = ScopedRepository()
-    result = await ImplementorAgent(client(monkeypatch, payload), repository).invoke(
-        "request-1", "exp-1", ("src/tiktok2026/experiment",)
-    )
-    assert isinstance(result, AgentFailure)
-    assert result.role == AgentRole.IMPLEMENTOR
-    assert not repository.writes
-
-
 async def test_production_implementor_repairs_empty_edits(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     invalid = ImplementationResult(
@@ -301,6 +292,157 @@ async def test_production_implementor_repairs_empty_edits(monkeypatch: MonkeyPat
     assert isinstance(result, ImplementationResult)
     assert result.changed_files == ("src/tiktok2026/experiment/model.py",)
     assert len(transport.requests) == 2
+
+
+def _git_repo_with_entrypoint(tmp_path: Path) -> Path:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(("git", "init", "-q"), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "config", "user.email", "test@example.invalid"),
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(("git", "config", "user.name", "test"), cwd=repository, check=True)
+    package = repository / "src/tiktok2026/experiment"
+    package.mkdir(parents=True)
+    (repository / "src/tiktok2026/__init__.py").write_text("\n", encoding="utf-8")
+    (package / "__init__.py").write_text("\n", encoding="utf-8")
+    (package / "train.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(("git", "add", "."), cwd=repository, check=True)
+    subprocess.run(("git", "commit", "-qm", "base"), cwd=repository, check=True)
+    return repository
+
+
+def _implementation_request() -> ImplementationRequest:
+    spec = ExperimentSpec(
+        experiment_id="exp-1",
+        hypothesis_id="hyp-1",
+        hypothesis="hypothesis",
+        mechanism="mechanism",
+        motivation="motivation",
+        expected_signal="signal",
+        implementation_scope=("src/tiktok2026/experiment",),
+        fidelity=Fidelity.SMOKE,
+        success_criteria="success",
+        failure_criteria="failure",
+    )
+    return ImplementationRequest(
+        request_id="request-1",
+        experiment_id="exp-1",
+        experiment_spec=spec,
+        allowed_scopes=spec.implementation_scope,
+    )
+
+
+async def test_agentic_implementor_runs_all_controller_checks(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    repository = _git_repo_with_entrypoint(tmp_path)
+    calls: list[tuple[tuple[str, ...], int]] = []
+
+    async def fake_invoke_agentic(*args: object, **kwargs: object) -> ImplementationSubmission:
+        handler = args[7]
+        assert callable(handler)
+        handler(
+            "write_file",
+            {"path": "src/tiktok2026/experiment/train.py", "content": "VALUE = 2\n"},
+        )  # type: ignore[operator]
+        return ImplementationSubmission(
+            experiment_id="exp-1",
+            patch_artifact_id="patch-1",
+            changed_files=("src/tiktok2026/experiment/train.py",),
+            edits=(
+                ImplementationEdit(
+                    relative_path="src/tiktok2026/experiment/train.py", content="VALUE = 2\n"
+                ),
+            ),
+            checks=("model-claimed-check",),
+        )
+
+    def run_check(
+        _repository: ScopedWorktreeRepository,
+        command: tuple[str, ...],
+        timeout_seconds: int,
+    ) -> str:
+        calls.append((command, timeout_seconds))
+        return "passed"
+
+    monkeypatch.setattr(adapters, "invoke_agentic", fake_invoke_agentic)
+    monkeypatch.setattr(ScopedWorktreeRepository, "run_check", run_check)
+    agent = RoleSpecificAgentClient(
+        client(monkeypatch, {}),
+        AgentRole.IMPLEMENTOR,
+        "implement",
+        scoped_repository=ScopedWorktreeRepository(
+            repository, ("src/tiktok2026/experiment",)
+        ),
+    )
+
+    result = await agent.invoke(_implementation_request())
+
+    assert isinstance(result, ImplementationResult)
+    assert len(calls) == len(IMPLEMENTOR_CHECK_NAMES)
+    assert all(command for command, _ in calls)
+    assert [timeout for _, timeout in calls] == [30] * len(IMPLEMENTOR_CHECK_NAMES)
+    assert result.checks == IMPLEMENTOR_CHECK_NAMES
+
+
+async def test_agentic_implementor_check_failure_blocks_submission(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    repository = _git_repo_with_entrypoint(tmp_path)
+    failed_check = "ruff_entrypoint"
+    calls: list[str] = []
+
+    async def fake_invoke_agentic(*args: object, **kwargs: object) -> ImplementationSubmission:
+        handler = args[7]
+        assert callable(handler)
+        handler(
+            "write_file",
+            {"path": "src/tiktok2026/experiment/train.py", "content": "VALUE = 2\n"},
+        )  # type: ignore[operator]
+        return ImplementationSubmission(
+            experiment_id="exp-1",
+            patch_artifact_id="patch-1",
+            changed_files=("src/tiktok2026/experiment/train.py",),
+            edits=(
+                ImplementationEdit(
+                    relative_path="src/tiktok2026/experiment/train.py", content="VALUE = 2\n"
+                ),
+            ),
+            checks=IMPLEMENTOR_CHECK_NAMES,
+        )
+
+    def run_check(
+        _repository: ScopedWorktreeRepository,
+        command: tuple[str, ...],
+        timeout_seconds: int,
+    ) -> str:
+        del timeout_seconds
+        check = IMPLEMENTOR_CHECK_NAMES[len(calls)]
+        calls.append(check)
+        if check == failed_check:
+            raise ValueError("synthetic check failure")
+        return "passed"
+
+    monkeypatch.setattr(adapters, "invoke_agentic", fake_invoke_agentic)
+    monkeypatch.setattr(ScopedWorktreeRepository, "run_check", run_check)
+    agent = RoleSpecificAgentClient(
+        client(monkeypatch, {}),
+        AgentRole.IMPLEMENTOR,
+        "implement",
+        scoped_repository=ScopedWorktreeRepository(
+            repository, ("src/tiktok2026/experiment",)
+        ),
+    )
+
+    result = await agent.invoke(_implementation_request())
+
+    assert isinstance(result, AgentFailure)
+    assert result.role == AgentRole.IMPLEMENTOR
+    assert failed_check in result.message
+    assert calls == list(IMPLEMENTOR_CHECK_NAMES[:3])
 
 
 async def test_validator_returns_read_only_report(monkeypatch: MonkeyPatch) -> None:

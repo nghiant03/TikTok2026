@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 from collections.abc import Sequence
@@ -20,6 +21,7 @@ from tiktok2026.contracts import (
     ResearchDecision,
     ResearchRequest,
     ResourceState,
+    ValidationOperationIdentity,
     ValidationReport,
     ValidationRequest,
     ValidationStage,
@@ -40,6 +42,20 @@ class RecordingTransport(ChatTransport):
         if isinstance(response, Exception):
             raise response
         return response
+
+
+def _validation_operation(stage: ValidationStage) -> ValidationOperationIdentity:
+    return ValidationOperationIdentity(
+        operation_id="validation-operation-test",
+        run_id="run-1",
+        experiment_id="exp-1",
+        stage=stage,
+        repair_attempt=0,
+        subject_sha256=hashlib.sha256(b"{}").hexdigest(),
+        implementation_diff_sha256="a" * 64
+        if stage == ValidationStage.IMPLEMENTATION
+        else None,
+    )
 
 
 class Reader:
@@ -364,6 +380,35 @@ async def test_agentic_loop_turn_limit(monkeypatch: MonkeyPatch) -> None:
     assert result.repair_attempts == 1
 
 
+async def test_agentic_loop_can_submit_after_twenty_tool_turns(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+
+    transport = RecordingTransport(
+        [
+            *[_tool_calls_response("run_check", {}) for _ in range(20)],
+            _tool_calls_response("submit_result", {"message": "done"}),
+        ]
+    )
+    result = await invoke_agentic(
+        OpenAICompatibleClient(ModelSettings(), transport),
+        AgentRole.IMPLEMENTOR,
+        "test-long-implementation",
+        _FakeResult,
+        "system prompt",
+        {},
+        [],
+        lambda _name, _arguments: "ok",
+        max_turns=32,
+        terminal_tool="submit_result",
+    )
+
+    assert isinstance(result, _FakeResult)
+    assert result.message == "done"
+    assert len(transport.requests) == 21
+
+
 async def test_agentic_loop_model_error(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     transport = RecordingTransport([{"choices": []}, {"choices": []}])
@@ -567,6 +612,7 @@ async def test_validator_agentic_tools_are_read_only_and_can_run_checks(
             request_id="validation-1",
             experiment_id="exp-1",
             stage=ValidationStage.IMPLEMENTATION,
+            validation_operation=_validation_operation(ValidationStage.IMPLEMENTATION),
             subject={},
         )
     )
@@ -610,6 +656,7 @@ async def test_validator_cannot_approve_failed_controller_checks(
             request_id="validation-1",
             experiment_id="exp-1",
             stage=ValidationStage.IMPLEMENTATION,
+            validation_operation=_validation_operation(ValidationStage.IMPLEMENTATION),
             subject={},
         )
     )
@@ -644,6 +691,7 @@ async def test_bound_validator_uses_single_shot_path_outside_implementation(
             request_id="proposal-validation",
             experiment_id="exp-1",
             stage=ValidationStage.PROPOSAL,
+            validation_operation=_validation_operation(ValidationStage.PROPOSAL),
             subject={},
         )
     )

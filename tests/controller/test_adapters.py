@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from tiktok2026.adapters import (
+    IMPLEMENTOR_CHECK_NAMES,
     DeterministicPolicyGate,
     RepositoryRunStore,
     ScopedWorktreeRepository,
@@ -237,6 +238,16 @@ def test_scoped_implementor_prevalidates_all_edits(tmp_path: Path) -> None:
     assert not allowed.exists()
 
 
+def test_implementor_checks_are_controller_owned_names() -> None:
+    assert IMPLEMENTOR_CHECK_NAMES == (
+        "compile_entrypoint",
+        "import_entrypoint",
+        "ruff_entrypoint",
+        "pyright_entrypoint",
+        "diff_check",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 4: Synthetic end-to-end persists real audit, evaluation, resource, exports
 # ---------------------------------------------------------------------------
@@ -394,6 +405,7 @@ async def test_run_bound_executor_classifies_missing_output_contract(
         image="tiktok2026:test@sha256:" + "0" * 64,
         source_path=source,
         dataset_path=dataset,
+        dataset_manifest_sha256="a" * 64,
         output_path=output,
         timeout_seconds=60,
         memory_bytes=1 << 20,
@@ -409,6 +421,7 @@ async def test_run_bound_executor_classifies_missing_output_contract(
 
     assert result.exit_code == 1
     assert result.failure_kind == FailureKind.MISSING_PATH
+    assert result.failure_message == "execution did not produce prediction and checkpoint artifacts"
 
 
 # ---------------------------------------------------------------------------

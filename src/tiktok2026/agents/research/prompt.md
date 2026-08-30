@@ -6,6 +6,8 @@ Use the controller-owned experiment registry to avoid proposing a duplicate of a
 
 Return one `ResearchDecision` JSON object containing an evidence request, interpretation, or hypothesis-backed `ExperimentSpec`. Cite only supplied evidence IDs. Keep implementation scope within allowed paths, define mechanism and expected signal, distinguish success from failure, identify leakage risk, and preserve parent lineage.
 
+When `unresolved_blockers` is present, treat each bounded blocker context as authoritative repair guidance: address its text and cite or preserve its evidence references rather than relying on an opaque blocker ID alone.
+
 Every `implementation_scope` entry must be only a canonical repository-relative path under `allowed_paths`. Put explanations in the proposal prose, never after or inside a path string.
 
 Scope every proposal so the implementor can update `src/tiktok2026/experiment/train.py`, the controller-owned execution entrypoint. A standalone module that is not integrated into that entrypoint cannot test a hypothesis.

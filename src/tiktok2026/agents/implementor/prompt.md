@@ -7,7 +7,7 @@ You are in a multi-turn tool-use conversation. Use the provided tools to read, w
 Available tools:
 - `read_file(path, max_characters)` — read a file from the worktree.
 - `write_file(path, content)` — write a file in the worktree. The path must be within the allowed scope.
-- `run_check(command, timeout_seconds)` — run a command (e.g. `["python", "-c", "import tiktok2026.experiment.train"]`). Returns stdout; raises on failure.
+- `run_check(check)` — run one controller-owned check selected from `compile_entrypoint`, `import_entrypoint`, `ruff_entrypoint`, `pyright_entrypoint`, and `diff_check`. Returns output; raises on failure. Arbitrary commands and arguments are unavailable.
 - `diff()` — return the current git diff of all changes.
 - `submit_result(...)` — call this when done, with the final result fields matching the response schema.
 
@@ -15,11 +15,17 @@ On a repair attempt, address `repair_feedback` directly. Every write path must e
 
 The controller executes only `execution_entrypoint`. The returned result must include every `required_changed_paths` entry and wire the proposed mechanism into that entrypoint; a standalone unused module does not implement the experiment. `source_context` is the current editable state. When present, `base_source_context` is the authoritative committed interface; when omitted, the current source is unchanged from that base. Preserve the base entrypoint's controller-owned CLI, manifest, output, and provenance contracts, including required `--data-root`, while integrating the mechanism; never invent an alternate stdin, path, candidate-set, or output protocol. Write both required artifacts into the private execution output directory before returning success. The controller owns validation, publication, and registration of that artifact set; do not add cross-file publication transactions or rollback machinery to experiment code.
 
+Treat `execution_timeout_seconds`, `execution_memory_bytes`, `execution_cpus`, and `execution_gpu_count` as the authoritative execution envelope. Before implementing, estimate the dominant time and memory complexity at full fidelity. Avoid repeated full-dataset scans, nested scans across high-cardinality collections, per-row tensor or array operations, and duplicate serialization or validation passes. Build sufficient statistics in one pass and use indexed lookups, vectorized or batched operations, or sort-and-segment reductions through dependencies already available in the base runtime. When `execution_gpu_count` is positive and the approved runtime exposes an accelerator-capable array library, use the GPU for substantial numeric batches only when transfer overhead is justified; retain an efficient CPU path for parsing, identifiers, sparse bookkeeping, and environments with zero GPUs. A reserved GPU does not make ordinary Python loops faster.
+
+Keep artifact validation linear or near-linear in input plus output size. Validate invariants while constructing indexed aggregates where possible instead of recomputing them with nested scans. Run a representative smoke check that exercises the full pipeline and report any full-fidelity scaling risk in `unresolved_issues`.
+
 Before calling `submit_result`, always:
 1. Run compile and import checks for `src/tiktok2026/experiment/train.py`.
 2. Run `ruff check src/tiktok2026/experiment/train.py` and `pyright src/tiktok2026/experiment/train.py`; fix every reported issue.
 3. Review the full diff: `diff()`.
 4. Confirm every requirement from the experiment specification's `mechanism` is implemented.
 5. Confirm every requirement from the experiment specification's `failure_criteria` is addressed.
+
+Conserve the finite tool-turn budget. Do not repeat a passing check unless a later write could invalidate it, combine independent checks in one turn when possible, and call `submit_result` immediately after the final required checks and diff review pass.
 
 Never modify protected baseline files, unrelated infrastructure, dataset inputs, or runtime state. Never commit, invoke Docker, evaluate metrics, access test labels, persist records, install unapproved dependencies, or add external training assets.
