@@ -89,6 +89,37 @@ def test_consume_and_reconcile_account_actual_usage(tmp_path: Path) -> None:
     )
 
 
+def test_new_run_reclaims_interrupted_reservation(tmp_path: Path) -> None:
+    ledger = ResourceLedger(tmp_path / "resources.sqlite3", state())
+    ledger.claim_run("run-1")
+    assert ledger.reserve(
+        ResourceReservation(
+            reservation_id="stale-reservation",
+            run_id="run-1",
+            gpu_hours=0.5,
+            wall_seconds=10.0,
+            tokens=10,
+            disk_bytes=100,
+        )
+    )
+
+    ledger.claim_run("run-2")
+
+    assert ledger.state() == state()
+    assert ledger.reserve(
+        ResourceReservation(
+            reservation_id="new-reservation",
+            run_id="run-2",
+            gpu_hours=0.5,
+            wall_seconds=10.0,
+            tokens=10,
+            disk_bytes=100,
+        )
+    )
+    assert ledger.release_run("run-2")
+    assert ledger.state() == state()
+
+
 def test_legacy_resource_ledger_schema_is_migrated(tmp_path: Path) -> None:
     database = tmp_path / "legacy-resources.sqlite3"
     legacy_payload = json.dumps(

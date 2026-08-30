@@ -9,6 +9,7 @@ from tiktok2026.contracts import (
     ArtifactRetention,
     AuditEvent,
     EvaluatorIdentity,
+    ExperimentRegistryEntry,
     ExperimentSpec,
     Fidelity,
     FinalTestAuthorizationRequest,
@@ -89,6 +90,36 @@ def test_experiment_write_is_idempotent(tmp_path: Path) -> None:
         expected_predecessor=None,
     )
     assert repository.get_experiment("exp-1") == spec()
+
+
+def test_experiment_registry_source_is_bounded_and_reports_total(tmp_path: Path) -> None:
+    repository = ApplicationRepository(tmp_path / "app.sqlite3")
+    repository.initialize()
+    repository.put_run(
+        RunRecord(run_id="run-1", status="running"),
+        transition_id="run-running",
+        expected_predecessor=None,
+    )
+    repository.put_experiment(
+        spec(),
+        "proposed",
+        "run-1",
+        "experiment-proposed",
+        expected_predecessor=None,
+    )
+
+    entries, total = repository.list_experiments(limit=1)
+
+    assert total == 1
+    assert entries == (
+        ExperimentRegistryEntry(
+            experiment_id="exp-1",
+            hypothesis_id="hyp-1",
+            hypothesis="A deterministic test",
+            mechanism="Exercise persistence",
+            status="proposed",
+        ),
+    )
 
 
 def test_audit_event_round_trips(tmp_path: Path) -> None:

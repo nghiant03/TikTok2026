@@ -191,6 +191,51 @@ def test_scoped_implementor_capability_applies_real_bounded_diff(tmp_path: Path)
         ScopedWorktreeRepository(repository, ("baseline",)).write("baseline/data.py", "blocked")
 
 
+def test_scoped_implementor_reads_current_and_committed_base_source(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(("git", "init", "-q"), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "config", "user.email", "test@example.invalid"), cwd=repository, check=True
+    )
+    subprocess.run(("git", "config", "user.name", "test"), cwd=repository, check=True)
+    target = repository / "src/tiktok2026/experiment"
+    target.mkdir(parents=True)
+    train = target / "train.py"
+    train.write_text("BASE = 1\n", encoding="utf-8")
+    subprocess.run(("git", "add", "."), cwd=repository, check=True)
+    subprocess.run(("git", "commit", "-qm", "base"), cwd=repository, check=True)
+    train.write_text("CURRENT = 2\n", encoding="utf-8")
+
+    capability = ScopedWorktreeRepository(
+        repository, ("src/tiktok2026/experiment/train.py",)
+    )
+
+    assert capability.read("src/tiktok2026/experiment/train.py") == "CURRENT = 2\n"
+    assert capability.read_base("src/tiktok2026/experiment/train.py") == "BASE = 1\n"
+
+
+def test_scoped_implementor_prevalidates_all_edits(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    capability = ScopedWorktreeRepository(
+        repository, ("src/tiktok2026/experiment",)
+    )
+    allowed = repository / "src/tiktok2026/experiment/allowed.py"
+
+    with pytest.raises(PermissionError, match="unrelated.py"):
+        capability.apply_edits(
+            (
+                ImplementationEdit(
+                    relative_path=allowed.relative_to(repository).as_posix(), content="ok\n"
+                ),
+                ImplementationEdit(relative_path="src/tiktok2026/unrelated.py", content="bad\n"),
+            )
+        )
+
+    assert not allowed.exists()
+
+
 # ---------------------------------------------------------------------------
 # Test 4: Synthetic end-to-end persists real audit, evaluation, resource, exports
 # ---------------------------------------------------------------------------
@@ -274,12 +319,95 @@ def test_production_composition_builds_offline(tmp_path: Path) -> None:
         runtime_root=tmp_path / "runtime",
         budget=BudgetSettings(),
         models={},
+        docker_image="registry.example/tiktok2026@sha256:" + "a" * 64,
     )
 
     result = build_production_services(settings)
     assert isinstance(result.controller, ProductionController)
     assert result.repository is not None
     assert result.graph is not None
+    assert result.executor.policy.allowed_image_digests == (settings.docker_image,)
+
+
+async def test_run_bound_executor_classifies_missing_output_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tiktok2026.execution.docker as docker
+    from tiktok2026.bootstrap import _RunBoundDockerExecutor
+    from tiktok2026.contracts import (
+        DatasetManifestIdentity,
+        ExecutionRequest,
+        ExecutionResult,
+        FailureKind,
+    )
+    source = tmp_path / "source"
+    dataset = tmp_path / "dataset"
+    output = tmp_path / "output"
+    source.mkdir()
+    dataset.mkdir()
+    output.mkdir()
+    assignment = WorktreeAssignment(
+        worktree_id="wt-1",
+        run_id="run-1",
+        experiment_id="exp-1",
+        path=source,
+        branch="experiment/run-1/exp-1",
+        parent_commit="b" * 40,
+    )
+
+    class FakeRunStore:
+        def __init__(self, repository: object) -> None:
+            del repository
+
+        def get_worktree_assignment(self, experiment_id: str) -> WorktreeAssignment | None:
+            return assignment if experiment_id == "exp-1" else None
+
+        def get_dataset_manifest_identity(self) -> DatasetManifestIdentity:
+            return DatasetManifestIdentity(
+                manifest_id="manifest-1", manifest_sha256="a" * 64
+            )
+
+    class StubDockerExecutor:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        async def execute(self, request: ExecutionRequest) -> ExecutionResult:
+            return ExecutionResult(
+                execution_id=request.execution_id,
+                experiment_id=request.experiment_id,
+                source_commit=request.source_commit,
+                command=request.command,
+                exit_code=0,
+                elapsed_seconds=0.1,
+                gpu_hours=0.0,
+            )
+
+    monkeypatch.setattr("tiktok2026.bootstrap.RepositoryRunStore", FakeRunStore)
+    monkeypatch.setattr(docker, "DockerExecutor", StubDockerExecutor)
+    request = ExecutionRequest(
+        run_id="run-1",
+        execution_id="execution-1",
+        experiment_id="exp-1",
+        source_commit="a" * 40,
+        command=("python", "-m", "tiktok2026.experiment.train"),
+        image="tiktok2026:test@sha256:" + "0" * 64,
+        source_path=source,
+        dataset_path=dataset,
+        output_path=output,
+        timeout_seconds=60,
+        memory_bytes=1 << 20,
+        cpus=1.0,
+    )
+
+    result = await _RunBoundDockerExecutor(
+        repository=object(),
+        artifact_store=object(),
+        policy=object(),
+        dataset_provider=object(),
+    ).execute(request)
+
+    assert result.exit_code == 1
+    assert result.failure_kind == FailureKind.MISSING_PATH
 
 
 # ---------------------------------------------------------------------------

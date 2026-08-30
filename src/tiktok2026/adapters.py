@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from collections.abc import Callable, Mapping
@@ -14,11 +15,14 @@ from tiktok2026.contracts import (
     ArtifactRecord,
     ArtifactRetention,
     AuditEvent,
+    BaselineCalibrationRecord,
     ContractModel,
     DatasetManifestIdentity,
     EvaluationResult,
     EvaluatorIdentity,
     ExecutionResult,
+    ExperimentProposalDecision,
+    ExperimentRegistrySnapshot,
     ExperimentSpec,
     FailureRecord,
     FinalizationBundleRequest,
@@ -26,7 +30,9 @@ from tiktok2026.contracts import (
     ImplementationEdit,
     ImplementationRequest,
     ImplementationResult,
+    ImplementationSubmission,
     OrchestrationDecision,
+    OrchestrationRequest,
     PolicyDecisionModel,
     PredictionArtifactRegistration,
     ProvenanceRequest,
@@ -77,9 +83,14 @@ class RoleSpecificAgentClient:
         if self.role == AgentRole.ORCHESTRATION:
             model_type = OrchestrationDecision
         elif self.role == AgentRole.RESEARCH:
-            model_type = ResearchDecision
+            model_type = (
+                ExperimentProposalDecision
+                if isinstance(request, ResearchRequest)
+                and request.objective.startswith("propose next experiment")
+                else ResearchDecision
+            )
         elif self.role == AgentRole.IMPLEMENTOR:
-            model_type = ImplementationResult
+            model_type = ImplementationSubmission
         elif self.role == AgentRole.VALIDATOR:
             model_type = ValidationReport
         else:  # pragma: no cover - AgentRole is exhaustive
@@ -98,8 +109,34 @@ class RoleSpecificAgentClient:
             self.prompt,
             request.model_dump(mode="json"),
         )
+        if isinstance(result, ExperimentProposalDecision):
+            result = ResearchDecision.model_validate(result.model_dump(mode="json"))
+        if isinstance(result, ImplementationSubmission):
+            result = ImplementationResult.model_validate(result.model_dump(mode="json"))
         if isinstance(result, AgentFailure):
             return result
+        if isinstance(request, OrchestrationRequest) and isinstance(
+            result, OrchestrationDecision
+        ):
+            if result.action not in request.allowed_actions:
+                return AgentFailure(
+                    request_id=request.request_id,
+                    role=AgentRole.ORCHESTRATION,
+                    kind="policy",
+                    message=f"orchestration selected disallowed action: {result.action.value}",
+                    repair_attempts=0,
+                )
+            if (
+                result.target_experiment_id is not None
+                and result.target_experiment_id != request.current_experiment_id
+            ):
+                return AgentFailure(
+                    request_id=request.request_id,
+                    role=AgentRole.ORCHESTRATION,
+                    kind="policy",
+                    message="orchestration selected an unauthorized experiment identity",
+                    repair_attempts=0,
+                )
         if isinstance(request, ImplementationRequest) and isinstance(result, ImplementationResult):
             repository = self.scoped_repository
             if repository is None:
@@ -108,14 +145,6 @@ class RoleSpecificAgentClient:
                     role=self.role,
                     kind="capability",
                     message="implementor worktree capability is not bound",
-                    repair_attempts=0,
-                )
-            if not result.edits:
-                return AgentFailure(
-                    request_id=request_id,
-                    role=self.role,
-                    kind="policy",
-                    message="implementor must apply at least one bounded edit",
                     repair_attempts=0,
                 )
             try:
@@ -211,13 +240,32 @@ class ScopedWorktreeRepository:
         if not any(
             relative == scope or relative.startswith(scope + "/") for scope in self.allowed_scopes
         ):
-            raise PermissionError("path is outside the approved implementation scope")
+            raise PermissionError(
+                f"path is outside the approved implementation scope: {relative}"
+            )
         if relative.startswith("baseline/"):
             raise PermissionError("protected path cannot be modified")
         return path
 
     def read(self, relative_path: str, max_characters: int = 20_000) -> str:
-        return self._path(relative_path).read_text(encoding="utf-8")[:max_characters]
+        content = self._path(relative_path).read_text(encoding="utf-8")
+        if len(content) > max_characters:
+            raise ValueError(f"scoped source exceeds {max_characters} characters")
+        return content
+
+    def read_base(self, relative_path: str, max_characters: int = 20_000) -> str:
+        path = self._path(relative_path)
+        relative = path.relative_to(self.root).as_posix()
+        content = subprocess.run(
+            ("git", "show", f"HEAD:{relative}"),
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if len(content) > max_characters:
+            raise ValueError(f"base source exceeds {max_characters} characters")
+        return content
 
     def search(self, query: str, max_results: int = 20) -> tuple[str, ...]:
         matches: list[str] = []
@@ -245,8 +293,10 @@ class ScopedWorktreeRepository:
         path.write_text(content, encoding="utf-8")
 
     def apply_edits(self, edits: tuple[ImplementationEdit, ...]) -> None:
-        for edit in edits:
-            self.write(edit.relative_path, edit.content)
+        paths = tuple(self._path(edit.relative_path) for edit in edits)
+        for edit, path in zip(edits, paths, strict=True):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(edit.content, encoding="utf-8")
 
     def changed_files(self) -> tuple[str, ...]:
         output = subprocess.run(
@@ -447,6 +497,54 @@ class RepositoryRunStore:
     def get_experiment(self, experiment_id: str) -> ExperimentSpec | None:
         return self._repo.get_experiment(experiment_id)
 
+    def get_experiment_registry(self, limit: int = 50) -> ExperimentRegistrySnapshot:
+        experiments, total = self._repo.list_experiments(limit)
+        evaluations_by_experiment: dict[str, list[EvaluationResult]] = {}
+        for raw in self._repo.list_json("evaluation"):
+            value = json.loads(raw)
+            result = EvaluationResult.model_validate(value.get("result", value))
+            evaluations_by_experiment.setdefault(result.experiment_id, []).append(result)
+        entries = tuple(
+            entry.model_copy(
+                update={
+                    "evaluation_ids": tuple(
+                        sorted(
+                            result.evaluation_id
+                            for result in evaluations_by_experiment.get(
+                                entry.experiment_id, ()
+                            )
+                        )
+                    ),
+                    "evaluator_sha256s": tuple(
+                        sorted(
+                            {
+                                result.evaluator_sha256
+                                for result in evaluations_by_experiment.get(
+                                    entry.experiment_id, ()
+                                )
+                            }
+                        )
+                    ),
+                }
+            )
+            for entry in experiments
+        )
+        payload = json.dumps(
+            {
+                "entries": [entry.model_dump(mode="json") for entry in entries],
+                "total_experiments": total,
+                "complete": total <= limit,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return ExperimentRegistrySnapshot(
+            evidence_id=f"experiment-registry-{hashlib.sha256(payload.encode()).hexdigest()}",
+            entries=entries,
+            total_experiments=total,
+            complete=total <= limit,
+        )
+
     def put_execution_result(self, result: ExecutionResult) -> None:
         self._repo.put_json("execution", result.execution_id, result.model_dump_json())
 
@@ -458,13 +556,24 @@ class RepositoryRunStore:
         return None
 
     def get_evaluation_result(self, evaluation_id: str) -> EvaluationResult | None:
-        for item in self._repo.list_json("evaluation"):
-            value = json.loads(item)
-            payload = value.get("result", value)
-            result = EvaluationResult.model_validate(payload)
+        for result in self.list_evaluation_results():
             if result.evaluation_id == evaluation_id:
                 return result
         return None
+
+    def list_evaluation_results(self) -> tuple[EvaluationResult, ...]:
+        results: list[EvaluationResult] = []
+        for item in self._repo.list_json("evaluation"):
+            value = json.loads(item)
+            payload = value.get("result", value)
+            results.append(EvaluationResult.model_validate(payload))
+        return tuple(results)
+
+    def list_baseline_calibrations(self) -> tuple[BaselineCalibrationRecord, ...]:
+        return tuple(
+            BaselineCalibrationRecord.model_validate_json(item)
+            for item in self._repo.list_json("baseline_calibration")
+        )
 
     def get_artifact(self, artifact_id: str) -> ArtifactRecord | None:
         return self._repo.get_artifact(artifact_id)

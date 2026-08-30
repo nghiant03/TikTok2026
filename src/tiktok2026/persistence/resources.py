@@ -153,6 +153,48 @@ class ResourceLedger:
         with sqlite3.connect(self.database) as connection:
             return self._read_state(connection)
 
+    def claim_run(self, run_id: str) -> None:
+        """Claim the single-run ledger after reclaiming an interrupted owner."""
+        with self._connect() as connection:
+            active = connection.execute(
+                "SELECT run_id FROM authority_resource_ledger_runs WHERE id = 1"
+            ).fetchone()
+        if active is not None and active[0] != run_id:
+            self.release_run(str(active[0]))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO authority_resource_ledger_runs (id, run_id) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET run_id = excluded.run_id",
+                (run_id,),
+            )
+            connection.commit()
+
+    def release_run(self, run_id: str) -> bool:
+        """Release unsettled reservations and relinquish this run's ledger ownership."""
+        with self._connect() as connection:
+            active = connection.execute(
+                "SELECT run_id FROM authority_resource_ledger_runs WHERE id = 1"
+            ).fetchone()
+            rows = connection.execute(
+                "SELECT reservation_id, reservation_json "
+                "FROM authority_resource_reservations WHERE status = 'reserved'"
+            ).fetchall()
+        if active is None or active[0] != run_id:
+            return False
+        for reservation_id, payload in rows:
+            reservation = ResourceReservation.model_validate_json(payload)
+            if reservation.run_id == run_id:
+                self.release(str(reservation_id))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM authority_resource_ledger_runs WHERE id = 1 AND run_id = ?",
+                (run_id,),
+            )
+            connection.commit()
+        return True
+
     def reserve(self, reservation: ResourceReservation) -> bool:
         connection = self._connect()
         try:

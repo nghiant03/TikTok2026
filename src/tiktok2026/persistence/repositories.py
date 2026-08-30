@@ -10,6 +10,7 @@ from tiktok2026.contracts import (
     ArtifactRecord,
     AuditEvent,
     EvaluatorIdentity,
+    ExperimentRegistryEntry,
     ExperimentSpec,
     FinalizationRecord,
     FinalTestAuthorizationRequest,
@@ -521,6 +522,40 @@ class ApplicationRepository:
                     "SELECT spec_json FROM experiments WHERE experiment_id = ?", (experiment_id,)
                 ).fetchone()
         return ExperimentSpec.model_validate_json(row[0]) if row else None
+
+    def list_experiments(
+        self, limit: int = 50
+    ) -> tuple[tuple[ExperimentRegistryEntry, ...], int]:
+        if limit < 1:
+            raise ValueError("experiment registry limit must be positive")
+        with self._connect() as connection:
+            total = int(
+                connection.execute("SELECT COUNT(*) FROM authority_experiments").fetchone()[0]
+            )
+            rows = connection.execute(
+                "SELECT authority.spec_json, COALESCE(("
+                "SELECT state.status FROM experiment_states AS state "
+                "WHERE state.experiment_id = authority.experiment_id "
+                "ORDER BY state.sequence DESC LIMIT 1"
+                "), 'proposed') "
+                "FROM authority_experiments AS authority "
+                "ORDER BY authority.created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        entries: list[ExperimentRegistryEntry] = []
+        for payload, status in rows:
+            value = json.loads(payload)
+            entries.append(
+                ExperimentRegistryEntry(
+                    experiment_id=str(value["experiment_id"]),
+                    hypothesis_id=str(value["hypothesis_id"]),
+                    parent_experiment_id=value.get("parent_experiment_id"),
+                    hypothesis=str(value["hypothesis"]),
+                    mechanism=str(value["mechanism"]),
+                    status=str(status),
+                )
+            )
+        return tuple(entries), total
 
     def put_source_registration(
         self, registration: SourceRegistration, audit_event: AuditEvent | None = None
