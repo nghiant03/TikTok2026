@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TypeVar, cast
 
 from tiktok2026.agents.common.client import OpenAICompatibleClient
-from tiktok2026.agents.common.structured import invoke_structured
+from tiktok2026.agents.common.structured import invoke_agentic, invoke_structured
 from tiktok2026.contracts import (
     AgentFailure,
     AgentRole,
@@ -45,6 +45,7 @@ from tiktok2026.contracts import (
     SourceRegistration,
     ValidationReport,
     ValidationRequest,
+    ValidationStage,
     WorktreeAssignment,
 )
 from tiktok2026.observability.exports import export_records
@@ -54,6 +55,128 @@ from tiktok2026.policies.lifecycle import can_repair, convergence_reason
 from tiktok2026.policies.paths import check_changed_paths
 
 ModelT = TypeVar("ModelT", bound=ContractModel)
+
+
+def _tool(
+    name: str,
+    description: str,
+    properties: dict[str, object],
+    required: tuple[str, ...] = (),
+) -> dict[str, object]:
+    parameters: dict[str, object] = {"type": "object", "properties": properties}
+    if required:
+        parameters["required"] = list(required)
+    return {
+        "type": "function",
+        "function": {"name": name, "description": description, "parameters": parameters},
+    }
+
+
+_READ_FILE_TOOL = _tool(
+    "read_file",
+    "Read a file from the assigned worktree. The path must be within the allowed scope.",
+    {
+        "path": {"type": "string", "description": "Repository-relative POSIX path"},
+        "max_characters": {
+            "type": "integer",
+            "description": "Maximum characters to return (default 20000)",
+            "default": 20000,
+        },
+    },
+    ("path",),
+)
+
+_WRITE_FILE_TOOL = _tool(
+    "write_file",
+    "Write content to a file in the assigned worktree. The path must be within the allowed scope.",
+    {
+        "path": {"type": "string", "description": "Repository-relative POSIX path"},
+        "content": {"type": "string", "description": "Full file content to write"},
+    },
+    ("path", "content"),
+)
+
+_RUN_CHECK_TOOL = _tool(
+    "run_check",
+    "Run a command in the worktree (e.g. python -c 'import ...'). Returns stdout. "
+    "Fails on non-zero exit or timeout.",
+    {
+        "command": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Command and arguments as a list",
+        },
+        "timeout_seconds": {
+            "type": "integer",
+            "description": "Timeout in seconds (default 30)",
+            "default": 30,
+        },
+    },
+    ("command",),
+)
+
+_VALIDATOR_CHECK_TOOL = _tool(
+    "run_check",
+    "Run one controller-owned, non-mutating implementation check.",
+    {
+        "check": {
+            "type": "string",
+            "enum": [
+                "compile_entrypoint",
+                "import_entrypoint",
+                "ruff_entrypoint",
+                "pyright_entrypoint",
+            ],
+        },
+        "timeout_seconds": {
+            "type": "integer",
+            "description": "Timeout in seconds (default 30)",
+            "default": 30,
+        },
+    },
+    ("check",),
+)
+
+_DIFF_TOOL = _tool(
+    "diff",
+    "Return the current git diff of all changes in the worktree.",
+    {},
+)
+
+
+def _submit_tool(model_type: type[ContractModel]) -> dict[str, object]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "submit_result",
+            "description": (
+                "Submit the final result. The arguments must match "
+                "response_json_schema exactly."
+            ),
+            "parameters": model_type.model_json_schema(),
+        },
+    }
+
+
+def _implementor_tools() -> list[dict[str, object]]:
+    """OpenAI function-calling tool definitions for the implementor role."""
+    return [
+        _READ_FILE_TOOL,
+        _WRITE_FILE_TOOL,
+        _RUN_CHECK_TOOL,
+        _DIFF_TOOL,
+        _submit_tool(ImplementationSubmission),
+    ]
+
+
+def _validator_tools() -> list[dict[str, object]]:
+    """Read-only tool definitions for the validator role."""
+    return [
+        _READ_FILE_TOOL,
+        _VALIDATOR_CHECK_TOOL,
+        _DIFF_TOOL,
+        _submit_tool(ValidationReport),
+    ]
 
 
 class RoleSpecificAgentClient:
@@ -74,7 +197,7 @@ class RoleSpecificAgentClient:
         self.scoped_repository = scoped_repository
 
     def bind_worktree(self, path: Path, allowed_scopes: tuple[str, ...]) -> None:
-        if self.role == AgentRole.IMPLEMENTOR:
+        if self.role in {AgentRole.IMPLEMENTOR, AgentRole.VALIDATOR}:
             self.scoped_repository = ScopedWorktreeRepository(path, allowed_scopes)
 
     async def invoke(self, request: ContractModel) -> ContractModel:
@@ -101,14 +224,26 @@ class RoleSpecificAgentClient:
                 message="unsupported agent role",
                 repair_attempts=0,
             )
-        result = await invoke_structured(
-            self._client,
-            self.role,
-            request_id,
-            model_type,
-            self.prompt,
-            request.model_dump(mode="json"),
-        )
+        if self.role == AgentRole.IMPLEMENTOR and isinstance(
+            self.scoped_repository, ScopedWorktreeRepository
+        ):
+            result = await self._invoke_implementor_agentic(request_id, request)
+        elif (
+            self.role == AgentRole.VALIDATOR
+            and isinstance(request, ValidationRequest)
+            and request.stage == ValidationStage.IMPLEMENTATION
+            and isinstance(self.scoped_repository, ScopedWorktreeRepository)
+        ):
+            result = await self._invoke_validator_agentic(request_id, request)
+        else:
+            result = await invoke_structured(
+                self._client,
+                self.role,
+                request_id,
+                model_type,
+                self.prompt,
+                request.model_dump(mode="json"),
+            )
         if isinstance(result, ExperimentProposalDecision):
             result = ResearchDecision.model_validate(result.model_dump(mode="json"))
         if isinstance(result, ImplementationSubmission):
@@ -137,7 +272,16 @@ class RoleSpecificAgentClient:
                     message="orchestration selected an unauthorized experiment identity",
                     repair_attempts=0,
                 )
-        if isinstance(request, ImplementationRequest) and isinstance(result, ImplementationResult):
+        # The implementor agentic path writes files via tools; edits are applied
+        # by the controller only for the single-shot (non-agentic) path.
+        implementor_agentic = self.role == AgentRole.IMPLEMENTOR and isinstance(
+            self.scoped_repository, ScopedWorktreeRepository
+        )
+        if (
+            not implementor_agentic
+            and isinstance(request, ImplementationRequest)
+            and isinstance(result, ImplementationResult)
+        ):
             repository = self.scoped_repository
             if repository is None:
                 return AgentFailure(
@@ -208,6 +352,140 @@ class RoleSpecificAgentClient:
                 repair_attempts=0,
             )
         return result
+
+    async def _invoke_implementor_agentic(
+        self, request_id: str, request: ContractModel
+    ) -> ContractModel:
+        """Multi-turn tool-use loop for the implementor role."""
+        repository = self.scoped_repository
+        if not isinstance(repository, ScopedWorktreeRepository):
+            return AgentFailure(
+                request_id=request_id,
+                role=self.role,
+                kind="capability",
+                message="implementor worktree capability is not bound",
+                repair_attempts=0,
+            )
+        tools = _implementor_tools()
+
+        def _handle(tool_name: str, arguments: dict[str, object]) -> str:
+            if tool_name == "read_file":
+                path = str(arguments.get("path", ""))
+                max_chars = int(str(arguments.get("max_characters", "20000")))
+                return repository.read(path, max_chars)
+            if tool_name == "write_file":
+                path = str(arguments.get("path", ""))
+                content = str(arguments.get("content", ""))
+                repository.write(path, content)
+                return f"written: {path}"
+            if tool_name == "run_check":
+                command_raw = arguments.get("command", [])
+                timeout = int(str(arguments.get("timeout_seconds", "30")))
+                if isinstance(command_raw, list):
+                    command = tuple(str(c) for c in cast(list[object], command_raw))
+                else:
+                    command = (str(command_raw),)
+                return repository.run_check(command, timeout)
+            if tool_name == "diff":
+                return repository.diff()
+            return f"error: unknown tool {tool_name!r}"
+
+        result = await invoke_agentic(
+            self._client,
+            self.role,
+            request_id,
+            ImplementationSubmission,
+            self.prompt,
+            request.model_dump(mode="json"),
+            tools,
+            _handle,
+            terminal_tool="submit_result",
+        )
+        if isinstance(result, AgentFailure):
+            return result
+        # The model has already written files via tools; skip re-applying edits.
+        # Verify a real diff exists.
+        changed_files = repository.changed_files()
+        if not changed_files or not repository.diff():
+            return AgentFailure(
+                request_id=request_id,
+                role=self.role,
+                kind="policy",
+                message="implementor produced no real diff",
+                repair_attempts=0,
+            )
+        return ImplementationResult(
+            experiment_id=result.experiment_id,
+            patch_artifact_id=result.patch_artifact_id,
+            changed_files=tuple(changed_files),
+            edits=result.edits,
+            changed_symbols=result.changed_symbols,
+            checks=result.checks,
+            assumptions=result.assumptions,
+            unresolved_issues=result.unresolved_issues,
+        )
+
+    async def _invoke_validator_agentic(
+        self, request_id: str, request: ContractModel
+    ) -> ContractModel:
+        """Multi-turn read-only verification loop for implementation validation."""
+        repository = self.scoped_repository
+        if not isinstance(repository, ScopedWorktreeRepository):
+            return AgentFailure(
+                request_id=request_id,
+                role=self.role,
+                kind="capability",
+                message="validator worktree capability is not bound",
+                repair_attempts=0,
+            )
+
+        def _handle(tool_name: str, arguments: dict[str, object]) -> str:
+            if tool_name == "read_file":
+                path = str(arguments.get("path", ""))
+                max_chars = int(str(arguments.get("max_characters", "20000")))
+                return repository.read(path, max_chars)
+            if tool_name == "run_check":
+                check = str(arguments.get("check", ""))
+                timeout = int(str(arguments.get("timeout_seconds", "30")))
+                entrypoint = "src/tiktok2026/experiment/train.py"
+                commands = {
+                    "compile_entrypoint": (
+                        "python",
+                        "-c",
+                        (
+                            "from pathlib import Path; "
+                            f"source=Path('{entrypoint}').read_text(); "
+                            f"compile(source, '{entrypoint}', 'exec')"
+                        ),
+                    ),
+                    "import_entrypoint": (
+                        "python",
+                        "-c",
+                        "import tiktok2026.experiment.train",
+                    ),
+                    "ruff_entrypoint": ("ruff", "check", entrypoint),
+                    "pyright_entrypoint": ("pyright", entrypoint),
+                }
+                command = commands.get(check)
+                if command is None:
+                    raise ValueError(f"unsupported validator check: {check}")
+                return repository.run_check(command, timeout)
+            if tool_name == "diff":
+                return repository.diff()
+            return f"error: unknown tool {tool_name!r}"
+
+        return await invoke_agentic(
+            self._client,
+            self.role,
+            request_id,
+            ValidationReport,
+            self.prompt,
+            request.model_dump(mode="json"),
+            _validator_tools(),
+            _handle,
+            max_turns=8,
+            terminal_tool="submit_result",
+        )
 
 
 class OpenAICompatibleAgentClient(RoleSpecificAgentClient):
@@ -355,14 +633,20 @@ class ScopedWorktreeRepository:
     def run_check(self, command: tuple[str, ...], timeout_seconds: int) -> str:
         if not command or any(not part for part in command):
             raise ValueError("check command must be a non-empty argument tuple")
-        return subprocess.run(
+        result = subprocess.run(
             list(command),
             cwd=self.root,
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
-        ).stdout
+        )
+        output = result.stdout + result.stderr
+        if result.returncode != 0:
+            raise ValueError(
+                f"check exited with status {result.returncode}: {output[-20_000:]}"
+            )
+        return output
 
 
 # ---------------------------------------------------------------------------

@@ -1018,7 +1018,13 @@ def build_production_services(settings: Any) -> ProductionServices:
         AgentRole.ORCHESTRATION: ("route", "budget", "frontier"),
         AgentRole.RESEARCH: ("repository_read", "dataset_summary", "memory", "literature"),
         AgentRole.IMPLEMENTOR: ("scoped_read", "scoped_write", "diff", "checks"),
-        AgentRole.VALIDATOR: ("repository_read", "diff", "provenance", "evaluation_read"),
+        AgentRole.VALIDATOR: (
+            "repository_read",
+            "diff",
+            "checks",
+            "provenance",
+            "evaluation_read",
+        ),
     }
     agents: dict[AgentRole, RoleSpecificAgentClient] = {
         role: RoleSpecificAgentClient(

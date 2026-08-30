@@ -640,6 +640,23 @@ def _validation(
             subject = _validation_subject(s, state, stage)
         except MissingAuthorityError as error:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
+        if stage == ValidationStage.IMPLEMENTATION:
+            if s.run_store is None:
+                return _failure(
+                    state,
+                    FailureKind.SCHEMA_MISMATCH,
+                    "run store is required for validator worktree binding",
+                )
+            assignment = s.run_store.get_worktree_assignment(_exp_id(state))
+            if assignment is None:
+                return _failure(
+                    state,
+                    FailureKind.MISSING_PATH,
+                    "validator worktree assignment is absent",
+                )
+            binder = getattr(client, "bind_worktree", None)
+            if binder is not None:
+                binder(assignment.path, _spec(s, state).implementation_scope)
         response = await client.invoke(
             ValidationRequest(
                 request_id=f"{stage.value}-validation-{state['run_id']}-{state['state_version']}",

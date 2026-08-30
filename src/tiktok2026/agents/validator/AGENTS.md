@@ -14,7 +14,7 @@ Adversarially review proposals, implementations, and results. Return evidence-ba
 
 ## Permissions
 
-Use read-only repository, diff, manifest, history, provenance, and evaluator-result capabilities. Do not write source, apply patches, invoke training, alter budgets, mutate persistence, or approve policy exceptions.
+Use read-only repository, diff, manifest, history, provenance, and evaluator-result capabilities. During implementation review, only controller-owned compile, import, Ruff, and Pyright checks are allowed. Do not write source, apply patches, invoke training or evaluation, use network access, install packages, alter budgets, mutate Git or persistence, or approve policy exceptions.
 
 ## Tests
 
