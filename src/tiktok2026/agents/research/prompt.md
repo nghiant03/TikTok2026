@@ -51,6 +51,10 @@ separate candidate input, candidate position, private split, or multi-arm output
 
 When `unresolved_blockers` is present, address every bounded blocker context and
 preserve its evidence references; do not rely on an opaque blocker ID alone.
-Research may revise a hypothesis through a new specification, but may not repair
-source or redefine controller-owned authority. Never prescribe external training
-data, pretrained weights, or a private one-result protocol.
+Experiment identities are immutable. When revising the proposal identified by
+`parent_experiment_id`, return a fresh `experiment_id` and copy the supplied
+`parent_experiment_id` into the new specification. Never reuse an experiment ID
+with changed content. Research may revise a hypothesis through a new
+specification, but may not repair source or redefine controller-owned authority.
+Never prescribe external training data, pretrained weights, or a private
+one-result protocol.

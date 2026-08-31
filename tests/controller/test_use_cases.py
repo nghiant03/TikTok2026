@@ -646,7 +646,11 @@ async def test_proposal_repair_passes_authoritative_blocker_context_to_research(
             ResearchDecision(
                 request_id="research-1",
                 kind="proposal",
-                experiment_spec=_estimated_experiment(("src/tiktok2026/experiment",)),
+                experiment_spec=_estimated_experiment(
+                    ("src/tiktok2026/experiment",)
+                ).model_copy(
+                    update={"experiment_id": "exp-2", "parent_experiment_id": "exp-1"}
+                ),
                 message="repaired proposal",
             )
         ]
@@ -654,12 +658,48 @@ async def test_proposal_repair_passes_authoritative_blocker_context_to_research(
     research_controller = ProductionController(
         _make_services(store=store, agent_client=researcher)
     )
-    await research_controller.research(state | validation | persisted | repaired)  # type: ignore[arg-type]
+    result = await research_controller.research(  # type: ignore[arg-type]
+        state | validation | persisted | repaired
+    )
     request = researcher.calls[0]
     assert isinstance(request, ResearchRequest)
+    assert request.parent_experiment_id == "exp-1"
     assert len(request.unresolved_blockers) == 1
     assert request.unresolved_blockers[0].text == "tighten the success criterion"
     assert request.unresolved_blockers[0].evidence_refs == ("evidence-1",)
+    assert result["current_experiment_id"] == "exp-2"
+    assert result["repair_attempts"] == 1
+
+
+async def test_proposal_repair_rejects_changed_content_under_same_identity() -> None:
+    store = _FakeStore()
+    original = _estimated_experiment(("src/tiktok2026/experiment",))
+    store.experiments["exp-1"] = original
+    revised = original.model_copy(update={"mechanism": "revised mechanism"})
+    researcher = _ScriptedAgentClient(
+        [
+            ResearchDecision(
+                request_id="research-1",
+                kind="proposal",
+                experiment_spec=revised,
+                message="repaired proposal",
+            )
+        ]
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=researcher))
+
+    result = await controller.research(
+        minimal_state(
+            phase=RunPhase.RESEARCH,
+            current_experiment_id="exp-1",
+            repair_attempts=1,
+            terminal_reason="proposal validation failed",
+        )
+    )
+
+    assert result["pending_route"] == "persist_failure"
+    assert "experiment identities are immutable" in str(result["terminal_reason"])
+    assert store.experiments["exp-1"] == original
 
 
 async def test_validation_replay_reuses_bound_report_without_invoking_validator() -> None:

@@ -511,6 +511,8 @@ def _research(s: ServiceTransitions) -> Transition:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "research role is not configured")
         objective = "propose next experiment"
         unresolved_context: tuple[ValidationBlockerContext, ...] = ()
+        prior_experiment_id = state.get("current_experiment_id")
+        is_proposal_repair = bool(state.get("terminal_reason") and prior_experiment_id)
         if state.get("terminal_reason"):
             _, message, _ = _failure_details(state)
             objective += f"; address validator feedback: {message}"
@@ -524,6 +526,7 @@ def _research(s: ServiceTransitions) -> Transition:
             request_id=f"research-{state['run_id']}-{state['state_version']}",
             objective=objective,
             resource_state=_resource_state(s),
+            parent_experiment_id=(prior_experiment_id if is_proposal_repair else None),
             allowed_paths=IMPLEMENTATION_ROOTS,
             controller_context=_controller_context(s),
             unresolved_blockers=unresolved_context,
@@ -536,8 +539,27 @@ def _research(s: ServiceTransitions) -> Transition:
                 state, FailureKind.SCHEMA_MISMATCH, "research returned no experiment spec"
             )
         spec = response.experiment_spec
-        is_new_experiment = spec.experiment_id != state.get("current_experiment_id")
+        is_new_experiment = spec.experiment_id != prior_experiment_id
         if s.run_store is not None:
+            existing = s.run_store.get_experiment(spec.experiment_id)
+            if existing is not None and existing != spec:
+                return _failure(
+                    state,
+                    FailureKind.SCHEMA_MISMATCH,
+                    "experiment identities are immutable; return the revised proposal with a "
+                    "new experiment_id and set parent_experiment_id to the proposal being repaired",
+                )
+            if (
+                is_proposal_repair
+                and is_new_experiment
+                and spec.parent_experiment_id != prior_experiment_id
+            ):
+                return _failure(
+                    state,
+                    FailureKind.SCHEMA_MISMATCH,
+                    "a revised proposal must set parent_experiment_id to the proposal "
+                    "being repaired",
+                )
             s.run_store.put_experiment(
                 spec, "proposed", state["run_id"], f"proposed-{spec.experiment_id}"
             )
@@ -545,7 +567,11 @@ def _research(s: ServiceTransitions) -> Transition:
             "phase": RunPhase.RESEARCH,
             "current_experiment_id": spec.experiment_id,
             "current_hypothesis_id": spec.hypothesis_id,
-            "repair_attempts": 0 if is_new_experiment else state["repair_attempts"],
+            "repair_attempts": (
+                state["repair_attempts"]
+                if is_proposal_repair
+                else 0 if is_new_experiment else state["repair_attempts"]
+            ),
             "terminal_reason": None,
             "pending_route": "proposal_policy",
         }
