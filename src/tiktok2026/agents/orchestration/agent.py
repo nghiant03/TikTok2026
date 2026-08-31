@@ -15,7 +15,8 @@ class OrchestrationAgent:
             AgentRole.ORCHESTRATION,
             request_id,
             OrchestrationDecision,
-            "Select exactly one action allowed by the context. Do not execute it.",
+            "Select exactly one action allowed by the context; when implementing, "
+            "pick the most promising pending proposal using outcome history. Do not execute it.",
             context,
         )
         if isinstance(result, OrchestrationDecision):
