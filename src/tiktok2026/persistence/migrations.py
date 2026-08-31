@@ -11,6 +11,10 @@ class MigrationChecksumError(RuntimeError):
     pass
 
 
+def _sqlite_sha256(value: object) -> bytes:
+    return hashlib.sha256(str(value).encode()).digest()
+
+
 def application_migrations_path() -> Path:
     return Path(__file__).resolve().parents[3] / "migrations" / "application"
 
@@ -34,6 +38,7 @@ class MigrationRunner:
         paths = sorted(self.migrations.glob("[0-9][0-9][0-9]_*.sql"))
         first_sql = paths[0].read_text(encoding="utf-8") if paths else ""
         with sqlite3.connect(self.database) as connection:
+            connection.create_function("sha256", 1, _sqlite_sha256)
             tracking_exists = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
             ).fetchone()

@@ -19,13 +19,18 @@ from tiktok2026.contracts.models import (
     FailureRecord,
     FinalizationBundleRequest,
     FinalizationRecord,
+    FullAttemptClaimRequest,
+    FullScientificAttemptClaim,
     ImplementationCriterionId,
     PolicyDecisionModel,
     PredictionArtifactRegistration,
     ProvenanceRequest,
     ResourceState,
     RunBaselineBinding,
+    RunClosure,
     RunRecord,
+    ScoredObservation,
+    ScoredObservationRequest,
     SourceRegistration,
     ValidationBlocker,
     ValidationOperationIdentity,
@@ -114,6 +119,8 @@ class ResourceAccountant(Protocol):
 
     def reconcile(self, reservation_id: str, **usage: float | int) -> bool: ...
 
+    def release(self, reservation_id: str) -> bool: ...
+
 
 class PolicyGate(Protocol):
     """Seam for deterministic policy decisions."""
@@ -156,17 +163,13 @@ class RunStore(Protocol):
 
     def get_validation_report(self, report_id: str) -> ValidationReport | None: ...
 
-    def get_validation_report_by_operation(
-        self, operation_id: str
-    ) -> ValidationReport | None: ...
+    def get_validation_report_by_operation(self, operation_id: str) -> ValidationReport | None: ...
 
     def get_validation_report_for_attempt(
         self, run_id: str, experiment_id: str, stage: ValidationStage, repair_attempt: int
     ) -> ValidationReport | None: ...
 
-    def get_validation_operation(
-        self, operation_id: str
-    ) -> ValidationOperationIdentity | None: ...
+    def get_validation_operation(self, operation_id: str) -> ValidationOperationIdentity | None: ...
 
     def list_validation_reports(
         self, experiment_id: str | None = None
@@ -209,9 +212,7 @@ class RunStore(Protocol):
 
     def get_source_registration(self, experiment_id: str) -> SourceRegistration | None: ...
 
-    def get_source_registration_by_id(
-        self, registration_id: str
-    ) -> SourceRegistration | None: ...
+    def get_source_registration_by_id(self, registration_id: str) -> SourceRegistration | None: ...
 
     def get_experiment(self, experiment_id: str) -> ExperimentSpec | None: ...
 
@@ -243,6 +244,43 @@ class RunStore(Protocol):
     def put_run_baseline(self, binding: RunBaselineBinding) -> None: ...
 
     def get_run_baseline(self, run_id: str) -> RunBaselineBinding | None: ...
+
+    def claim_full_attempt(
+        self, request: FullAttemptClaimRequest
+    ) -> FullScientificAttemptClaim | None: ...
+
+    def list_full_attempt_claims(
+        self, run_id: str | None = None
+    ) -> tuple[FullScientificAttemptClaim, ...]: ...
+
+    def count_full_attempt_claims(self, run_id: str) -> int: ...
+
+    def put_scored_observation(self, request: ScoredObservationRequest) -> ScoredObservation: ...
+
+    def get_scored_observation(self, observation_id: str) -> ScoredObservation | None: ...
+
+    def list_scored_observations(
+        self, run_id: str | None = None
+    ) -> tuple[ScoredObservation, ...]: ...
+
+    def close_run(
+        self,
+        run_id: str,
+        reason: Literal["plateau", "attempt_cap"],
+        epsilon: float = 0.002,
+        patience: int = 3,
+    ) -> RunClosure: ...
+
+    def get_run_closure(self, run_id: str) -> RunClosure | None: ...
+
+    def close_run_if_ready(
+        self,
+        run_id: str,
+        *,
+        after_failure: bool = False,
+        epsilon: float = 0.002,
+        patience: int = 3,
+    ) -> RunClosure | None: ...
 
     def get_artifact(self, artifact_id: str) -> ArtifactRecord | None: ...
 
@@ -295,6 +333,12 @@ class FinalizationBundleService(Protocol):
 
 class FrontierService(Protocol):
     """Seam for updating the experiment frontier after persistence."""
+
+    @property
+    def epsilon(self) -> float: ...
+
+    @property
+    def patience(self) -> int: ...
 
     def initialize(self, run_id: str) -> None: ...
 

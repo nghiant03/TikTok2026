@@ -185,6 +185,17 @@ class ResourceLedger:
         for reservation_id, payload in rows:
             reservation = ResourceReservation.model_validate_json(payload)
             if reservation.run_id == run_id:
+                # A result is persisted before settlement.  If the process dies
+                # in that small window, releasing the reservation here would
+                # refund an execution that must be replay-settled on resume.
+                execution_id = str(reservation_id).removeprefix("reservation-")
+                with self._connect() as connection:
+                    persisted_result = connection.execute(
+                        "SELECT 1 FROM records WHERE kind = 'execution' AND record_id = ?",
+                        (execution_id,),
+                    ).fetchone()
+                if persisted_result is not None:
+                    continue
                 self.release(str(reservation_id))
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")

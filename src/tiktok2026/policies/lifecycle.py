@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 from tiktok2026.contracts import (
     Fidelity,
     ImplementationResourceEstimate,
@@ -56,15 +58,23 @@ def valid_fidelity_transition(current: Fidelity, requested: Fidelity) -> PolicyD
 def convergence_reason(
     scores: list[float], epsilon: float = 0.002, patience: int = 3
 ) -> str | None:
+    """Return plateau only when the cumulative improvement is within epsilon.
+
+    The comparison is against the best score before the final patience-sized
+    window, rather than counting consecutive non-improvements.  This prevents
+    a sequence of small gains from resetting or prematurely satisfying the
+    stopping rule.
+    """
+    if patience < 1:
+        raise ValueError("patience must be positive")
+    if epsilon < 0:
+        raise ValueError("epsilon must be non-negative")
     if len(scores) < patience + 1:
         return None
-    champion = scores[0]
-    insignificant = 0
-    for score in scores[1:]:
-        if score > champion + epsilon:
-            champion = score
-            insignificant = 0
-        else:
-            champion = max(champion, score)
-            insignificant += 1
-    return "plateau" if insignificant >= patience else None
+    best_now = max(scores)
+    best_before_window = max(scores[:-patience])
+    # Decimal conversion from the canonical float spellings makes a decimal
+    # boundary such as 0.500 -> 0.502 compare as equality without introducing
+    # an arbitrary tolerance that could admit a genuinely larger improvement.
+    improvement = Decimal(str(best_now)) - Decimal(str(best_before_window))
+    return "plateau" if improvement <= Decimal(str(epsilon)) else None

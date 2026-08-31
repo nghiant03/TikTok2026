@@ -734,12 +734,12 @@ def test_training_registration_rejects_artifact_view_hash_mismatch(
 
 
 # ---------------------------------------------------------------------------
-# Test 6: Finalize failure propagates (no suppression)
+# Test 6: Premature finalize redirects to orchestration
 # ---------------------------------------------------------------------------
 
 
-async def test_finalize_failure_propagates(tmp_path: Path) -> None:
-    """finalize transition must NOT suppress eligibility errors — fails closed with typed error."""
+async def test_finalize_without_closure_redirects_to_orchestration(tmp_path: Path) -> None:
+    """A stale graph terminal flag cannot authorize finalization."""
     import shutil
 
     from tiktok2026.bootstrap import build_synthetic_controller
@@ -756,8 +756,7 @@ async def test_finalize_failure_propagates(tmp_path: Path) -> None:
         runtime_root=tmp_path / "runtime",
     )
 
-    # Finalization authority errors are terminal: they are persisted as a typed
-    # failure and must not route through export or complete.
+    # Finalization requires the repository closure, not a graph terminal flag.
     state: ProductionState = {
         "run_id": "test-finalize",
         "phase": "finalize",  # type: ignore[typeddict-item]
@@ -775,12 +774,7 @@ async def test_finalize_failure_propagates(tmp_path: Path) -> None:
         "state_version": 5,
     }
 
-    from tiktok2026.use_cases import TerminalLifecycleError
-
-    with pytest.raises(TerminalLifecycleError):
-        await _controller.finalize(state)
-    assert any(
-        '"kind":"schema_mismatch"' in failure
-        for failure in _store.list_json("failure")  # type: ignore[union-attr]
-    )
+    result = await _controller.services.transitions["finalize"](state)
+    assert result["pending_route"] == "orchestrate"
+    assert result["terminal_reason"] is None
     assert _store.get_finalization("finalization-test-finalize") is None  # type: ignore[union-attr]

@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -76,3 +77,31 @@ def test_criterion_history_migration_is_tracked_and_idempotent(tmp_path: Path) -
         "authority_validation_criterion_occurrences",
         "authority_validation_resolution_claims",
     } <= tables
+
+
+def test_lifecycle_migration_backfills_shared_record_hashes(tmp_path: Path) -> None:
+    database = tmp_path / "app.sqlite3"
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    application = application_migrations_path()
+    for path in sorted(application.glob("[0-9][0-9][0-9]_*.sql")):
+        if path.name.startswith("010_"):
+            continue
+        (migrations / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    MigrationRunner(database, migrations).apply()
+    payload = '{"kind":"legacy"}'
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO records (kind, record_id, payload_json) VALUES ('legacy', 'one', ?)",
+            (payload,),
+        )
+    migration = application / "010_lifecycle_authority.sql"
+    (migrations / migration.name).write_text(
+        migration.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    MigrationRunner(database, migrations).apply()
+    with sqlite3.connect(database) as connection:
+        digest = connection.execute(
+            "SELECT content_sha256 FROM records WHERE kind = 'legacy' AND record_id = 'one'"
+        ).fetchone()[0]
+    assert digest == hashlib.sha256(payload.encode()).hexdigest()

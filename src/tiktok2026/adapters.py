@@ -28,6 +28,8 @@ from tiktok2026.contracts import (
     FailureRecord,
     FinalizationBundleRequest,
     FinalizationRecord,
+    FullAttemptClaimRequest,
+    FullScientificAttemptClaim,
     ImplementationEdit,
     ImplementationRequest,
     ImplementationResult,
@@ -42,8 +44,11 @@ from tiktok2026.contracts import (
     ResourceReservation,
     ResourceState,
     RunBaselineBinding,
+    RunClosure,
     RunRecord,
     ScopedRepository,
+    ScoredObservation,
+    ScoredObservationRequest,
     SourceRegistration,
     ValidationBlocker,
     ValidationOperationIdentity,
@@ -1143,6 +1148,57 @@ class RepositoryRunStore:
     def get_run_baseline(self, run_id: str) -> RunBaselineBinding | None:
         return self._repo.get_run_baseline(run_id)
 
+    def claim_full_attempt(
+        self, request: FullAttemptClaimRequest
+    ) -> FullScientificAttemptClaim | None:
+        return self._repo.claim_full_attempt(request)
+
+    def list_full_attempt_claims(
+        self, run_id: str | None = None
+    ) -> tuple[FullScientificAttemptClaim, ...]:
+        return self._repo.list_full_attempt_claims(run_id)
+
+    def count_full_attempt_claims(self, run_id: str) -> int:
+        return self._repo.count_full_attempt_claims(run_id)
+
+    def put_scored_observation(self, request: ScoredObservationRequest) -> ScoredObservation:
+        return self._repo.put_scored_observation(request)
+
+    def get_scored_observation(self, observation_id: str) -> ScoredObservation | None:
+        return self._repo.get_scored_observation(observation_id)
+
+    def list_scored_observations(
+        self, run_id: str | None = None
+    ) -> tuple[ScoredObservation, ...]:
+        return self._repo.list_scored_observations(run_id)
+
+    def close_run(
+        self,
+        run_id: str,
+        reason: Literal["plateau", "attempt_cap"],
+        epsilon: float = 0.002,
+        patience: int = 3,
+    ) -> RunClosure:
+        return self._repo.close_run(run_id, reason, epsilon, patience)
+
+    def get_run_closure(self, run_id: str) -> RunClosure | None:
+        return self._repo.get_run_closure(run_id)
+
+    def close_run_if_ready(
+        self,
+        run_id: str,
+        *,
+        after_failure: bool = False,
+        epsilon: float = 0.002,
+        patience: int = 3,
+    ) -> RunClosure | None:
+        return self._repo.close_run_if_ready(
+            run_id,
+            after_failure=after_failure,
+            epsilon=epsilon,
+            patience=patience,
+        )
+
     def get_artifact(self, artifact_id: str) -> ArtifactRecord | None:
         return self._repo.get_artifact(artifact_id)
 
@@ -1220,7 +1276,7 @@ class RepositoryFinalizationBundleService:
     def create(self, request: FinalizationBundleRequest) -> ArtifactRecord:
         store = RepositoryRunStore(self.repository)
         evaluation = store.get_evaluation_result(request.evaluation_id)
-        source = self.repository.get_source_registration(request.experiment_id)
+        source = self.repository.get_source_registration_by_id(f"source-{request.source_commit}")
         evaluator = store.get_evaluator_identity(request.evaluator_id)
         prediction = (
             self.repository.get_artifact(evaluation.prediction_artifact_id)
@@ -1472,6 +1528,9 @@ class LedgerResourceAccountant:
             tokens=int(usage["tokens"]) if "tokens" in usage else None,
             disk_bytes=int(usage["disk_bytes"]) if "disk_bytes" in usage else None,
         )
+
+    def release(self, reservation_id: str) -> bool:
+        return self._ledger.release(reservation_id)
 
 
 # ---------------------------------------------------------------------------

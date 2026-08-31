@@ -13,6 +13,7 @@ Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{7,64}$")]
 FullCommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 CURRENT_EVALUATOR_ID = "provisional-within-user-v2"
+MAX_FULL_ATTEMPTS = 50
 
 
 def _populate_source_identity(value: object, field: str) -> object:
@@ -389,10 +390,14 @@ class CriterionResolutionClaim(ContractModel):
     def normalize_blocker_ids(self) -> CriterionResolutionClaim:
         if self.status == CriterionAssessmentStatus.FAIL:
             raise ValueError("failed criteria cannot claim resolution")
-        if self.status in (
-            CriterionAssessmentStatus.PASS,
-            CriterionAssessmentStatus.PARTIAL,
-        ) and not self.evidence_refs:
+        if (
+            self.status
+            in (
+                CriterionAssessmentStatus.PASS,
+                CriterionAssessmentStatus.PARTIAL,
+            )
+            and not self.evidence_refs
+        ):
             raise ValueError("pass or partial resolution claims require evidence_refs")
         if self.blocker_id is not None and self.blocker_id not in self.blocker_ids:
             return self.model_copy(update={"blocker_ids": (self.blocker_id, *self.blocker_ids)})
@@ -450,9 +455,7 @@ class ImplementationRequest(ContractModel):
     allowed_scopes: tuple[str, ...]
     # Write scopes and controller-derived read scopes are intentionally separate.
     read_scopes: tuple[str, ...] = ()
-    implementation_criteria: tuple[ImplementationCriterionId, ...] = (
-        DEFAULT_IMPLEMENTATION_CRITERIA
-    )
+    implementation_criteria: tuple[ImplementationCriterionId, ...] = DEFAULT_IMPLEMENTATION_CRITERIA
     criterion_requirements: tuple[ImplementationCriterion, ...] = ()
     capabilities: tuple[str, ...] = ()
     repair_feedback: str | None = None
@@ -543,6 +546,7 @@ class ValidationOperationIdentity(ContractModel):
     repair_attempt: Annotated[int, Field(ge=0, le=3)]
     subject_sha256: Sha256
     implementation_diff_sha256: Sha256 | None = None
+
 
 class ValidationBlocker(ContractModel):
     """A durable, independently addressable validation failure."""
@@ -724,9 +728,7 @@ class ValidationReport(ContractModel):
 
     @model_validator(mode="after")
     def validate_blockers(self) -> ValidationReport:
-        criterion_ids = tuple(
-            assessment.criterion_id for assessment in self.criterion_assessments
-        )
+        criterion_ids = tuple(assessment.criterion_id for assessment in self.criterion_assessments)
         if len(set(criterion_ids)) != len(criterion_ids):
             raise ValueError("criterion_assessments must contain unique criterion IDs")
         if len(set(self.resolves_blocker_ids)) != len(self.resolves_blocker_ids):
@@ -741,9 +743,7 @@ class ValidationReport(ContractModel):
             ):
                 raise ValueError("validation blocker identity does not match its report")
         claimed_ids = tuple(
-            blocker_id
-            for claim in self.resolution_claims
-            for blocker_id in claim.blocker_ids
+            blocker_id for claim in self.resolution_claims for blocker_id in claim.blocker_ids
         )
         all_resolved_ids = (*self.resolves_blocker_ids, *claimed_ids)
         if len(set(all_resolved_ids)) != len(all_resolved_ids):
@@ -831,9 +831,7 @@ class ExecutionResult(ContractModel):
     memory_measurement_status: Literal["measured", "unavailable"] = "unavailable"
     resource_measurement_basis: Literal["docker_stats", "unavailable"] = "unavailable"
     measured_gpu_hours: Annotated[float, Field(ge=0.0)] | None = None
-    gpu_telemetry_status: Literal["measured", "unavailable", "not_requested"] = (
-        "not_requested"
-    )
+    gpu_telemetry_status: Literal["measured", "unavailable", "not_requested"] = "not_requested"
     smoke_output_valid: bool = False
     scientific_evidence: bool = True
 
@@ -1176,6 +1174,122 @@ class EvaluationResult(ContractModel):
         raise ValueError("both metrics from one judging pair are required")
 
 
+class FullAttemptClaimRequest(ContractModel):
+    """Identity supplied when the controller claims a fresh full execution."""
+
+    schema_version: Literal["1"] = "1"
+    attempt_id: Annotated[str, Field(min_length=1)]
+    execution_id: Annotated[str, Field(min_length=1)]
+    run_id: Annotated[str, Field(min_length=1)]
+    experiment_id: Annotated[str, Field(min_length=1)]
+    source_registration_id: Annotated[str, Field(min_length=1)]
+    source_commit: FullCommitSha
+
+
+class FullScientificAttemptClaim(ContractModel):
+    """Immutable authority record for one counted, full scientific attempt."""
+
+    schema_version: Literal["1"] = "1"
+    attempt_id: Annotated[str, Field(min_length=1)]
+    execution_id: Annotated[str, Field(min_length=1)]
+    run_id: Annotated[str, Field(min_length=1)]
+    experiment_id: Annotated[str, Field(min_length=1)]
+    source_registration_id: Annotated[str, Field(min_length=1)]
+    source_commit: FullCommitSha
+    attempt_sequence: Annotated[int, Field(ge=1, le=50)]
+    claimed_at: datetime
+    max_attempts: Literal[50] = 50
+    attempt_policy_id: Literal["full-attempt-cap-v1"] = "full-attempt-cap-v1"
+
+    @model_validator(mode="after")
+    def validate_sequence_against_cap(self) -> FullScientificAttemptClaim:
+        if self.attempt_sequence > MAX_FULL_ATTEMPTS:
+            raise ValueError("attempt sequence exceeds the fixed attempt cap")
+        if self.claimed_at.tzinfo is None:
+            raise ValueError("claimed_at must include timezone information")
+        return self
+
+
+class ChampionBinding(ContractModel):
+    """The complete provenance identity of the selected validation champion."""
+
+    observation_id: Annotated[str, Field(min_length=1)]
+    attempt_id: Annotated[str, Field(min_length=1)]
+    execution_id: Annotated[str, Field(min_length=1)]
+    evaluation_id: Annotated[str, Field(min_length=1)]
+    checkpoint_id: Annotated[str, Field(min_length=1)]
+    source_commit: FullCommitSha
+    attempt_sequence: Annotated[int, Field(ge=1, le=50)]
+    primary_score: Annotated[float, Field(ge=0.0, le=1.0)]
+
+
+class ScoredObservationRequest(ContractModel):
+    """Caller-supplied identity and evidence for one scored observation."""
+
+    schema_version: Literal["1"] = "1"
+    observation_id: Annotated[str, Field(min_length=1)]
+    run_id: Annotated[str, Field(min_length=1)]
+    experiment_id: Annotated[str, Field(min_length=1)]
+    attempt_id: Annotated[str, Field(min_length=1)]
+    execution_id: Annotated[str, Field(min_length=1)]
+    evaluation_id: Annotated[str, Field(min_length=1)]
+    checkpoint_id: Annotated[str, Field(min_length=1)]
+    source_commit: FullCommitSha
+    evaluator_id: Annotated[str, Field(min_length=1)]
+    evaluator_sha256: Sha256
+    dataset_manifest_id: Annotated[str, Field(min_length=1)]
+    dataset_manifest_sha256: Sha256
+    split: Literal["valid"] = "valid"
+    validity: Literal["provisional", "official"]
+    primary_score: Annotated[float, Field(ge=0.0, le=1.0)]
+    validation_report_id: Annotated[str, Field(min_length=1)]
+    validation_evidence_refs: Annotated[
+        tuple[Annotated[str, Field(min_length=1)], ...], Field(min_length=1)
+    ]
+    validation_status: Literal["approved"] = "approved"
+    label: Literal["long_view"] = "long_view"
+
+
+class ScoredObservation(ScoredObservationRequest):
+    """An approved, comparable validation score attached to one full attempt."""
+
+    scored_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @model_validator(mode="after")
+    def validate_scored_at(self) -> ScoredObservation:
+        if self.scored_at.tzinfo is None:
+            raise ValueError("scored_at must include timezone information")
+        return self
+
+
+class RunClosure(ContractModel):
+    """Immutable stopping decision and optional champion binding for a run."""
+
+    schema_version: Literal["1"] = "1"
+    closure_id: Annotated[str, Field(min_length=1)]
+    run_id: Annotated[str, Field(min_length=1)]
+    reason: Literal["plateau", "attempt_cap"]
+    attempt_count: Annotated[int, Field(ge=0, le=50)]
+    scored_observation_count: Annotated[int, Field(ge=0)]
+    max_attempts: Literal[50] = 50
+    champion: ChampionBinding | None = None
+    closed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @model_validator(mode="after")
+    def validate_closure(self) -> RunClosure:
+        if self.attempt_count > self.max_attempts:
+            raise ValueError("closure attempt count exceeds the fixed attempt cap")
+        if self.scored_observation_count > self.attempt_count:
+            raise ValueError("scored observations cannot exceed attempts")
+        if self.reason == "attempt_cap" and self.attempt_count != self.max_attempts:
+            raise ValueError("attempt-cap closure requires consuming the fixed cap")
+        if self.champion is not None and self.scored_observation_count == 0:
+            raise ValueError("a champion requires an eligible scored observation")
+        if self.closed_at.tzinfo is None:
+            raise ValueError("closed_at must include timezone information")
+        return self
+
+
 class DiagnosticMetricValue(ContractModel):
     name: Literal["GAUC", "nDCG@5", "primary"]
     value: float
@@ -1335,12 +1449,12 @@ class ExperimentExecutionContract(ContractModel):
         "--dataset-manifest-sha256",
         "--data-root",
     )
-    required_dataset_hash_arguments: tuple[
-        Literal["--dataset-manifest-sha256"], ...
-    ] = ("--dataset-manifest-sha256",)
-    optional_dataset_hash_arguments: tuple[
-        Literal["--dataset-view-sha256"], ...
-    ] = ("--dataset-view-sha256",)
+    required_dataset_hash_arguments: tuple[Literal["--dataset-manifest-sha256"], ...] = (
+        "--dataset-manifest-sha256",
+    )
+    optional_dataset_hash_arguments: tuple[Literal["--dataset-view-sha256"], ...] = (
+        "--dataset-view-sha256",
+    )
     available_splits: tuple[Literal["train", "valid"], ...] = ("train", "valid")
     prediction_split: Literal["valid"] = "valid"
     prediction_rows: Literal["exact_valid_manifest_rows_in_manifest_order"] = (

@@ -5,34 +5,48 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from tiktok2026.contracts import (
+    MAX_FULL_ATTEMPTS,
     ArtifactRecord,
     AuditEvent,
     BaselineCalibrationRecord,
     BlockerResolution,
+    ChampionBinding,
     CriterionAssessmentStatus,
     CriterionResolutionClaim,
+    EvaluationResult,
     EvaluatorIdentity,
+    ExecutionResult,
     ExperimentRegistryEntry,
     ExperimentSpec,
+    FailureRecord,
     FinalizationRecord,
     FinalTestAuthorizationRequest,
     FinalTestClaim,
     FinalTestRequest,
+    FullAttemptClaimRequest,
+    FullScientificAttemptClaim,
     ImplementationCriterionAssessment,
     ImplementationValidationAuthority,
+    ProvenanceRequest,
     ProvisionalFinalizationRequest,
+    ResourceReservation,
     RunBaselineBinding,
+    RunClosure,
     RunRecord,
+    ScoredObservation,
+    ScoredObservationRequest,
     SourceRegistration,
     ValidationBlocker,
     ValidationOperationIdentity,
     ValidationReport,
     ValidationStage,
+    ValidationVerdict,
 )
 from tiktok2026.persistence.migrations import MigrationRunner, application_migrations_path
+from tiktok2026.policies.lifecycle import convergence_reason
 from tiktok2026.repository.diffs import patch_signature
 
 
@@ -56,6 +70,18 @@ class PersistedFinalTestClaimResolver:
 
 def _content_hash(payload: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _authority_timestamp(value: object, evidence: str) -> datetime:
+    if not isinstance(value, str):
+        raise PersistenceConflictError(f"malformed {evidence} timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise PersistenceConflictError(f"malformed {evidence} timestamp") from error
+    if parsed.tzinfo is None:
+        raise PersistenceConflictError(f"timezone missing from {evidence} timestamp")
+    return parsed.astimezone(UTC)
 
 
 class ApplicationRepository:
@@ -95,10 +121,13 @@ class ApplicationRepository:
                     "(experiment_id, spec_json, content_sha256, created_at) VALUES (?, ?, ?, ?)",
                     (experiment_id, payload, digest, now),
                 )
-                if connection.execute(
-                    "SELECT 1 FROM experiment_states WHERE experiment_id = ? LIMIT 1",
-                    (experiment_id,),
-                ).fetchone() is None:
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM experiment_states WHERE experiment_id = ? LIMIT 1",
+                        (experiment_id,),
+                    ).fetchone()
+                    is None
+                ):
                     connection.execute(
                         "INSERT INTO experiment_states "
                         "(experiment_id, status, transition_id, content_sha256, created_at) "
@@ -113,9 +142,12 @@ class ApplicationRepository:
                     )
             runs = connection.execute("SELECT run_id, status FROM runs").fetchall()
             for run_id, status in runs:
-                if connection.execute(
-                    "SELECT 1 FROM run_states WHERE run_id = ? LIMIT 1", (run_id,)
-                ).fetchone() is None:
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM run_states WHERE run_id = ? LIMIT 1", (run_id,)
+                    ).fetchone()
+                    is None
+                ):
                     connection.execute(
                         "INSERT INTO run_states "
                         "(run_id, status, transition_id, content_sha256, created_at) "
@@ -132,10 +164,14 @@ class ApplicationRepository:
             # some runtime databases.  Adopt only this explicitly supported
             # legacy authority kind; other generic records remain generic.
             legacy_calibrations = connection.execute(
-                "SELECT record_id, payload_json FROM records "
+                "SELECT record_id, payload_json, content_sha256 FROM records "
                 "WHERE kind = 'baseline_calibration' ORDER BY record_id"
             ).fetchall()
-            for record_id, legacy_payload in legacy_calibrations:
+            for record_id, legacy_payload, legacy_digest in legacy_calibrations:
+                if legacy_digest is None or _content_hash(legacy_payload) != legacy_digest:
+                    raise PersistenceConflictError(
+                        f"persisted baseline calibration {record_id} integrity check failed"
+                    )
                 record = BaselineCalibrationRecord.model_validate_json(legacy_payload)
                 payload = record.model_dump_json()
                 digest = _content_hash(payload)
@@ -253,14 +289,15 @@ class ApplicationRepository:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
-                "SELECT payload_json FROM records WHERE kind = 'transition' AND record_id = ?",
+                "SELECT payload_json, content_sha256 FROM records "
+                "WHERE kind = 'transition' AND record_id = ?",
                 (record_id,),
             ).fetchone()
             if existing is not None:
+                if existing[1] is None or _content_hash(existing[0]) != existing[1]:
+                    raise PersistenceConflictError("record transition integrity check failed")
                 if existing[0] != payload:
-                    raise PersistenceConflictError(
-                        f"transition {record_id} content changed"
-                    )
+                    raise PersistenceConflictError(f"transition {record_id} content changed")
                 # An interrupted transaction cannot leave this path half
                 # committed, but older data may lack its audit event.  Repair
                 # that event during an identical, idempotent retry.
@@ -276,19 +313,19 @@ class ApplicationRepository:
                     actual.pop("created_at", None)
                     expected.pop("created_at", None)
                     if actual != expected:
-                        raise PersistenceConflictError(
-                            f"audit event {event_id} content changed"
-                        )
+                        raise PersistenceConflictError(f"audit event {event_id} content changed")
                 return
 
             rows = connection.execute(
-                "SELECT payload_json FROM records WHERE kind = 'transition'"
+                "SELECT payload_json, content_sha256 FROM records WHERE kind = 'transition'"
             ).fetchall()
-            versions = {
-                int(value["state_version"])
-                for (raw,) in rows
-                if (value := json.loads(raw)).get("run_id") == run_id
-            }
+            versions: set[int] = set()
+            for raw, digest in rows:
+                if digest is None or _content_hash(raw) != digest:
+                    raise PersistenceConflictError("record transition integrity check failed")
+                value = json.loads(raw)
+                if value.get("run_id") == run_id:
+                    versions.add(int(value["state_version"]))
             if state_version == 1:
                 if versions:
                     raise PersistenceConflictError("transition version one has a predecessor")
@@ -297,8 +334,9 @@ class ApplicationRepository:
             ):
                 raise PersistenceConflictError("transition CAS predecessor is stale")
             connection.execute(
-                "INSERT INTO records (kind, record_id, payload_json) VALUES ('transition', ?, ?)",
-                (record_id, payload),
+                "INSERT INTO records (kind, record_id, payload_json, content_sha256) "
+                "VALUES ('transition', ?, ?, ?)",
+                (record_id, payload, _content_hash(payload)),
             )
             audit = connection.execute(
                 "SELECT payload_json FROM audit_events WHERE event_id = ?",
@@ -312,9 +350,7 @@ class ApplicationRepository:
                 actual.pop("created_at", None)
                 expected.pop("created_at", None)
                 if actual != expected:
-                    raise PersistenceConflictError(
-                        f"audit event {event.event_id} content changed"
-                    )
+                    raise PersistenceConflictError(f"audit event {event.event_id} content changed")
 
     def register_artifact(self, record: ArtifactRecord) -> None:
         payload = record.model_dump_json()
@@ -328,9 +364,7 @@ class ApplicationRepository:
             ).fetchone()
             if row is not None:
                 if row[0] != digest:
-                    raise PersistenceConflictError(
-                        f"artifact {record.artifact_id} content changed"
-                    )
+                    raise PersistenceConflictError(f"artifact {record.artifact_id} content changed")
                 return
             connection.execute(
                 "INSERT INTO authority_artifacts "
@@ -428,12 +462,7 @@ class ApplicationRepository:
         if artifact_row is None:
             raise ValueError("source patch artifact is not registered")
         artifact = ArtifactRecord.model_validate_json(artifact_row[0])
-        expected_parent = (
-            self.database.parent
-            / "artifacts"
-            / run_id
-            / experiment_id
-        ).resolve()
+        expected_parent = (self.database.parent / "artifacts" / run_id / experiment_id).resolve()
         artifact_path = Path(artifact.uri.removeprefix("file://")).resolve()
         if not artifact_path.is_file():
             raise ValueError("source patch artifact is unavailable")
@@ -617,9 +646,10 @@ class ApplicationRepository:
         digest = _content_hash(operation_json + subject_json)
         subject_for_identity = dict(json.loads(subject_json))
         subject_for_identity.pop("validation_operation", None)
-        if _content_hash(
-            json.dumps(subject_for_identity, sort_keys=True, separators=(",", ":"))
-        ) != operation.subject_sha256:
+        if (
+            _content_hash(json.dumps(subject_for_identity, sort_keys=True, separators=(",", ":")))
+            != operation.subject_sha256
+        ):
             raise PersistenceConflictError("validation subject identity does not match operation")
         authority = subject_for_identity.get("implementation_authority")
         if operation.stage == ValidationStage.IMPLEMENTATION:
@@ -634,9 +664,7 @@ class ApplicationRepository:
                     "implementation validation authority is invalid"
                 ) from error
             if parsed_authority.diff_sha256 != operation.implementation_diff_sha256:
-                raise PersistenceConflictError(
-                    "validation authority diff does not match operation"
-                )
+                raise PersistenceConflictError("validation authority diff does not match operation")
             if parsed_authority.evidence_id != (
                 f"implementation-diff-{parsed_authority.diff_sha256}"
             ):
@@ -699,9 +727,7 @@ class ApplicationRepository:
             raise PersistenceConflictError("validation report is bound to another operation")
         if set(report.resolves_blocker_ids) & {b.blocker_id for b in report.blockers}:
             raise ValueError("a validation report cannot resolve a blocker it introduces")
-        bound_report = report.model_copy(
-            update={"validation_operation_id": operation.operation_id}
-        )
+        bound_report = report.model_copy(update={"validation_operation_id": operation.operation_id})
         payload = bound_report.model_dump_json()
         digest = _content_hash(payload)
         now = datetime.now(UTC).isoformat()
@@ -830,12 +856,9 @@ class ApplicationRepository:
                 blocker_ids = tuple(
                     blocker.blocker_id
                     for blocker in report.blockers
-                    if blocker.criterion_id is not None
-                    and str(blocker.criterion_id) == criterion
+                    if blocker.criterion_id is not None and str(blocker.criterion_id) == criterion
                 )
-                self._persist_criterion_occurrence(
-                    connection, report, assessment, blocker_ids, now
-                )
+                self._persist_criterion_occurrence(connection, report, assessment, blocker_ids, now)
 
             claim_ids = [str(claim.criterion_id) for claim in report.resolution_claims]
             if len(set(claim_ids)) != len(claim_ids):
@@ -876,9 +899,7 @@ class ApplicationRepository:
                 if criterion_id is not None and str(blocker.criterion_id) != criterion_id:
                     raise ValueError("criterion resolution claim does not match blocker")
                 resolution = BlockerResolution(
-                    resolution_id=self._resolution_id(
-                        report.report_id, blocker_id, evidence_refs
-                    ),
+                    resolution_id=self._resolution_id(report.report_id, blocker_id, evidence_refs),
                     blocker_id=blocker_id,
                     report_id=report.report_id,
                     experiment_id=report.experiment_id,
@@ -965,9 +986,7 @@ class ApplicationRepository:
                 "blocker resolution requires an approved or repairable validation report"
             )
         claimed_ids = {
-            blocker_id
-            for claim in report.resolution_claims
-            for blocker_id in claim.blocker_ids
+            blocker_id for claim in report.resolution_claims for blocker_id in claim.blocker_ids
         }
         partially_claimed_ids = {
             blocker_id
@@ -1058,9 +1077,7 @@ class ApplicationRepository:
             ).fetchone()
         return ValidationReport.model_validate_json(row[0]) if row else None
 
-    def get_validation_report_by_operation(
-        self, operation_id: str
-    ) -> ValidationReport | None:
+    def get_validation_report_by_operation(self, operation_id: str) -> ValidationReport | None:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT report_json FROM authority_validation_reports "
@@ -1085,13 +1102,10 @@ class ApplicationRepository:
             raise PersistenceConflictError("validation attempt has multiple authoritative reports")
         return ValidationReport.model_validate_json(rows[0][0]) if rows else None
 
-    def get_validation_operation(
-        self, operation_id: str
-    ) -> ValidationOperationIdentity | None:
+    def get_validation_operation(self, operation_id: str) -> ValidationOperationIdentity | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT operation_json FROM authority_validation_operations "
-                "WHERE operation_id = ?",
+                "SELECT operation_json FROM authority_validation_operations WHERE operation_id = ?",
                 (operation_id,),
             ).fetchone()
         return ValidationOperationIdentity.model_validate_json(row[0]) if row else None
@@ -1146,8 +1160,7 @@ class ApplicationRepository:
     def get_blocker_resolution(self, resolution_id: str) -> BlockerResolution | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT resolution_json FROM authority_blocker_resolutions "
-                "WHERE resolution_id = ?",
+                "SELECT resolution_json FROM authority_blocker_resolutions WHERE resolution_id = ?",
                 (resolution_id,),
             ).fetchone()
         return BlockerResolution.model_validate_json(row[0]) if row else None
@@ -1246,6 +1259,1459 @@ class ApplicationRepository:
             ).fetchone()
         return int(row[0])
 
+    @staticmethod
+    def _attempt_identity_digest(claim: FullScientificAttemptClaim) -> str:
+        value = claim.model_dump(mode="json")
+        value.pop("attempt_sequence", None)
+        value.pop("claimed_at", None)
+        material = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return _content_hash(material)
+
+    @staticmethod
+    def _observation_identity_digest(
+        observation: ScoredObservation | ScoredObservationRequest,
+    ) -> str:
+        value = observation.model_dump(mode="json")
+        value.pop("scored_at", None)
+        material = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return _content_hash(material)
+
+    def _verified_record(self, connection: sqlite3.Connection, kind: str, record_id: str) -> str:
+        row = connection.execute(
+            "SELECT payload_json, content_sha256 FROM records WHERE kind = ? AND record_id = ?",
+            (kind, record_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"persisted {kind} {record_id} is absent")
+        if row[1] is None or _content_hash(row[0]) != row[1]:
+            raise PersistenceConflictError(f"persisted {kind} {record_id} integrity check failed")
+        return row[0]
+
+    @staticmethod
+    def _indexed_identity(
+        connection: sqlite3.Connection,
+        table: str,
+        identity_column: str,
+        identity: str,
+        columns: tuple[str, ...],
+        expected: tuple[object, ...],
+    ) -> tuple[object, ...]:
+        selected = ", ".join(columns)
+        row = connection.execute(
+            f"SELECT {selected} FROM {table} WHERE {identity_column} = ?", (identity,)
+        ).fetchone()
+        if row is None or tuple(row) != expected:
+            raise PersistenceConflictError(f"persisted {table} identity columns are inconsistent")
+        return row
+
+    def _validate_attempt_source(
+        self, connection: sqlite3.Connection, request: FullAttemptClaimRequest
+    ) -> None:
+        row = self._indexed_identity(
+            connection,
+            "source_registrations",
+            "registration_id",
+            request.source_registration_id,
+            ("registration_id", "experiment_id", "run_id", "source_commit", "eligible"),
+            (
+                request.source_registration_id,
+                request.experiment_id,
+                request.run_id,
+                request.source_commit,
+                1,
+            ),
+        )
+        source_row = connection.execute(
+            "SELECT registration_json, content_sha256 FROM source_registrations "
+            "WHERE registration_id = ?",
+            (request.source_registration_id,),
+        ).fetchone()
+        if source_row is None or source_row[1] is None:
+            raise PersistenceConflictError("source registration integrity check failed")
+        if _content_hash(source_row[0]) != source_row[1]:
+            raise PersistenceConflictError("source registration integrity check failed")
+        source = SourceRegistration.model_validate_json(source_row[0])
+        if (
+            tuple(row)
+            != (
+                source.registration_id,
+                source.experiment_id,
+                source.run_id,
+                source.source_commit,
+                1 if source.eligible else 0,
+            )
+            or not source.eligible
+            or source.registration_id != request.source_registration_id
+            or source.experiment_id != request.experiment_id
+            or source.run_id != request.run_id
+            or source.source_commit != request.source_commit
+        ):
+            raise ValueError("claim source registration is not the exact eligible source")
+
+    def claim_full_attempt(
+        self, request: FullAttemptClaimRequest
+    ) -> FullScientificAttemptClaim | None:
+        """Atomically claim the next fresh full attempt for a run.
+
+        The sequence is assigned while holding ``BEGIN IMMEDIATE``.  A replay is
+        keyed by the stable attempt/execution identity and returns the original
+        authority record without consuming another sequence.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT claim_json, identity_sha256, content_sha256, attempt_id, execution_id, "
+                "run_id, experiment_id, source_registration_id, source_commit "
+                "FROM authority_full_attempt_claims "
+                "WHERE execution_id = ? OR attempt_id = ?",
+                (request.execution_id, request.attempt_id),
+            ).fetchone()
+            if existing is not None:
+                if existing[2] is None or _content_hash(existing[0]) != existing[2]:
+                    raise PersistenceConflictError(
+                        "persisted full attempt claim integrity check failed"
+                    )
+                existing_claim = FullScientificAttemptClaim.model_validate_json(existing[0])
+                if tuple(existing[3:]) != (
+                    existing_claim.attempt_id,
+                    existing_claim.execution_id,
+                    existing_claim.run_id,
+                    existing_claim.experiment_id,
+                    existing_claim.source_registration_id,
+                    existing_claim.source_commit,
+                ):
+                    raise PersistenceConflictError(
+                        "persisted full attempt claim identity is inconsistent"
+                    )
+                identity = self._attempt_identity_digest(existing_claim)
+                requested = FullScientificAttemptClaim(
+                    **request.model_dump(),
+                    attempt_sequence=existing_claim.attempt_sequence,
+                    claimed_at=existing_claim.claimed_at,
+                )
+                if existing[1] != identity or identity != self._attempt_identity_digest(requested):
+                    raise PersistenceConflictError(
+                        f"full attempt {request.execution_id} identity changed"
+                    )
+                return existing_claim
+
+            if connection.execute(
+                "SELECT 1 FROM authority_run_closures WHERE run_id = ?", (request.run_id,)
+            ).fetchone():
+                raise PersistenceConflictError("run is already closed")
+            self._validate_attempt_source(connection, request)
+            next_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(attempt_sequence), 0) + 1 "
+                    "FROM authority_full_attempt_claims WHERE run_id = ?",
+                    (request.run_id,),
+                ).fetchone()[0]
+            )
+            if next_sequence > MAX_FULL_ATTEMPTS:
+                return None
+            record = FullScientificAttemptClaim(
+                **request.model_dump(),
+                attempt_sequence=next_sequence,
+                claimed_at=datetime.now(UTC),
+            )
+            payload = record.model_dump_json()
+            identity_digest = self._attempt_identity_digest(record)
+            now = datetime.now(UTC).isoformat()
+            connection.execute(
+                "INSERT INTO authority_full_attempt_claims "
+                "(attempt_id, execution_id, run_id, experiment_id, source_registration_id, "
+                "source_commit, attempt_sequence, max_attempts, attempt_policy_id, claim_json, "
+                "identity_sha256, content_sha256, claimed_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.attempt_id,
+                    record.execution_id,
+                    record.run_id,
+                    record.experiment_id,
+                    record.source_registration_id,
+                    record.source_commit,
+                    record.attempt_sequence,
+                    record.max_attempts,
+                    record.attempt_policy_id,
+                    payload,
+                    identity_digest,
+                    _content_hash(payload),
+                    record.claimed_at.isoformat(),
+                    now,
+                ),
+            )
+            self._insert_audit(
+                connection,
+                self._automatic_event(
+                    "full_attempt_claimed",
+                    record.run_id,
+                    record.experiment_id,
+                    {
+                        "attempt_id": record.attempt_id,
+                        "execution_id": record.execution_id,
+                        "attempt_sequence": record.attempt_sequence,
+                    },
+                    now,
+                ),
+            )
+            return record
+
+    def count_full_attempt_claims(self, run_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM authority_full_attempt_claims WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return int(row[0])
+
+    def get_full_attempt_claim(self, attempt_id: str) -> FullScientificAttemptClaim | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT claim_json, content_sha256, attempt_id, execution_id, run_id, "
+                "experiment_id, source_registration_id, source_commit "
+                "FROM authority_full_attempt_claims "
+                "WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row[1] is None or _content_hash(row[0]) != row[1]:
+            raise PersistenceConflictError("persisted full attempt claim integrity check failed")
+        claim = FullScientificAttemptClaim.model_validate_json(row[0])
+        if tuple(row[2:]) != (
+            claim.attempt_id,
+            claim.execution_id,
+            claim.run_id,
+            claim.experiment_id,
+            claim.source_registration_id,
+            claim.source_commit,
+        ):
+            raise PersistenceConflictError("persisted full attempt claim identity is inconsistent")
+        return claim
+
+    def list_full_attempt_claims(
+        self, run_id: str | None = None
+    ) -> tuple[FullScientificAttemptClaim, ...]:
+        query = (
+            "SELECT claim_json, content_sha256, attempt_id, execution_id, run_id, "
+            "experiment_id, source_registration_id, source_commit "
+            "FROM authority_full_attempt_claims"
+        )
+        parameters: tuple[object, ...] = ()
+        if run_id is not None:
+            query += " WHERE run_id = ?"
+            parameters = (run_id,)
+        query += " ORDER BY run_id, attempt_sequence, attempt_id"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        claims: list[FullScientificAttemptClaim] = []
+        for row in rows:
+            if row[1] is None or _content_hash(row[0]) != row[1]:
+                raise PersistenceConflictError(
+                    "persisted full attempt claim integrity check failed"
+                )
+            claim = FullScientificAttemptClaim.model_validate_json(row[0])
+            if tuple(
+                (
+                    claim.attempt_id,
+                    claim.execution_id,
+                    claim.run_id,
+                    claim.experiment_id,
+                    claim.source_registration_id,
+                    claim.source_commit,
+                )
+            ) != tuple(row[2:]):
+                raise PersistenceConflictError(
+                    "persisted full attempt claim identity is inconsistent"
+                )
+            claims.append(claim)
+        return tuple(claims)
+
+    def put_scored_observation(
+        self, request: ScoredObservationRequest
+    ) -> ScoredObservation:
+        """Persist one approved score as an immutable, idempotent authority record."""
+        identity_digest = self._observation_identity_digest(request)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT observation_json, identity_sha256, content_sha256, run_id, experiment_id, "
+                "attempt_id, evaluation_id, checkpoint_id FROM authority_scored_observations "
+                "WHERE observation_id = ?",
+                (request.observation_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing[2] is None or _content_hash(existing[0]) != existing[2]:
+                    raise PersistenceConflictError(
+                        "persisted scored observation integrity check failed"
+                    )
+                existing_observation = ScoredObservation.model_validate_json(existing[0])
+                if tuple(existing[3:]) != (
+                    existing_observation.run_id,
+                    existing_observation.experiment_id,
+                    existing_observation.attempt_id,
+                    existing_observation.evaluation_id,
+                    existing_observation.checkpoint_id,
+                ):
+                    raise PersistenceConflictError(
+                        "persisted scored observation identity is inconsistent"
+                    )
+                if existing[1] != identity_digest:
+                    raise PersistenceConflictError(
+                        f"scored observation {request.observation_id} content changed"
+                    )
+                return existing_observation
+            observation = ScoredObservation(
+                **request.model_dump(),
+                scored_at=datetime.now(UTC),
+            )
+            payload = observation.model_dump_json()
+            now = datetime.now(UTC).isoformat()
+            self._validate_observation(connection, observation)
+            if connection.execute(
+                "SELECT 1 FROM authority_run_closures WHERE run_id = ?", (observation.run_id,)
+            ).fetchone():
+                raise PersistenceConflictError("run is already closed")
+            duplicate = connection.execute(
+                "SELECT observation_id FROM authority_scored_observations "
+                "WHERE attempt_id = ? OR evaluation_id = ?",
+                (observation.attempt_id, observation.evaluation_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise PersistenceConflictError(
+                    f"attempt or evaluation already has observation {duplicate[0]}"
+                )
+            connection.execute(
+                "INSERT INTO authority_scored_observations "
+                "(observation_id, run_id, experiment_id, attempt_id, evaluation_id, checkpoint_id, "
+                "observation_json, identity_sha256, content_sha256, scored_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    observation.observation_id,
+                    observation.run_id,
+                    observation.experiment_id,
+                    observation.attempt_id,
+                    observation.evaluation_id,
+                    observation.checkpoint_id,
+                    payload,
+                    identity_digest,
+                    _content_hash(payload),
+                    observation.scored_at.isoformat(),
+                    now,
+                ),
+            )
+            self._insert_audit(
+                connection,
+                self._automatic_event(
+                    "scored_observation_persisted",
+                    observation.run_id,
+                    observation.experiment_id,
+                    {"observation_id": observation.observation_id},
+                    now,
+                ),
+            )
+            return observation
+
+    def _validate_observation(
+        self, connection: sqlite3.Connection, observation: ScoredObservation
+    ) -> None:
+        attempt_row = connection.execute(
+            "SELECT claim_json, content_sha256, attempt_id, run_id, experiment_id, "
+            "execution_id, source_registration_id, source_commit, attempt_sequence "
+            "FROM authority_full_attempt_claims WHERE attempt_id = ?",
+            (observation.attempt_id,),
+        ).fetchone()
+        if attempt_row is None:
+            raise ValueError("scored observation requires a persisted full attempt")
+        if attempt_row[1] is None or _content_hash(attempt_row[0]) != attempt_row[1]:
+            raise PersistenceConflictError("persisted full attempt claim integrity check failed")
+        attempt = FullScientificAttemptClaim.model_validate_json(attempt_row[0])
+        if tuple(attempt_row[2:]) != (
+            attempt.attempt_id,
+            attempt.run_id,
+            attempt.experiment_id,
+            attempt.execution_id,
+            attempt.source_registration_id,
+            attempt.source_commit,
+            attempt.attempt_sequence,
+        ):
+            raise PersistenceConflictError("persisted full attempt claim identity is inconsistent")
+        if (
+            observation.run_id != attempt.run_id
+            or observation.experiment_id != attempt.experiment_id
+            or observation.execution_id != attempt.execution_id
+            or observation.source_commit != attempt.source_commit
+        ):
+            raise ValueError("scored observation does not match its attempt provenance")
+        self._validate_attempt_source(
+            connection,
+            FullAttemptClaimRequest(
+                attempt_id=attempt.attempt_id,
+                execution_id=attempt.execution_id,
+                run_id=attempt.run_id,
+                experiment_id=attempt.experiment_id,
+                source_registration_id=attempt.source_registration_id,
+                source_commit=attempt.source_commit,
+            ),
+        )
+
+        execution = ExecutionResult.model_validate_json(
+            self._verified_record(connection, "execution", observation.execution_id)
+        )
+        if (
+            execution.execution_id != attempt.execution_id
+            or execution.experiment_id != attempt.experiment_id
+            or execution.source_registration_id != attempt.source_registration_id
+            or execution.source_commit != attempt.source_commit
+            or execution.execution_kind != "full"
+            or execution.exit_code != 0
+            or execution.checkpoint_id != observation.checkpoint_id
+            or execution.dataset_manifest_id != observation.dataset_manifest_id
+            or execution.dataset_manifest_sha256 != observation.dataset_manifest_sha256
+        ):
+            raise ValueError("scored observation execution provenance is invalid")
+
+        evaluation_payload = json.loads(
+            self._verified_record(connection, "evaluation", observation.evaluation_id)
+        )
+        if not isinstance(evaluation_payload, dict) or "result" not in evaluation_payload:
+            raise ValueError("scored observation requires a typed persisted evaluation")
+        evaluation = EvaluationResult.model_validate(evaluation_payload["result"])
+        provenance = ProvenanceRequest.model_validate(evaluation_payload.get("provenance"))
+        if (
+            evaluation.evaluation_id != observation.evaluation_id
+            or evaluation.experiment_id != observation.experiment_id
+            or evaluation.checkpoint_id != observation.checkpoint_id
+            or evaluation.run_id != observation.run_id
+            or evaluation.source_commit != observation.source_commit
+            or evaluation.execution_id != observation.execution_id
+            or evaluation.dataset_manifest_id != observation.dataset_manifest_id
+            or evaluation.dataset_manifest_sha256 != observation.dataset_manifest_sha256
+            or evaluation.split != observation.split
+            or evaluation.validity != observation.validity
+            or evaluation.evaluator_artifact_id != observation.evaluator_id
+            or evaluation.evaluator_sha256 != observation.evaluator_sha256
+            or provenance.run_id != observation.run_id
+            or provenance.experiment_id != observation.experiment_id
+            or provenance.source_commit != observation.source_commit
+            or provenance.execution_id != observation.execution_id
+            or provenance.dataset_manifest_id != observation.dataset_manifest_id
+            or provenance.dataset_manifest_sha256 != observation.dataset_manifest_sha256
+            or provenance.evaluator_id != observation.evaluator_id
+            or provenance.evaluator_sha256 != observation.evaluator_sha256
+        ):
+            raise ValueError("scored observation evaluation provenance is invalid")
+        metrics = {metric.name: metric.value for metric in evaluation.metrics}
+        if set(metrics) != {"GAUC", "nDCG@5"} or len(metrics) != 2:
+            raise ValueError("scored observation requires current GAUC and nDCG@5 metrics")
+        from decimal import Decimal
+
+        computed_score = (Decimal(str(metrics["GAUC"])) + Decimal(str(metrics["nDCG@5"]))) / 2
+        if computed_score != Decimal(str(observation.primary_score)):
+            raise ValueError("scored observation primary score is not the metric mean")
+
+        report_row = connection.execute(
+            "SELECT report_json, content_sha256, report_id, experiment_id, stage "
+            "FROM authority_validation_reports WHERE report_id = ?",
+            (observation.validation_report_id,),
+        ).fetchone()
+        if report_row is None:
+            raise ValueError("scored observation requires a persisted result validation report")
+        if report_row[1] is None or _content_hash(report_row[0]) != report_row[1]:
+            raise PersistenceConflictError("persisted validation report integrity check failed")
+        if tuple(report_row[2:]) != (
+            observation.validation_report_id,
+            observation.experiment_id,
+            ValidationStage.RESULT.value,
+        ):
+            raise PersistenceConflictError("persisted validation report identity is inconsistent")
+        report = ValidationReport.model_validate_json(report_row[0])
+        if (
+            report.experiment_id != observation.experiment_id
+            or report.stage != ValidationStage.RESULT
+            or report.verdict != ValidationVerdict.APPROVED
+            or not report.evidence_refs
+            or tuple(report.evidence_refs) != tuple(observation.validation_evidence_refs)
+        ):
+            raise ValueError("scored observation result validation is not approved provenance")
+        operation_id = report.validation_operation_id
+        if not operation_id:
+            raise ValueError("scored observation requires a bound validation operation")
+        operation_row = connection.execute(
+            "SELECT operation_json, subject_json, content_sha256, operation_id, run_id, "
+            "experiment_id, stage, subject_sha256 FROM authority_validation_operations "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if operation_row is None:
+            raise ValueError("scored observation validation operation is absent")
+        operation_json, subject_json = operation_row[0], operation_row[1]
+        if (
+            operation_row[2] is None
+            or _content_hash(operation_json + subject_json) != operation_row[2]
+        ):
+            raise PersistenceConflictError(
+                "persisted validation operation integrity check failed"
+            )
+        operation = ValidationOperationIdentity.model_validate_json(operation_json)
+        if tuple(operation_row[3:]) != (
+            operation.operation_id,
+            operation.run_id,
+            operation.experiment_id,
+            operation.stage.value,
+            operation.subject_sha256,
+        ):
+            raise PersistenceConflictError(
+                "persisted validation operation identity is inconsistent"
+            )
+        subject = json.loads(subject_json)
+        if not isinstance(subject, dict):
+            raise ValueError("validation operation subject must be an object")
+        subject = cast(dict[str, object], subject)
+        subject_identity = dict(subject)
+        subject_identity.pop("validation_operation", None)
+        if _content_hash(
+            json.dumps(subject_identity, sort_keys=True, separators=(",", ":"))
+        ) != operation.subject_sha256:
+            raise PersistenceConflictError("validation operation subject hash is invalid")
+        if (
+            operation.run_id != observation.run_id
+            or operation.experiment_id != observation.experiment_id
+            or operation.stage != ValidationStage.RESULT
+            or subject.get("evaluation_result") != evaluation.model_dump(mode="json")
+            or subject.get("execution_result")
+            != execution.model_dump(mode="json", exclude={"dataset_valid_rows"})
+        ):
+            raise ValueError("validation operation subject provenance is invalid")
+
+        state = connection.execute(
+            "SELECT status, experiment_id FROM experiment_states WHERE experiment_id = ? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (observation.experiment_id,),
+        ).fetchone()
+        if state is None or tuple(state) != ("completed", observation.experiment_id):
+            raise ValueError("scored observation requires a completed experiment")
+
+    def get_scored_observation(self, observation_id: str) -> ScoredObservation | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT observation_json, content_sha256, run_id, experiment_id, attempt_id, "
+                "evaluation_id, checkpoint_id FROM authority_scored_observations "
+                "WHERE observation_id = ?",
+                (observation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if _content_hash(row[0]) != row[1]:
+            raise PersistenceConflictError("persisted scored observation integrity check failed")
+        observation = ScoredObservation.model_validate_json(row[0])
+        if tuple(row[2:]) != (
+            observation.run_id,
+            observation.experiment_id,
+            observation.attempt_id,
+            observation.evaluation_id,
+            observation.checkpoint_id,
+        ):
+            raise PersistenceConflictError("persisted scored observation identity is inconsistent")
+        return observation
+
+    def list_scored_observations(self, run_id: str | None = None) -> tuple[ScoredObservation, ...]:
+        query = (
+            "SELECT observation.observation_json, observation.content_sha256, "
+            "observation.observation_id, observation.run_id, observation.experiment_id, "
+            "observation.attempt_id, observation.evaluation_id, observation.checkpoint_id "
+            "FROM authority_scored_observations AS observation "
+            "JOIN authority_full_attempt_claims AS attempt "
+            "ON attempt.attempt_id = observation.attempt_id"
+        )
+        parameters: tuple[object, ...] = ()
+        if run_id is not None:
+            query += " WHERE observation.run_id = ?"
+            parameters = (run_id,)
+        query += (
+            " ORDER BY observation.run_id, attempt.attempt_sequence, observation.observation_id"
+        )
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        values: list[ScoredObservation] = []
+        for row in rows:
+            if row[1] is None or _content_hash(row[0]) != row[1]:
+                raise PersistenceConflictError(
+                    "persisted scored observation integrity check failed"
+                )
+            observation = ScoredObservation.model_validate_json(row[0])
+            if tuple(row[2:]) != (
+                observation.observation_id,
+                observation.run_id,
+                observation.experiment_id,
+                observation.attempt_id,
+                observation.evaluation_id,
+                observation.checkpoint_id,
+            ):
+                raise PersistenceConflictError(
+                    "persisted scored observation identity is inconsistent"
+                )
+            values.append(observation)
+        return tuple(values)
+
+    def close_run(
+        self,
+        run_id: str,
+        reason: Literal["plateau", "attempt_cap"],
+        epsilon: float = 0.002,
+        patience: int = 3,
+    ) -> RunClosure:
+        if reason not in {"plateau", "attempt_cap"}:
+            raise ValueError("unsupported run closure reason")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT closure_json, content_sha256, closure_id, run_id, reason "
+                "FROM authority_run_closures WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing[1] is None or _content_hash(existing[0]) != existing[1]:
+                    raise PersistenceConflictError("persisted run closure integrity check failed")
+                closure = RunClosure.model_validate_json(existing[0])
+                if tuple(existing[2:]) != (closure.closure_id, closure.run_id, closure.reason):
+                    raise PersistenceConflictError("persisted run closure identity is inconsistent")
+                if closure.reason != reason:
+                    raise PersistenceConflictError("run is already closed for another reason")
+                return closure
+
+            claim_rows = connection.execute(
+                "SELECT claim_json, content_sha256, attempt_id, run_id, experiment_id, "
+                "source_registration_id, source_commit, attempt_sequence "
+                "FROM authority_full_attempt_claims "
+                "WHERE run_id = ? ORDER BY attempt_sequence, attempt_id",
+                (run_id,),
+            ).fetchall()
+            claims: list[FullScientificAttemptClaim] = []
+            for row in claim_rows:
+                if row[1] is None or _content_hash(row[0]) != row[1]:
+                    raise PersistenceConflictError(
+                        "persisted full attempt claim integrity check failed"
+                    )
+                claim = FullScientificAttemptClaim.model_validate_json(row[0])
+                if tuple(row[2:]) != (
+                    claim.attempt_id,
+                    claim.run_id,
+                    claim.experiment_id,
+                    claim.source_registration_id,
+                    claim.source_commit,
+                    claim.attempt_sequence,
+                ):
+                    raise PersistenceConflictError(
+                        "persisted full attempt claim identity is inconsistent"
+                    )
+                claims.append(claim)
+            observations_rows = connection.execute(
+                "SELECT observation.observation_json, observation.content_sha256, "
+                "observation.observation_id, observation.run_id, observation.experiment_id, "
+                "observation.attempt_id, observation.evaluation_id, observation.checkpoint_id, "
+                "attempt.attempt_sequence "
+                "FROM authority_scored_observations AS observation "
+                "JOIN authority_full_attempt_claims AS attempt "
+                "ON attempt.attempt_id = observation.attempt_id "
+                "AND attempt.run_id = observation.run_id "
+                "WHERE observation.run_id = ? "
+                "ORDER BY attempt.attempt_sequence, observation.evaluation_id, "
+                "observation.observation_id",
+                (run_id,),
+            ).fetchall()
+            observations: list[ScoredObservation] = []
+            for row in observations_rows:
+                if row[1] is None or _content_hash(row[0]) != row[1]:
+                    raise PersistenceConflictError(
+                        "persisted scored observation integrity check failed"
+                    )
+                observation = ScoredObservation.model_validate_json(row[0])
+                if tuple(row[2:]) != (
+                    observation.observation_id,
+                    observation.run_id,
+                    observation.experiment_id,
+                    observation.attempt_id,
+                    observation.evaluation_id,
+                    observation.checkpoint_id,
+                    row[8],
+                ):
+                    raise PersistenceConflictError(
+                        "persisted scored observation identity is inconsistent"
+                    )
+                self._validate_observation(connection, observation)
+                claim = next(
+                    (item for item in claims if item.attempt_id == observation.attempt_id),
+                    None,
+                )
+                if claim is None or row[8] != claim.attempt_sequence:
+                    raise PersistenceConflictError("observation attempt sequence is inconsistent")
+                observations.append(observation)
+
+            champion: object = None
+            if observations:
+                by_attempt = {claim.attempt_id: claim for claim in claims}
+                candidates = [
+                    (observation, by_attempt[observation.attempt_id])
+                    for observation in observations
+                    if observation.attempt_id in by_attempt
+                ]
+                if len(candidates) != len(observations):
+                    raise PersistenceConflictError("observation has no claim in its run")
+                selected, selected_attempt = min(
+                    candidates,
+                    key=lambda item: (
+                        -item[0].primary_score,
+                        item[1].attempt_sequence,
+                        item[0].evaluation_id,
+                    ),
+                )
+                champion = ChampionBinding(
+                    observation_id=selected.observation_id,
+                    attempt_id=selected.attempt_id,
+                    execution_id=selected.execution_id,
+                    evaluation_id=selected.evaluation_id,
+                    checkpoint_id=selected.checkpoint_id,
+                    source_commit=selected.source_commit,
+                    attempt_sequence=selected_attempt.attempt_sequence,
+                    primary_score=selected.primary_score,
+                )
+
+            scores = [observation.primary_score for observation in observations]
+            plateau = convergence_reason(scores, epsilon=epsilon, patience=patience) == "plateau"
+            if reason == "plateau" and (not plateau or champion is None):
+                raise PersistenceConflictError("plateau closure is not currently satisfied")
+            if reason == "attempt_cap" and len(claims) != MAX_FULL_ATTEMPTS:
+                raise PersistenceConflictError("attempt-cap closure requires exactly 50 attempts")
+            closure = RunClosure(
+                closure_id=f"closure-{run_id}-{reason}",
+                run_id=run_id,
+                reason=reason,
+                attempt_count=len(claims),
+                scored_observation_count=len(observations),
+                champion=champion,
+                closed_at=datetime.now(UTC),
+            )
+            payload = closure.model_dump_json()
+            now = datetime.now(UTC).isoformat()
+            connection.execute(
+                "INSERT INTO authority_run_closures "
+                "(closure_id, run_id, reason, closure_json, content_sha256, closed_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    closure.closure_id,
+                    closure.run_id,
+                    closure.reason,
+                    payload,
+                    _content_hash(payload),
+                    closure.closed_at.isoformat(),
+                    now,
+                ),
+            )
+            self._insert_audit(
+                connection,
+                self._automatic_event(
+                    "run_closed",
+                    closure.run_id,
+                    None,
+                    {"closure_id": closure.closure_id, "reason": closure.reason},
+                    now,
+                ),
+            )
+            return closure
+
+    def close_run_if_ready(
+        self,
+        run_id: str,
+        *,
+        after_failure: bool = False,
+        epsilon: float = 0.002,
+        patience: int = 3,
+    ) -> RunClosure | None:
+        """Derive the next authoritative closure without trusting graph state."""
+        existing = self.get_run_closure(run_id)
+        if existing is not None:
+            return existing
+        claim_count = self.count_full_attempt_claims(run_id)
+        if not after_failure and claim_count >= patience + 1:
+            observations = self.list_scored_observations(run_id)
+            scores = [observation.primary_score for observation in observations]
+            if convergence_reason(scores, epsilon=epsilon, patience=patience) == "plateau":
+                return self.close_run(
+                    run_id, "plateau", epsilon=epsilon, patience=patience
+                )
+        if claim_count == MAX_FULL_ATTEMPTS:
+            return self.close_run(
+                run_id, "attempt_cap", epsilon=epsilon, patience=patience
+            )
+        return None
+
+    def _insert_adopted_claim(
+        self, connection: sqlite3.Connection, request: FullAttemptClaimRequest
+    ) -> FullScientificAttemptClaim:
+        self._validate_attempt_source(connection, request)
+        existing = connection.execute(
+            "SELECT claim_json, content_sha256 FROM authority_full_attempt_claims "
+            "WHERE execution_id = ? OR attempt_id = ?",
+            (request.execution_id, request.attempt_id),
+        ).fetchone()
+        if existing is not None:
+            if existing[1] is None or _content_hash(existing[0]) != existing[1]:
+                raise PersistenceConflictError("persisted adopted attempt integrity failed")
+            return FullScientificAttemptClaim.model_validate_json(existing[0])
+        next_sequence = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(attempt_sequence), 0) + 1 "
+                "FROM authority_full_attempt_claims WHERE run_id = ?",
+                (request.run_id,),
+            ).fetchone()[0]
+        )
+        if next_sequence > MAX_FULL_ATTEMPTS:
+            raise PersistenceConflictError("legacy lifecycle adoption exceeded the attempt cap")
+        record = FullScientificAttemptClaim(
+            **request.model_dump(),
+            attempt_sequence=next_sequence,
+            claimed_at=datetime.now(UTC),
+        )
+        payload = record.model_dump_json()
+        now = datetime.now(UTC).isoformat()
+        connection.execute(
+            "INSERT INTO authority_full_attempt_claims "
+            "(attempt_id, execution_id, run_id, experiment_id, source_registration_id, "
+            "source_commit, attempt_sequence, max_attempts, attempt_policy_id, claim_json, "
+            "identity_sha256, content_sha256, claimed_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record.attempt_id,
+                record.execution_id,
+                record.run_id,
+                record.experiment_id,
+                record.source_registration_id,
+                record.source_commit,
+                record.attempt_sequence,
+                record.max_attempts,
+                record.attempt_policy_id,
+                payload,
+                self._attempt_identity_digest(record),
+                _content_hash(payload),
+                record.claimed_at.isoformat(),
+                now,
+            ),
+        )
+        self._insert_audit(
+            connection,
+            self._automatic_event(
+                "full_attempt_claimed",
+                record.run_id,
+                record.experiment_id,
+                {
+                    "attempt_id": record.attempt_id,
+                    "execution_id": record.execution_id,
+                    "attempt_sequence": record.attempt_sequence,
+                },
+                now,
+            ),
+        )
+        return record
+
+    def _insert_adopted_observation(
+        self, connection: sqlite3.Connection, request: ScoredObservationRequest
+    ) -> ScoredObservation:
+        observation = ScoredObservation(
+            **request.model_dump(),
+            scored_at=datetime.now(UTC),
+        )
+        self._validate_observation(connection, observation)
+        payload = observation.model_dump_json()
+        identity_digest = self._observation_identity_digest(observation)
+        duplicate = connection.execute(
+            "SELECT observation_id FROM authority_scored_observations "
+            "WHERE attempt_id = ? OR evaluation_id = ?",
+            (observation.attempt_id, observation.evaluation_id),
+        ).fetchone()
+        if duplicate is not None:
+            raise PersistenceConflictError(
+                f"attempt or evaluation already has observation {duplicate[0]}"
+            )
+        now = datetime.now(UTC).isoformat()
+        connection.execute(
+            "INSERT INTO authority_scored_observations "
+            "(observation_id, run_id, experiment_id, attempt_id, evaluation_id, checkpoint_id, "
+            "observation_json, identity_sha256, content_sha256, scored_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                observation.observation_id,
+                observation.run_id,
+                observation.experiment_id,
+                observation.attempt_id,
+                observation.evaluation_id,
+                observation.checkpoint_id,
+                payload,
+                identity_digest,
+                _content_hash(payload),
+                observation.scored_at.isoformat(),
+                now,
+            ),
+        )
+        self._insert_audit(
+            connection,
+            self._automatic_event(
+                "scored_observation_persisted",
+                observation.run_id,
+                observation.experiment_id,
+                {"observation_id": observation.observation_id},
+                now,
+            ),
+        )
+        return observation
+
+    def adopt_legacy_lifecycle(self, run_id: str | None = None) -> tuple[dict[str, object], ...]:
+        """Adopt pre-010 full dispatches from the resource authority.
+
+        Resource reservations are the dispatch ledger for the pre-010 runtime;
+        graph transitions are deliberately not consulted because failed
+        execution transitions did not carry a latest execution identity.
+        The complete plan is validated before the first claim is inserted so an
+        ambiguous active history cannot be partially adopted.
+        """
+        with self._connect() as connection:
+            active_runs = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT latest.run_id FROM run_states AS latest "
+                    "JOIN (SELECT run_id, MAX(sequence) AS sequence FROM run_states "
+                    "GROUP BY run_id) AS current ON current.run_id = latest.run_id "
+                    "AND current.sequence = latest.sequence WHERE latest.status = 'active'"
+                ).fetchall()
+            }
+            if run_id is not None:
+                active_runs.intersection_update({run_id})
+            migration_row = connection.execute(
+                "SELECT applied_at FROM schema_migrations WHERE version = 10"
+            ).fetchone()
+            if migration_row is None:
+                raise PersistenceConflictError("migration 010 cutoff is unavailable")
+            migration_cutoff = _authority_timestamp(migration_row[0], "migration cutoff")
+            reservation_rows = connection.execute(
+                "SELECT reservation.reservation_id, reservation.reservation_json, "
+                "reservation.status, reservation.created_at, operation.operation_id, "
+                "operation.reservation_id, operation.operation, operation.usage_json, "
+                "operation.created_at "
+                "FROM authority_resource_reservations AS reservation "
+                "JOIN authority_resource_operations AS operation "
+                "ON operation.reservation_id = reservation.reservation_id "
+                "WHERE operation.operation = 'reserve' "
+                "ORDER BY operation.created_at, operation.operation_id, reservation.reservation_id"
+            ).fetchall()
+            execution_rows = connection.execute(
+                "SELECT record_id, payload_json, content_sha256 FROM records "
+                "WHERE kind = 'execution'"
+            ).fetchall()
+            failure_rows = connection.execute(
+                "SELECT record_id, payload_json, content_sha256 FROM records "
+                "WHERE kind = 'failure'"
+            ).fetchall()
+            source_rows = connection.execute(
+                "SELECT registration_id, registration_json, content_sha256, created_at, "
+                "experiment_id, run_id, source_commit, eligible "
+                "FROM source_registrations"
+            ).fetchall()
+            claim_rows = connection.execute(
+                "SELECT claim_json, content_sha256, attempt_id, execution_id, run_id, "
+                "experiment_id, source_registration_id, source_commit "
+                "FROM authority_full_attempt_claims"
+            ).fetchall()
+
+        executions: dict[str, ExecutionResult] = {}
+        corrupt_execution_ids: set[str] = set()
+        for record_id, payload, digest in execution_rows:
+            if digest is None or _content_hash(payload) != digest:
+                corrupt_execution_ids.add(str(record_id))
+                continue
+            try:
+                execution = ExecutionResult.model_validate_json(payload)
+            except ValueError:
+                corrupt_execution_ids.add(str(record_id))
+                continue
+            if execution.execution_id == record_id:
+                executions[execution.execution_id] = execution
+            else:
+                corrupt_execution_ids.add(str(record_id))
+
+        failures: dict[str, tuple[FailureRecord, ...]] = {}
+        for _, payload, digest in failure_rows:
+            if digest is None or _content_hash(payload) != digest:
+                continue
+            try:
+                failure = FailureRecord.model_validate_json(payload)
+            except ValueError:
+                continue
+            for evidence_ref in failure.evidence_refs:
+                failures.setdefault(evidence_ref, ())
+                failures[evidence_ref] += (failure,)
+
+        sources: dict[str, list[tuple[SourceRegistration, datetime]]] = {}
+        corrupt_source_identities: set[tuple[str, str]] = set()
+        for (
+            registration_id,
+            payload,
+            digest,
+            created_at,
+            indexed_experiment_id,
+            indexed_run_id,
+            indexed_source_commit,
+            indexed_eligible,
+        ) in source_rows:
+            if digest is None or _content_hash(payload) != digest:
+                try:
+                    raw_source = json.loads(payload)
+                    if isinstance(raw_source, dict):
+                        typed_source = cast(dict[str, object], raw_source)
+                        raw_run: object = typed_source.get("run_id")
+                        raw_experiment: object = typed_source.get("experiment_id")
+                        if isinstance(raw_run, str) and isinstance(raw_experiment, str):
+                            corrupt_source_identities.add((raw_run, raw_experiment))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    if isinstance(indexed_run_id, str) and isinstance(indexed_experiment_id, str):
+                        corrupt_source_identities.add(
+                            (indexed_run_id, indexed_experiment_id)
+                        )
+                if isinstance(indexed_run_id, str) and isinstance(indexed_experiment_id, str):
+                    corrupt_source_identities.add((indexed_run_id, indexed_experiment_id))
+                continue
+            try:
+                source = SourceRegistration.model_validate_json(payload)
+            except ValueError:
+                try:
+                    raw_source = json.loads(payload)
+                    if isinstance(raw_source, dict):
+                        typed_source = cast(dict[str, object], raw_source)
+                        raw_run = typed_source.get("run_id")
+                        raw_experiment = typed_source.get("experiment_id")
+                        if isinstance(raw_run, str) and isinstance(raw_experiment, str):
+                            corrupt_source_identities.add((raw_run, raw_experiment))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+                continue
+            if (
+                source.registration_id != registration_id
+                or source.experiment_id != indexed_experiment_id
+                or source.run_id != indexed_run_id
+                or source.source_commit != indexed_source_commit
+                or (1 if source.eligible else 0) != indexed_eligible
+            ):
+                corrupt_source_identities.add((source.run_id, source.experiment_id))
+                continue
+            sources.setdefault(source.run_id, []).append(
+                (source, _authority_timestamp(created_at, "source registration"))
+            )
+
+        claimed_execution_ids: set[str] = set()
+        for row in claim_rows:
+            claim_payload, claim_digest = row[0], row[1]
+            claim = FullScientificAttemptClaim.model_validate_json(claim_payload)
+            if claim.run_id not in active_runs:
+                continue
+            if claim_digest is None or _content_hash(claim_payload) != claim_digest:
+                raise PersistenceConflictError(
+                    "persisted full attempt claim integrity check failed"
+                )
+            if tuple(row[2:]) != (
+                claim.attempt_id,
+                claim.execution_id,
+                claim.run_id,
+                claim.experiment_id,
+                claim.source_registration_id,
+                claim.source_commit,
+            ):
+                raise PersistenceConflictError(
+                    "persisted full attempt claim identity is inconsistent"
+                )
+            claimed_execution_ids.add(claim.execution_id)
+        candidates: dict[
+            str, list[tuple[datetime, str, str, ExecutionResult | None, SourceRegistration]]
+        ] = {}
+        ambiguous: dict[str, list[str]] = {}
+
+        reservation_evidence: dict[str, list[tuple[object, ...]]] = {}
+        for row in reservation_rows:
+            reservation_evidence.setdefault(str(row[0]), []).append(tuple(row))
+
+        for indexed_reservation_id, evidence_rows in reservation_evidence.items():
+            pre010_rows = [
+                row
+                for row in evidence_rows
+                if _authority_timestamp(row[8], "reserve operation") < migration_cutoff
+            ]
+            if not pre010_rows:
+                continue
+            if len(evidence_rows) != 1:
+                raise PersistenceConflictError(
+                    f"ambiguous legacy reservation evidence for {indexed_reservation_id}: "
+                    "expected exactly one reserve operation"
+                )
+            (
+                reservation_id,
+                reservation_payload,
+                status,
+                reservation_created_at,
+                operation_id,
+                operation_reservation_id,
+                operation,
+                usage_json,
+                created_at,
+            ) = evidence_rows[0]
+            operation_timestamp = _authority_timestamp(created_at, "reserve operation")
+            indexed_timestamp = _authority_timestamp(
+                reservation_created_at, "reservation"
+            )
+            if (
+                reservation_id != indexed_reservation_id
+                or operation_reservation_id != indexed_reservation_id
+                or operation != "reserve"
+                or not isinstance(operation_id, str)
+                or not operation_id
+                or usage_json is not None
+                or indexed_timestamp != operation_timestamp
+            ):
+                raise PersistenceConflictError(
+                    f"ambiguous legacy reservation evidence for {indexed_reservation_id}: "
+                    "reservation identity or reserve operation content conflicts"
+                )
+            if not isinstance(reservation_payload, str):
+                raise PersistenceConflictError(
+                    f"ambiguous legacy reservation evidence for {indexed_reservation_id}: "
+                    "reservation payload is malformed"
+                )
+            try:
+                reservation = ResourceReservation.model_validate_json(reservation_payload)
+            except ValueError as error:
+                # This method is called only for an explicit resume.  A
+                # malformed reservation cannot prove that it was a pre-dispatch
+                # cleanup, so treating it as absent would permit an unsafe
+                # partial adoption.
+                raise PersistenceConflictError(
+                    f"ambiguous legacy lifecycle evidence for active run {run_id}: "
+                    f"{reservation_id}/{operation_id}"
+                ) from error
+            if reservation.reservation_id != indexed_reservation_id:
+                raise PersistenceConflictError(
+                    f"ambiguous legacy reservation evidence for active run {reservation.run_id}: "
+                    f"{indexed_reservation_id}/{operation_id} reservation identity mismatch"
+                )
+            if reservation.run_id not in active_runs or reservation.purpose != "iteration":
+                continue
+            execution_id = str(reservation_id).removeprefix("reservation-")
+            marker = f"{reservation_id}/{operation_id}"
+            if not execution_id or execution_id == str(reservation_id):
+                ambiguous.setdefault(reservation.run_id, []).append(marker)
+                continue
+            if execution_id.startswith("smoke-"):
+                continue
+            if execution_id in claimed_execution_ids:
+                continue
+            eligible_sources = [
+                source
+                for source, source_created_at in sources.get(reservation.run_id, [])
+                if source.experiment_id == reservation.experiment_id
+                and source.eligible
+                # The reserve operation is the dispatch-order authority.  The
+                # reservation row timestamp may be copied or rewritten during
+                # legacy recovery and must not establish source ordering.
+                and source_created_at <= operation_timestamp
+            ]
+            if (reservation.run_id, str(reservation.experiment_id)) in corrupt_source_identities:
+                ambiguous.setdefault(reservation.run_id, []).append(marker)
+                continue
+            execution = executions.get(execution_id)
+            if execution_id in corrupt_execution_ids:
+                ambiguous.setdefault(reservation.run_id, []).append(marker)
+                continue
+            if execution is not None:
+                source = next(
+                    (
+                        item
+                        for item in eligible_sources
+                        if item.registration_id == execution.source_registration_id
+                        and item.source_commit == execution.source_commit
+                    ),
+                    None,
+                )
+                if execution.execution_kind != "full":
+                    continue
+                if execution.experiment_id != reservation.experiment_id or source is None:
+                    ambiguous.setdefault(reservation.run_id, []).append(marker)
+                    continue
+            else:
+                # A consumed or still-reserved iteration reservation can mean
+                # that dispatch started before its result was durable.  The
+                # source must still be uniquely recoverable; otherwise resume
+                # is blocked rather than guessing.
+                if status not in {"consumed", "reserved"} or len(eligible_sources) != 1:
+                    ambiguous.setdefault(reservation.run_id, []).append(marker)
+                    continue
+                source = eligible_sources[0]
+                if any(
+                    failure.experiment_id not in {None, reservation.experiment_id}
+                    for failure in failures.get(execution_id, ())
+                ):
+                    ambiguous.setdefault(reservation.run_id, []).append(marker)
+                    continue
+            candidates.setdefault(reservation.run_id, []).append(
+                (operation_timestamp, str(operation_id), execution_id, execution, source)
+            )
+
+        planned: dict[
+            str,
+            list[tuple[FullAttemptClaimRequest, ScoredObservationRequest | None]],
+        ] = {}
+        existing_attempt_counts: dict[str, int] = {}
+        existing_observation_counts: dict[str, int] = {}
+        for run_id in sorted(set(active_runs) | set(candidates) | set(ambiguous)):
+            if ambiguous.get(run_id):
+                raise PersistenceConflictError(
+                    f"ambiguous legacy lifecycle evidence for active run {run_id}: "
+                    + ", ".join(ambiguous[run_id][:8])
+                )
+            entries = candidates.get(run_id, [])
+            entries.sort(key=lambda item: (item[0], item[1], item[2]))
+            if len(entries) + self.count_full_attempt_claims(run_id) > MAX_FULL_ATTEMPTS:
+                raise PersistenceConflictError(
+                    f"legacy lifecycle evidence exceeds the fixed attempt cap for run {run_id}"
+                )
+            existing_attempt_counts[run_id] = self.count_full_attempt_claims(run_id)
+            existing_observation_counts[run_id] = len(self.list_scored_observations(run_id))
+            planned[run_id] = []
+            for index, (_, _, execution_id, execution, source) in enumerate(entries):
+                request = FullAttemptClaimRequest(
+                    attempt_id=f"attempt-{execution_id}",
+                    execution_id=execution_id,
+                    run_id=run_id,
+                    experiment_id=source.experiment_id,
+                    source_registration_id=source.registration_id,
+                    source_commit=source.source_commit,
+                )
+                observation_request: ScoredObservationRequest | None = None
+                if execution is not None and execution.failure_kind is None:
+                    provisional_claim = FullScientificAttemptClaim(
+                        **request.model_dump(),
+                        attempt_sequence=existing_attempt_counts[run_id] + index + 1,
+                        claimed_at=datetime.now(UTC),
+                    )
+                    try:
+                        observation_request = self._legacy_scored_observation(
+                            execution, provisional_claim
+                        )
+                    except (PersistenceConflictError, ValueError) as error:
+                        raise PersistenceConflictError(
+                            f"corrupt legacy observation evidence for {execution_id}"
+                        ) from error
+                planned[run_id].append((request, observation_request))
+
+        summaries: list[dict[str, object]] = []
+        # Validate and insert the entire adoption plan in one transaction.  A
+        # later run must not be able to retain claims if an earlier run's
+        # authority is found to be corrupt during insertion.
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for run_id in sorted(planned):
+                    adopted_attempts = 0
+                    adopted_observations = existing_observation_counts[run_id]
+                    for request, observation_request in planned[run_id]:
+                        self._insert_adopted_claim(connection, request)
+                        adopted_attempts += 1
+                        if observation_request is not None:
+                            self._insert_adopted_observation(connection, observation_request)
+                            adopted_observations += 1
+                    summary: dict[str, object] = {
+                        "run_id": run_id,
+                        "adopted_attempts": adopted_attempts,
+                        "adopted_observations": adopted_observations,
+                        "ambiguous_execution_ids": tuple(ambiguous.get(run_id, ())[:8]),
+                    }
+                    self._insert_audit(
+                        connection,
+                        AuditEvent(
+                            event_id=f"lifecycle-adoption-{run_id}",
+                            run_id=run_id,
+                            event_type="legacy_lifecycle_adopted",
+                            actor_type="controller",
+                            actor_id="production-controller",
+                            payload={"run_id": run_id, "adopted": True},
+                            created_at=datetime(1970, 1, 1, tzinfo=UTC),
+                        ),
+                    )
+                    summaries.append(summary)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        for summary in summaries:
+            closure = self.close_run_if_ready(str(summary["run_id"]))
+            if closure is not None:
+                summary["closure_reason"] = closure.reason
+        return tuple(summaries)
+
+    def _legacy_scored_observation(
+        self, execution: ExecutionResult, claim: FullScientificAttemptClaim
+    ) -> ScoredObservationRequest | None:
+        if execution.checkpoint_id is None:
+            return None
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT record_id, payload_json, content_sha256 "
+                "FROM records WHERE kind = 'evaluation'"
+            ).fetchall()
+            evaluation_payload: dict[str, object] | None = None
+            for record_id, payload, digest in rows:
+                try:
+                    raw = json.loads(payload)
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    if record_id == f"evaluation-{execution.execution_id}":
+                        raise PersistenceConflictError(
+                            "legacy evaluation authority is not valid JSON"
+                        ) from error
+                    continue
+                if not isinstance(raw, dict):
+                    if record_id == f"evaluation-{execution.execution_id}":
+                        raise PersistenceConflictError(
+                            "legacy evaluation authority is not an object"
+                        )
+                    continue
+                raw_mapping = cast(dict[str, object], raw)
+                raw_result: object = raw_mapping.get("result")
+                candidate: dict[str, object] = (
+                    cast(dict[str, object], raw_result)
+                    if isinstance(raw_result, dict)
+                    else raw_mapping
+                )
+                if candidate.get("execution_id") != execution.execution_id:
+                    continue
+                if digest is None or _content_hash(payload) != digest:
+                    raise PersistenceConflictError("legacy evaluation authority integrity failed")
+                evaluation_payload = raw_mapping
+                break
+            if not isinstance(evaluation_payload, dict):
+                return None
+            evaluation = EvaluationResult.model_validate(
+                evaluation_payload.get("result", evaluation_payload)
+            )
+            report_rows = connection.execute(
+                "SELECT report.report_json, report.content_sha256, "
+                "operation.operation_json, operation.subject_json, operation.content_sha256 "
+                "FROM authority_validation_reports AS report "
+                "JOIN authority_validation_operations AS operation "
+                "ON operation.operation_id = report.validation_operation_id "
+                "WHERE report.experiment_id = ? AND report.stage = 'result' "
+                "ORDER BY report.created_at DESC, report.report_id DESC",
+                (execution.experiment_id,),
+            ).fetchall()
+        if not (
+            evaluation.execution_id == execution.execution_id
+            and evaluation.run_id == claim.run_id
+            and evaluation.experiment_id == execution.experiment_id
+            and evaluation.source_commit == execution.source_commit
+            and evaluation.checkpoint_id == execution.checkpoint_id
+            and evaluation.split == "valid"
+            and evaluation.validity in {"provisional", "official"}
+        ):
+            raise PersistenceConflictError("legacy evaluation provenance is inconsistent")
+        if not report_rows:
+            return None
+        reports: list[tuple[ValidationReport, dict[str, object]]] = []
+        for (
+            report_json,
+            report_digest,
+            operation_json,
+            subject_json,
+            operation_digest,
+        ) in report_rows:
+            if (
+                report_digest is None
+                or _content_hash(report_json) != report_digest
+                or operation_digest is None
+                or _content_hash(operation_json + subject_json) != operation_digest
+            ):
+                raise PersistenceConflictError("legacy validation authority integrity failed")
+            report = ValidationReport.model_validate_json(report_json)
+            operation = ValidationOperationIdentity.model_validate_json(operation_json)
+            subject = json.loads(subject_json)
+            if not isinstance(subject, dict):
+                raise PersistenceConflictError("legacy validation subject is not an object")
+            if (
+                operation.run_id != claim.run_id
+                or operation.experiment_id != execution.experiment_id
+                or operation.stage != ValidationStage.RESULT
+                or report.experiment_id != execution.experiment_id
+                or report.stage != ValidationStage.RESULT
+            ):
+                raise PersistenceConflictError(
+                    "legacy validation operation provenance is inconsistent"
+                )
+            reports.append((report, cast(dict[str, object], subject)))
+        exact_subject = {
+            "evaluation_result": evaluation.model_dump(mode="json"),
+            "execution_result": execution.model_dump(mode="json", exclude={"dataset_valid_rows"}),
+        }
+        approved = [report for report, _ in reports if report.verdict == ValidationVerdict.APPROVED]
+        if not approved:
+            return None
+        report = next(
+            (
+                report
+                for report, subject in reports
+                if report.verdict == ValidationVerdict.APPROVED
+                and report.stage == ValidationStage.RESULT
+                and subject == exact_subject
+            ),
+            None,
+        )
+        if report is None:
+            raise PersistenceConflictError("legacy validation subject provenance is inconsistent")
+        if (
+            evaluation.dataset_manifest_id is None
+            or evaluation.dataset_manifest_sha256 is None
+            or evaluation.source_commit is None
+        ):
+            return None
+        validity = cast(Literal["provisional", "official"], evaluation.validity)
+        return ScoredObservationRequest(
+            observation_id=f"observation-{evaluation.evaluation_id}",
+            run_id=claim.run_id,
+            experiment_id=evaluation.experiment_id,
+            attempt_id=claim.attempt_id,
+            execution_id=execution.execution_id,
+            evaluation_id=evaluation.evaluation_id,
+            checkpoint_id=evaluation.checkpoint_id,
+            source_commit=evaluation.source_commit,
+            evaluator_id=evaluation.evaluator_artifact_id,
+            evaluator_sha256=evaluation.evaluator_sha256,
+            dataset_manifest_id=evaluation.dataset_manifest_id,
+            dataset_manifest_sha256=evaluation.dataset_manifest_sha256,
+            split="valid",
+            validity=validity,
+            primary_score=evaluation.validation_score,
+            validation_report_id=report.report_id,
+            validation_evidence_refs=report.evidence_refs,
+        )
+
+    def get_run_closure(self, run_id: str) -> RunClosure | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT closure_json, content_sha256, closure_id, run_id, reason "
+                "FROM authority_run_closures WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if _content_hash(row[0]) != row[1]:
+            raise PersistenceConflictError("persisted run closure integrity check failed")
+        closure = RunClosure.model_validate_json(row[0])
+        if tuple(row[2:]) != (closure.closure_id, closure.run_id, closure.reason):
+            raise PersistenceConflictError("persisted run closure identity is inconsistent")
+        return closure
+
     def put_experiment(
         self,
         spec: ExperimentSpec,
@@ -1260,9 +2726,7 @@ class ApplicationRepository:
         now = datetime.now(UTC).isoformat()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            if not connection.execute(
-                "SELECT 1 FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone():
+            if not connection.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone():
                 raise ValueError("authoritative experiment transitions require a persisted run")
             row = connection.execute(
                 "SELECT content_sha256 FROM authority_experiments WHERE experiment_id = ?",
@@ -1440,7 +2904,8 @@ class ApplicationRepository:
             connection.execute(
                 "INSERT INTO source_registrations "
                 "(registration_id, experiment_id, revision, registration_json, "
-                "content_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "content_sha256, created_at, run_id, source_commit, eligible) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     registration.registration_id,
                     registration.experiment_id,
@@ -1448,6 +2913,9 @@ class ApplicationRepository:
                     payload,
                     digest,
                     now,
+                    registration.run_id,
+                    registration.source_commit,
+                    1 if registration.eligible else 0,
                 ),
             )
             event = audit_event or self._automatic_event(
@@ -1466,21 +2934,47 @@ class ApplicationRepository:
     def get_source_registration(self, experiment_id: str) -> SourceRegistration | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT registration_json FROM source_registrations "
+                "SELECT registration_json, content_sha256, registration_id, experiment_id, run_id, "
+                "source_commit, eligible FROM source_registrations "
                 "WHERE experiment_id = ? ORDER BY revision DESC LIMIT 1",
                 (experiment_id,),
             ).fetchone()
-        return SourceRegistration.model_validate_json(row[0]) if row else None
+        if row is None:
+            return None
+        if row[1] is None or _content_hash(row[0]) != row[1]:
+            raise PersistenceConflictError("source registration integrity check failed")
+        source = SourceRegistration.model_validate_json(row[0])
+        if tuple(row[2:]) != (
+            source.registration_id,
+            source.experiment_id,
+            source.run_id,
+            source.source_commit,
+            1 if source.eligible else 0,
+        ):
+            raise PersistenceConflictError("source registration identity is inconsistent")
+        return source
 
-    def get_source_registration_by_id(
-        self, registration_id: str
-    ) -> SourceRegistration | None:
+    def get_source_registration_by_id(self, registration_id: str) -> SourceRegistration | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT registration_json FROM source_registrations WHERE registration_id = ?",
+                "SELECT registration_json, content_sha256, registration_id, experiment_id, run_id, "
+                "source_commit, eligible FROM source_registrations WHERE registration_id = ?",
                 (registration_id,),
             ).fetchone()
-        return SourceRegistration.model_validate_json(row[0]) if row else None
+        if row is None:
+            return None
+        if row[1] is None or _content_hash(row[0]) != row[1]:
+            raise PersistenceConflictError("source registration integrity check failed")
+        source = SourceRegistration.model_validate_json(row[0])
+        if tuple(row[2:]) != (
+            source.registration_id,
+            source.experiment_id,
+            source.run_id,
+            source.source_commit,
+            1 if source.eligible else 0,
+        ):
+            raise PersistenceConflictError("source registration identity is inconsistent")
+        return source
 
     def put_evaluator_identity(
         self, identity: EvaluatorIdentity, audit_event: AuditEvent | None = None
@@ -1629,8 +3123,7 @@ class ApplicationRepository:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             run_status = connection.execute(
-                "SELECT status FROM run_states WHERE run_id = ? "
-                "ORDER BY sequence DESC LIMIT 1",
+                "SELECT status FROM run_states WHERE run_id = ? ORDER BY sequence DESC LIMIT 1",
                 (request.run_id,),
             ).fetchone()
             experiment_status = connection.execute(
@@ -1644,25 +3137,98 @@ class ApplicationRepository:
                 raise FinalTestAccessError(
                     "provisional finalization requires a converged experiment"
                 )
-            self._validate_source(
-                connection, request.experiment_id, request.run_id, request.source_commit
-            )
-            evaluator = connection.execute(
-                "SELECT 1 FROM evaluator_identities WHERE evaluator_id = ?",
+            closure_row = connection.execute(
+                "SELECT closure_json, content_sha256 FROM authority_run_closures "
+                "WHERE run_id = ?",
+                (request.run_id,),
+            ).fetchone()
+            if closure_row is None or _content_hash(closure_row[0]) != closure_row[1]:
+                raise FinalTestAccessError("provisional finalization requires a valid run closure")
+            closure = RunClosure.model_validate_json(closure_row[0])
+            if closure.champion is None:
+                raise FinalTestAccessError("run closure has no eligible champion")
+            champion = closure.champion
+            observation_row = connection.execute(
+                "SELECT observation_json, content_sha256 FROM authority_scored_observations "
+                "WHERE observation_id = ?",
+                (champion.observation_id,),
+            ).fetchone()
+            if observation_row is None or _content_hash(observation_row[0]) != observation_row[1]:
+                raise FinalTestAccessError("run closure champion observation is unavailable")
+            observation = ScoredObservation.model_validate_json(observation_row[0])
+            if (
+                observation.run_id != request.run_id
+                or observation.experiment_id != request.experiment_id
+                or observation.attempt_id != champion.attempt_id
+                or observation.execution_id != champion.execution_id
+                or observation.evaluation_id != champion.evaluation_id
+                or observation.checkpoint_id != champion.checkpoint_id
+                or observation.source_commit != champion.source_commit
+                or observation.primary_score != champion.primary_score
+                or request.experiment_id != observation.experiment_id
+                or request.source_commit != observation.source_commit
+                or request.evaluation_id != observation.evaluation_id
+                or request.checkpoint_id != observation.checkpoint_id
+            ):
+                raise FinalTestAccessError("finalization is not bound to the closure champion")
+            source_row = connection.execute(
+                "SELECT registration_json, content_sha256 FROM source_registrations "
+                "WHERE registration_id = ?",
+                (f"source-{observation.source_commit}",),
+            ).fetchone()
+            if source_row is None or _content_hash(source_row[0]) != source_row[1]:
+                raise FinalTestAccessError("champion source revision is unavailable")
+            source = SourceRegistration.model_validate_json(source_row[0])
+            if (
+                source.registration_id != f"source-{observation.source_commit}"
+                or source.run_id != request.run_id
+                or source.experiment_id != request.experiment_id
+                or not source.eligible
+                or source.source_commit != request.source_commit
+            ):
+                raise FinalTestAccessError("champion source revision does not match finalization")
+            try:
+                self._validate_patch_artifact(connection, source, request.experiment_id)
+            except ValueError as error:
+                raise FinalTestAccessError(str(error)) from error
+            spec_row = connection.execute(
+                "SELECT spec_json, content_sha256 FROM authority_experiments "
+                "WHERE experiment_id = ?",
+                (request.experiment_id,),
+            ).fetchone()
+            if spec_row is None or _content_hash(spec_row[0]) != spec_row[1]:
+                raise FinalTestAccessError("champion experiment specification is unavailable")
+            spec = ExperimentSpec.model_validate_json(spec_row[0])
+            if spec.experiment_id != observation.experiment_id:
+                raise FinalTestAccessError("champion experiment specification is inconsistent")
+            evaluator_row = connection.execute(
+                "SELECT evaluator_json, content_sha256 FROM evaluator_identities "
+                "WHERE evaluator_id = ?",
                 (request.evaluator_id,),
             ).fetchone()
-            if evaluator is None:
+            if evaluator_row is None or _content_hash(evaluator_row[0]) != evaluator_row[1]:
                 raise FinalTestAccessError("evaluator identity is not registered")
-            evaluation = connection.execute(
-                "SELECT payload_json FROM records WHERE kind = 'evaluation' AND record_id = ?",
-                (request.evaluation_id,),
-            ).fetchone()
-            if evaluation is None:
-                raise FinalTestAccessError("evaluation provenance is unavailable")
-            evaluation_payload = json.loads(evaluation[0])
+            evaluator = EvaluatorIdentity.model_validate_json(evaluator_row[0])
+            try:
+                evaluation_payload = json.loads(
+                    self._verified_record(connection, "evaluation", request.evaluation_id)
+                )
+            except ValueError as error:
+                raise FinalTestAccessError("evaluation provenance is unavailable") from error
+            evaluation = EvaluationResult.model_validate(
+                evaluation_payload.get("result", evaluation_payload)
+            )
             if (
-                evaluation_payload.get("experiment_id") != request.experiment_id
-                or evaluation_payload.get("checkpoint_id") != request.checkpoint_id
+                evaluation.evaluation_id != observation.evaluation_id
+                or evaluation.experiment_id != observation.experiment_id
+                or evaluation.run_id != request.run_id
+                or evaluation.source_commit != observation.source_commit
+                or evaluation.execution_id != observation.execution_id
+                or evaluation.checkpoint_id != request.checkpoint_id
+                or evaluation.evaluator_artifact_id != request.evaluator_id
+                or evaluation.evaluator_sha256 != evaluator.evaluator_sha256
+                or evaluation.validity != observation.validity
+                or evaluation.split != observation.split
             ):
                 raise FinalTestAccessError("evaluation provenance does not match finalization")
             try:
@@ -1707,8 +3273,7 @@ class ApplicationRepository:
     def get_finalization(self, finalization_id: str) -> FinalizationRecord | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT finalization_json FROM authority_finalizations "
-                "WHERE finalization_id = ?",
+                "SELECT finalization_json FROM authority_finalizations WHERE finalization_id = ?",
                 (finalization_id,),
             ).fetchone()
         return FinalizationRecord.model_validate_json(row[0]) if row else None
@@ -1975,24 +3540,28 @@ class ApplicationRepository:
         """List typed calibrations, with a narrow legacy generic fallback."""
         with self._connect() as connection:
             typed_rows = connection.execute(
-                "SELECT calibration_id, payload_json "
+                "SELECT calibration_id, payload_json, content_sha256 "
                 "FROM authority_baseline_calibrations ORDER BY created_at, calibration_id"
             ).fetchall()
             legacy_rows = connection.execute(
-                "SELECT record_id, payload_json FROM records "
+                "SELECT record_id, payload_json, content_sha256 FROM records "
                 "WHERE kind = 'baseline_calibration' ORDER BY record_id"
             ).fetchall()
-        records = [
-            BaselineCalibrationRecord.model_validate_json(payload)
-            for _calibration_id, payload in typed_rows
-        ]
+        records: list[BaselineCalibrationRecord] = []
+        for calibration_id, payload, digest in typed_rows:
+            if digest is None or _content_hash(payload) != digest:
+                raise PersistenceConflictError(
+                    f"baseline calibration {calibration_id} integrity check failed"
+                )
+            records.append(BaselineCalibrationRecord.model_validate_json(payload))
         typed_ids = {record.calibration_id for record in records}
-        records.extend(
-            record
-            for record_id, payload in legacy_rows
-            if record_id not in typed_ids
-            for record in (BaselineCalibrationRecord.model_validate_json(payload),)
-        )
+        for record_id, payload, digest in legacy_rows:
+            if digest is None or _content_hash(payload) != digest:
+                raise PersistenceConflictError(
+                    f"persisted baseline calibration {record_id} integrity check failed"
+                )
+            if record_id not in typed_ids:
+                records.append(BaselineCalibrationRecord.model_validate_json(payload))
         return tuple(records)
 
     def put_baseline_calibration(
@@ -2029,8 +3598,7 @@ class ApplicationRepository:
     def get_run_baseline(self, run_id: str) -> RunBaselineBinding | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT payload_json FROM authority_run_baseline_bindings "
-                "WHERE run_id = ?",
+                "SELECT payload_json FROM authority_run_baseline_bindings WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
         return RunBaselineBinding.model_validate_json(row[0]) if row else None
@@ -2064,8 +3632,7 @@ class ApplicationRepository:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
-                "SELECT content_sha256 FROM authority_run_baseline_bindings "
-                "WHERE run_id = ?",
+                "SELECT content_sha256 FROM authority_run_baseline_bindings WHERE run_id = ?",
                 (binding.run_id,),
             ).fetchone()
             if existing is not None and existing[0] != _content_hash(payload):
@@ -2073,8 +3640,7 @@ class ApplicationRepository:
                     f"run baseline binding {binding.run_id} content changed"
                 )
             calibration = connection.execute(
-                "SELECT payload_json FROM authority_baseline_calibrations "
-                "WHERE calibration_id = ?",
+                "SELECT payload_json FROM authority_baseline_calibrations WHERE calibration_id = ?",
                 (binding.calibration_id,),
             ).fetchone()
             if calibration is None:
@@ -2085,11 +3651,9 @@ class ApplicationRepository:
             }
             binding_metrics = {metric.name: metric.value for metric in binding.metrics}
             if (
-                calibration_record.evaluation.evaluation_id
-                != binding.baseline_evaluation_id
+                calibration_record.evaluation.evaluation_id != binding.baseline_evaluation_id
                 or calibration_record.dataset_manifest_id != binding.dataset_manifest_id
-                or calibration_record.dataset_manifest_sha256
-                != binding.dataset_manifest_sha256
+                or calibration_record.dataset_manifest_sha256 != binding.dataset_manifest_sha256
                 or calibration_record.evaluator_id != binding.evaluator_id
                 or calibration_record.evaluator_sha256 != binding.evaluator_sha256
                 or calibration_record.split != binding.split
@@ -2114,17 +3678,23 @@ class ApplicationRepository:
     def get_baseline_calibration(self, calibration_id: str) -> BaselineCalibrationRecord | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT payload_json FROM authority_baseline_calibrations "
+                "SELECT payload_json, content_sha256 FROM authority_baseline_calibrations "
                 "WHERE calibration_id = ?",
                 (calibration_id,),
             ).fetchone()
             if row is None:
                 row = connection.execute(
-                    "SELECT payload_json FROM records "
+                    "SELECT payload_json, content_sha256 FROM records "
                     "WHERE kind = 'baseline_calibration' AND record_id = ?",
                     (calibration_id,),
                 ).fetchone()
-        return BaselineCalibrationRecord.model_validate_json(row[0]) if row else None
+        if row is None:
+            return None
+        if row[1] is None or _content_hash(row[0]) != row[1]:
+            raise PersistenceConflictError(
+                f"baseline calibration {calibration_id} integrity check failed"
+            )
+        return BaselineCalibrationRecord.model_validate_json(row[0])
 
     def put_json(self, kind: str, record_id: str, payload_json: str) -> None:
         """Compatibility store for non-authority artifacts.
@@ -2148,15 +3718,21 @@ class ApplicationRepository:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
-                "SELECT payload_json FROM records WHERE kind = ? AND record_id = ?",
+                "SELECT payload_json, content_sha256 FROM records WHERE kind = ? AND record_id = ?",
                 (kind, record_id),
             ).fetchone()
-            if existing is not None and existing[0] != payload_json:
-                raise PersistenceConflictError(f"record {kind}/{record_id} content changed")
+            if existing is not None:
+                if existing[1] is None or _content_hash(existing[0]) != existing[1]:
+                    raise PersistenceConflictError(
+                        f"record {kind}/{record_id} integrity check failed"
+                    )
+                if existing[0] != payload_json:
+                    raise PersistenceConflictError(f"record {kind}/{record_id} content changed")
             if existing is None:
                 connection.execute(
-                    "INSERT INTO records (kind, record_id, payload_json) VALUES (?, ?, ?)",
-                    (kind, record_id, payload_json),
+                    "INSERT INTO records (kind, record_id, payload_json, content_sha256) "
+                    "VALUES (?, ?, ?, ?)",
+                    (kind, record_id, payload_json, _content_hash(payload_json)),
                 )
 
     def list_json(self, kind: str) -> tuple[str, ...]:
@@ -2164,6 +3740,13 @@ class ApplicationRepository:
             return tuple(record.model_dump_json() for record in self.list_baseline_calibrations())
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT payload_json FROM records WHERE kind = ? ORDER BY record_id", (kind,)
+                "SELECT payload_json, content_sha256 FROM records "
+                "WHERE kind = ? ORDER BY record_id",
+                (kind,),
             ).fetchall()
-        return tuple(row[0] for row in rows)
+        values: list[str] = []
+        for payload, digest in rows:
+            if digest is None or _content_hash(payload) != digest:
+                raise PersistenceConflictError(f"record {kind} integrity check failed")
+            values.append(payload)
+        return tuple(values)
