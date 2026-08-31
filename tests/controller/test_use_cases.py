@@ -1364,6 +1364,78 @@ async def test_diff_policy_requires_execution_entrypoint_integration() -> None:
     assert result["pending_route"] == "persist_failure"
     assert "experiment/train.py" in str(result["terminal_reason"])
 
+class _MultiProposalStore(_FakeStore):
+    """FakeStore with the two read methods used by multi-proposal orchestration."""
+
+    def list_experiments_by_status(
+        self, run_id: str, status: str
+    ) -> tuple[ExperimentSpec, ...]:
+        del run_id, status
+        return tuple(self.experiments.values())
+
+    def list_scored_observations(self, run_id: str) -> tuple[ScoredObservation, ...]:
+        del run_id
+        return tuple(self.observations.values())
+
+
+def _proposal(experiment_id: str, hypothesis: str) -> ExperimentSpec:
+    return _experiment(("src/tiktok2026/experiment",)).model_copy(
+        update={
+            "experiment_id": experiment_id,
+            "hypothesis_id": f"hyp-{experiment_id}",
+            "hypothesis": hypothesis,
+        }
+    )
+
+
+async def test_orchestration_selects_among_pending_proposals() -> None:
+    """With pending proposals, implement is allowed and the chosen proposal becomes current."""
+    store = _MultiProposalStore()
+    store.experiments["exp-a"] = _proposal("exp-a", "pairwise loss")
+    store.experiments["exp-b"] = _proposal("exp-b", "bigger embeddings")
+    agent = _ScriptedAgentClient(
+        [
+            OrchestrationDecision(
+                decision_id="pick-exp-a",
+                action=DecisionAction.IMPLEMENT,
+                target_experiment_id="exp-a",
+                rationale="History favors loss-function experiments",
+            )
+        ]
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=agent))
+
+    result = await controller.orchestrate(minimal_state(phase=RunPhase.RESEARCH))
+
+    assert result["pending_route"] == "proposal_policy"
+    assert result["current_experiment_id"] == "exp-a"
+    assert result["current_hypothesis_id"] == "hyp-exp-a"
+    request = agent.calls[0]
+    assert isinstance(request, OrchestrationRequest)
+    assert DecisionAction.IMPLEMENT in request.allowed_actions
+    assert {p.experiment_id for p in request.pending_proposals} == {"exp-a", "exp-b"}
+
+
+async def test_orchestration_rejects_unknown_proposal_target() -> None:
+    """Implement with an id outside pending proposals is a schema failure."""
+    store = _MultiProposalStore()
+    store.experiments["exp-a"] = _proposal("exp-a", "pairwise loss")
+    agent = _ScriptedAgentClient(
+        [
+            OrchestrationDecision(
+                decision_id="pick-ghost",
+                action=DecisionAction.IMPLEMENT,
+                target_experiment_id="exp-ghost",
+                rationale="Invented identity",
+            )
+        ]
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=agent))
+
+    result = await controller.orchestrate(minimal_state(phase=RunPhase.RESEARCH))
+
+    assert result["pending_route"] == "persist_failure"
+    assert "unknown proposal" in str(result["terminal_reason"])
 
 async def test_orchestration_offers_empty_run_only_research() -> None:
     store = _FakeStore()
