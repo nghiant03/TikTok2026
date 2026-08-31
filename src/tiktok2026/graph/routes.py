@@ -76,7 +76,7 @@ def route_after_validation(
             return "create_worktree"
         if report.stage.value == "implementation":
             return "register_source"
-        return "interpret"
+        return "persist"
     if report.verdict == ValidationVerdict.REPAIRABLE:
         return "repair"
     return "persist_failure"

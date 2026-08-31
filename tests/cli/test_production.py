@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -202,6 +204,144 @@ def test_production_resume_backfills_baseline_without_checkpoint_mutation(
     assert "baseline_bound" in {
         event.event_type for event in repository.list_audit_events("legacy-run")
     }
+
+
+def test_resume_champion_closure_finalizes_without_stale_implementation_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tiktok2026 import bootstrap
+    from tiktok2026.bootstrap import ProductionOperations
+    from tiktok2026.contracts import RunPhase
+
+    class _Checkpoint:
+        def __init__(self) -> None:
+            self.updates: list[dict[str, object]] = []
+
+        async def aget_tuple(self, config: object) -> SimpleNamespace:
+            del config
+            return SimpleNamespace(config={"configurable": {"thread_id": "run-1"}})
+
+        async def aupdate_state(
+            self, config: dict[str, object], updates: dict[str, object], as_node: str
+        ) -> None:
+            del config, as_node
+            self.updates.append(updates)
+
+    class _Graph:
+        def __init__(self) -> None:
+            self.invoked = False
+
+        async def ainvoke(self, state: object, config: object) -> dict[str, object]:
+            del state, config
+            self.invoked = True
+            return {"phase": RunPhase.COMPLETE, "pending_route": "complete"}
+
+    class _Repository:
+        def adopt_legacy_lifecycle(self, run_id: str) -> tuple[dict[str, object], ...]:
+            assert run_id == "run-1"
+            return ()
+
+    closure = SimpleNamespace(champion=object())
+    repository = _Repository()
+    checkpoint = _Checkpoint()
+    graph = _Graph()
+    stale_state = {
+        "phase": RunPhase.IMPLEMENT,
+        "pending_route": "implement",
+        "current_experiment_id": "abandoned-experiment",
+        "state_version": 17,
+    }
+    closure_state = {
+        "phase": RunPhase.FINALIZE,
+        "pending_route": "finalize",
+        "current_experiment_id": "historical-champion",
+    }
+
+    class _Store:
+        def __init__(self, repository_: object) -> None:
+            assert repository_ is repository
+
+        def get_run_closure(self, run_id: str) -> object:
+            assert run_id == "run-1"
+            return closure
+
+        def put_run_baseline(self, binding: object) -> None:
+            del binding
+
+    runtime_root = tmp_path / "runtime"
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    runtime_root.mkdir()
+    operations = ProductionOperations(repo_dir, runtime_root)
+    settings = SimpleNamespace(dataset_root=tmp_path / "dataset")
+    monkeypatch.setattr(
+        bootstrap,
+        "initialize_runtime",
+        lambda repository_root, runtime_root_: SimpleNamespace(repository=repository),
+    )
+    monkeypatch.setattr(bootstrap, "RepositoryRunStore", _Store)
+    monkeypatch.setattr(bootstrap, "SqliteCheckpointer", lambda path: checkpoint)
+    monkeypatch.setattr(bootstrap, "closure_updates_without_agents", lambda *args: closure_state)
+    monkeypatch.setattr(operations, "_load_checkpoint", lambda run_id: stale_state)
+    monkeypatch.setattr(operations, "_production_settings", lambda: settings)
+    monkeypatch.setattr(operations, "_ensure_current_baseline", lambda *args: (object(), False))
+    monkeypatch.setattr(operations, "_binding", lambda *args: object())
+    monkeypatch.setattr(
+        bootstrap,
+        "build_production_services",
+        lambda settings_: SimpleNamespace(graph=graph),
+    )
+    monkeypatch.setattr(
+        operations,
+        "_reconcile_resume_boundary",
+        lambda *args: pytest.fail("stale resume boundary was reconciled"),
+    )
+    monkeypatch.setattr(
+        operations,
+        "_bind_resumed_implementor",
+        lambda *args: pytest.fail("stale implementor was bound"),
+    )
+    monkeypatch.setattr(operations, "_resume_audit", lambda *args: None)
+
+    result = operations.resume("run-1")
+
+    assert result.status == "resumed"
+    assert graph.invoked
+    assert checkpoint.updates == [closure_state]
+
+
+def test_resume_runtime_lock_allows_only_one_dispatch_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tiktok2026.bootstrap import OperationalError, ProductionOperations
+    from tiktok2026.contracts import OperationResult, RunPhase
+
+    runtime_root, repo_dir = _setup_runtime(tmp_path)
+    operations = ProductionOperations(repo_dir, runtime_root)
+    entered = Event()
+    release = Event()
+    dispatches = 0
+
+    def fake_resume_locked(run_id: str, *, synthetic: bool = False) -> OperationResult:
+        nonlocal dispatches
+        del synthetic
+        dispatches += 1
+        entered.set()
+        assert release.wait(5)
+        return OperationResult(
+            operation="resume", run_id=run_id, phase=RunPhase.EXECUTE, status="resumed"
+        )
+
+    monkeypatch.setattr(operations, "_resume_locked", fake_resume_locked)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(operations.resume, "run-1")
+        assert entered.wait(5)
+        second = executor.submit(operations.resume, "run-1")
+        with pytest.raises(OperationalError, match="another production run"):
+            second.result()
+        release.set()
+        assert first.result().status == "resumed"
+    assert dispatches == 1
 
 
 def test_production_resume_rejects_conflicting_baseline_binding(

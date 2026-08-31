@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -12,6 +13,8 @@ from tiktok2026.contracts import (
     DEFAULT_IMPLEMENTATION_CRITERIA,
     AgentFailure,
     AgentRole,
+    ArtifactRecord,
+    ArtifactRetention,
     BaselineCalibrationRecord,
     BlockerResolution,
     ContractModel,
@@ -30,6 +33,8 @@ from tiktok2026.contracts import (
     ExperimentSpec,
     FailureKind,
     Fidelity,
+    FullAttemptClaimRequest,
+    FullScientificAttemptClaim,
     ImplementationAttemptRecord,
     ImplementationCriterionAssessment,
     ImplementationCriterionId,
@@ -43,7 +48,10 @@ from tiktok2026.contracts import (
     ResearchDecision,
     ResearchRequest,
     ResourceState,
+    RunClosure,
     RunPhase,
+    ScoredObservation,
+    ScoredObservationRequest,
     SourceRegistration,
     ValidationBlocker,
     ValidationOperationIdentity,
@@ -102,6 +110,7 @@ class _FakeStore:
         self.sources: dict[str, SourceRegistration] = {}
         self.assignments: dict[str, WorktreeAssignment] = {}
         self.predictions: dict[str, PredictionArtifactRegistration] = {}
+        self.artifacts: dict[str, ArtifactRecord] = {}
         self.evaluator: EvaluatorIdentity | None = None
         self.manifest: DatasetManifestIdentity | None = None
         self.evaluations: list[EvaluationResult] = []
@@ -113,6 +122,9 @@ class _FakeStore:
         self.validation_blockers: dict[str, ValidationBlocker] = {}
         self.validation_resolutions: dict[str, BlockerResolution] = {}
         self.criterion_occurrences: list[tuple[str, str, CriterionAssessmentStatus]] = []
+        self.attempts: dict[str, FullScientificAttemptClaim] = {}
+        self.observations: dict[str, ScoredObservation] = {}
+        self.closure: RunClosure | None = None
 
     def persist_transition(
         self, run_id: str, operation: str, state_version: int, updates: dict[str, object]
@@ -329,6 +341,127 @@ class _FakeStore:
             for (record_kind, _), payload in sorted(self.json_records.items())
             if record_kind == kind
         )
+
+    def claim_full_attempt(
+        self, request: FullAttemptClaimRequest
+    ) -> FullScientificAttemptClaim | None:
+        existing = next(
+            (
+                attempt
+                for attempt in self.attempts.values()
+                if attempt.execution_id == request.execution_id
+            ),
+            None,
+        )
+        if existing is not None:
+            if any(
+                getattr(existing, field) != getattr(request, field)
+                for field in (
+                    "attempt_id",
+                    "execution_id",
+                    "run_id",
+                    "experiment_id",
+                    "source_registration_id",
+                    "source_commit",
+                )
+            ):
+                raise ValueError("attempt identity changed")
+            return existing
+        sequence = len(
+            [attempt for attempt in self.attempts.values() if attempt.run_id == request.run_id]
+        ) + 1
+        if sequence > 50:
+            return None
+        attempt = FullScientificAttemptClaim(
+            **request.model_dump(),
+            attempt_sequence=sequence,
+            claimed_at=datetime.now(UTC),
+        )
+        self.attempts[attempt.attempt_id] = attempt
+        return attempt
+
+    def list_full_attempt_claims(
+        self, run_id: str | None = None
+    ) -> tuple[FullScientificAttemptClaim, ...]:
+        return tuple(
+            sorted(
+                (
+                    attempt
+                    for attempt in self.attempts.values()
+                    if run_id is None or attempt.run_id == run_id
+                ),
+                key=lambda attempt: (attempt.run_id, attempt.attempt_sequence),
+            )
+        )
+
+    def count_full_attempt_claims(self, run_id: str) -> int:
+        return len(self.list_full_attempt_claims(run_id))
+
+    def put_scored_observation(self, request: ScoredObservationRequest) -> ScoredObservation:
+        existing = self.observations.get(request.observation_id)
+        if existing is not None:
+            return existing
+        observation = ScoredObservation(**request.model_dump(), scored_at=datetime.now(UTC))
+        self.observations[observation.observation_id] = observation
+        return observation
+
+    def get_scored_observation(self, observation_id: str) -> ScoredObservation | None:
+        return self.observations.get(observation_id)
+
+    def list_scored_observations(
+        self, run_id: str | None = None
+    ) -> tuple[ScoredObservation, ...]:
+        return tuple(
+            observation
+            for observation in self.observations.values()
+            if run_id is None or observation.run_id == run_id
+        )
+
+    def close_run(
+        self,
+        run_id: str,
+        reason: str,
+        epsilon: float = 0.002,
+        patience: int = 3,
+    ) -> RunClosure:
+        del epsilon, patience
+        if self.closure is None:
+            self.closure = RunClosure(
+                closure_id=f"closure-{run_id}",
+                run_id=run_id,
+                reason=reason,
+                attempt_count=self.count_full_attempt_claims(run_id),
+                scored_observation_count=len(self.list_scored_observations(run_id)),
+                champion=None,
+            )
+        return self.closure
+
+    def get_run_closure(self, run_id: str) -> RunClosure | None:
+        return self.closure if self.closure is not None and self.closure.run_id == run_id else None
+
+    def close_run_if_ready(
+        self,
+        run_id: str,
+        *,
+        after_failure: bool = False,
+        epsilon: float = 0.002,
+        patience: int = 3,
+    ) -> RunClosure | None:
+        del run_id, after_failure, epsilon, patience
+        return self.closure
+
+    def get_run_baseline(self, run_id: str) -> Any:
+        del run_id
+        return None
+
+    def get_baseline_calibration(self, calibration_id: str) -> BaselineCalibrationRecord | None:
+        return next(
+            (item for item in self.baseline_calibrations if item.calibration_id == calibration_id),
+            None,
+        )
+
+    def get_artifact(self, artifact_id: str) -> Any:
+        return self.artifacts.get(artifact_id)
 
 
 class _ContentAddressedRegistryStore(_FakeStore):
@@ -1274,7 +1407,7 @@ async def test_orchestration_rejects_stop_without_finalization_authority() -> No
     assert "disallowed action: stop" in str(result["terminal_reason"])
 
 
-async def test_orchestration_allows_stop_with_finalization_authority() -> None:
+async def test_orchestration_rejects_stop_before_deterministic_convergence() -> None:
     store = _FakeStore()
     store.sources["exp-1"] = SourceRegistration(
         experiment_id="exp-1",
@@ -1310,11 +1443,29 @@ async def test_orchestration_allows_stop_with_finalization_authority() -> None:
         )
     )
 
-    assert result["pending_route"] == "finalize"
+    assert result["pending_route"] == "persist_failure"
+    assert "disallowed action: stop" in str(result["terminal_reason"])
     request = agent.calls[0]
     assert isinstance(request, OrchestrationRequest)
-    assert request.finalization_ready is True
-    assert DecisionAction.STOP in request.allowed_actions
+    assert request.finalization_ready is False
+    assert DecisionAction.STOP not in request.allowed_actions
+
+
+async def test_finalize_recovers_premature_stop_to_orchestration() -> None:
+    controller = ProductionController(_make_services())
+
+    result = await controller.finalize(
+        minimal_state(
+            phase=RunPhase.PERSIST,
+            current_experiment_id="exp-1",
+            latest_evaluation_result_id="eval-1",
+            pending_route="finalize",
+        )
+    )
+
+    assert result["phase"] == RunPhase.PERSIST
+    assert result["pending_route"] == "orchestrate"
+    assert result["state_version"] == 1
 
 
 async def test_research_repairs_one_bad_response() -> None:
@@ -1516,6 +1667,10 @@ class _FakeResourceAccountant:
         self.operations.append(f"reconcile:{reservation_id}")
         return True
 
+    def release(self, reservation_id: str) -> bool:
+        self.operations.append(f"release:{reservation_id}")
+        return True
+
 
 def _populate_execution_authority(store: _FakeStore) -> str:
     source_commit = "a" * 40
@@ -1574,11 +1729,13 @@ async def test_execute_builds_only_deterministic_allowlisted_train_command(
         branch="experiment/test-run/exp-1",
         parent_commit="b" * 40,
     )
+    accountant = _FakeResourceAccountant()
     services = make_service_transitions(
         executor=executor,
         run_store=store,
         dataset_root="/external/readonly-dataset",
         runtime_root=str(tmp_path / "runtime"),
+        resource_accountant=accountant,
         default_timeout_seconds=123,
         default_memory_bytes=4_294_967_296,
         default_cpus=2.0,
@@ -1618,13 +1775,124 @@ async def test_execute_builds_only_deterministic_allowlisted_train_command(
 
     assert retried["pending_route"] == "evaluate"
     assert executor.calls == 1
+    assert accountant.operations == [
+        "reserve:reservation-execution-test-run-exp-1-0",
+        "consume:reservation-execution-test-run-exp-1-0",
+        "reconcile:reservation-execution-test-run-exp-1-0",
+        "reserve:reservation-execution-test-run-exp-1-0",
+        "consume:reservation-execution-test-run-exp-1-0",
+        "reconcile:reservation-execution-test-run-exp-1-0",
+    ]
 
     del store.executions[executor.request.execution_id]
     ambiguous = await controller.execute(minimal_state(current_experiment_id="exp-1"))
 
     assert ambiguous["pending_route"] == "persist_failure"
-    assert "execution output path already exists" in str(ambiguous["terminal_reason"])
+    assert "already claimed but its result is absent" in str(ambiguous["terminal_reason"])
     assert executor.calls == 1
+
+
+async def test_execute_preparation_failure_releases_reservation_without_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _FakeStore()
+    _populate_execution_authority(store)
+    executor = _CapturingExecutor()
+    accountant = _FakeResourceAccountant()
+    monkeypatch.setattr(
+        use_cases,
+        "_fresh_execution_output_path",
+        lambda runtime_root, execution_id: (_ for _ in ()).throw(
+            ValueError("output preparation failed")
+        ),
+    )
+    services = make_service_transitions(
+        executor=executor,
+        run_store=store,
+        dataset_root="/external/readonly-dataset",
+        runtime_root=str(tmp_path / "runtime"),
+        resource_accountant=accountant,
+    )
+
+    result = await ProductionController(ControllerServices(services, store)).execute(
+        minimal_state(current_experiment_id="exp-1", phase=RunPhase.EXECUTE)
+    )
+
+    assert result["pending_route"] == "persist_failure"
+    assert store.count_full_attempt_claims("test-run") == 0
+    assert accountant.operations == [
+        "reserve:reservation-execution-test-run-exp-1-0",
+        "release:reservation-execution-test-run-exp-1-0",
+    ]
+    assert executor.calls == 0
+
+
+async def test_execute_request_validation_failure_releases_reservation_and_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _FakeStore()
+    _populate_execution_authority(store)
+    executor = _CapturingExecutor()
+    accountant = _FakeResourceAccountant()
+
+    def reject_request(**kwargs: object) -> None:
+        del kwargs
+        raise ValueError("request validation failed")
+
+    monkeypatch.setattr(use_cases, "ExecutionRequest", reject_request)
+    services = make_service_transitions(
+        executor=executor,
+        run_store=store,
+        dataset_root="/external/readonly-dataset",
+        runtime_root=str(tmp_path / "runtime"),
+        resource_accountant=accountant,
+    )
+
+    result = await ProductionController(ControllerServices(services, store)).execute(
+        minimal_state(current_experiment_id="exp-1", phase=RunPhase.EXECUTE)
+    )
+
+    assert result["pending_route"] == "persist_failure"
+    assert store.count_full_attempt_claims("test-run") == 0
+    assert accountant.operations == [
+        "reserve:reservation-execution-test-run-exp-1-0",
+        "release:reservation-execution-test-run-exp-1-0",
+    ]
+    assert tuple((tmp_path / "runtime" / "artifacts" / ".execution").iterdir()) == ()
+    assert executor.calls == 0
+
+
+async def test_execute_never_dispatches_a_fifty_first_full_attempt(tmp_path: Path) -> None:
+    store = _FakeStore()
+    _populate_execution_authority(store)
+    for index in range(50):
+        claim = FullAttemptClaimRequest(
+            attempt_id=f"attempt-existing-{index}",
+            execution_id=f"execution-existing-{index}",
+            run_id="test-run",
+            experiment_id="exp-1",
+            source_registration_id=store.sources["exp-1"].registration_id,
+            source_commit=store.sources["exp-1"].source_commit,
+        )
+        assert store.claim_full_attempt(claim) is not None
+    executor = _CapturingExecutor()
+    accountant = _FakeResourceAccountant()
+    services = make_service_transitions(
+        executor=executor,
+        run_store=store,
+        dataset_root="/external/readonly-dataset",
+        runtime_root=str(tmp_path / "runtime"),
+        resource_accountant=accountant,
+    )
+
+    result = await ProductionController(ControllerServices(services, store)).execute(
+        minimal_state(current_experiment_id="exp-1", phase=RunPhase.EXECUTE)
+    )
+
+    assert result["pending_route"] == "persist_failure"
+    assert executor.calls == 0
+    assert store.count_full_attempt_claims("test-run") == 50
+    assert accountant.operations[-1] == "release:reservation-execution-test-run-exp-1-0"
 
 
 async def test_smoke_runs_before_full_execution_with_distinct_identity(tmp_path: Path) -> None:
@@ -1841,6 +2109,28 @@ async def test_evaluate_persists_evaluation_with_provenance() -> None:
         dataset_manifest_sha256="d" * 64,
         split="valid",
     )
+    store.artifacts["prediction-1"] = ArtifactRecord(
+        artifact_id="prediction-1",
+        run_id="test-run",
+        experiment_id="exp-1",
+        kind="prediction",
+        uri="file:///tmp/prediction-1.json",
+        sha256="1" * 64,
+        size_bytes=1,
+        producer="test",
+        retention=ArtifactRetention.RUN,
+    )
+    store.artifacts["ckpt-1"] = ArtifactRecord(
+        artifact_id="ckpt-1",
+        run_id="test-run",
+        experiment_id="exp-1",
+        kind="checkpoint",
+        uri="file:///tmp/checkpoint-1.json",
+        sha256="2" * 64,
+        size_bytes=1,
+        producer="test",
+        retention=ArtifactRetention.RUN,
+    )
     services = _make_services(store=store, evaluator=evaluator)
     controller = ProductionController(services)
 
@@ -1910,7 +2200,7 @@ async def test_result_validation_excludes_authoritative_dataset_rows() -> None:
         )
     )
 
-    assert result["pending_route"] == "interpret"
+    assert result["pending_route"] == "persist"
     request = agent.calls[0]
     assert isinstance(request, ValidationRequest)
     execution = request.subject["execution_result"]

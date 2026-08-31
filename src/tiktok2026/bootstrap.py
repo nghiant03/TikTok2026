@@ -41,7 +41,6 @@ from tiktok2026.contracts import (
     DatasetViewProvenance,
     DatasetViewRow,
     DecisionAction,
-    EvaluationResult,
     EvaluatorIdentity,
     ExecutionRequest,
     ExecutionResult,
@@ -65,6 +64,7 @@ from tiktok2026.contracts import (
     RunBaselineBinding,
     RunPhase,
     RunRecord,
+    RunStore,
     RuntimePaths,
     SourceRegistration,
     ValidationReport,
@@ -76,6 +76,7 @@ from tiktok2026.contracts import (
 from tiktok2026.controller import ControllerServices, ProductionController
 from tiktok2026.evaluation.registry import evaluator_implementation_sha256
 from tiktok2026.graph.build import build_production_graph
+from tiktok2026.graph.state import ProductionState
 from tiktok2026.persistence.checkpointer import SqliteCheckpointer
 from tiktok2026.persistence.migrations import MigrationRunner
 from tiktok2026.persistence.repositories import ApplicationRepository
@@ -85,7 +86,11 @@ from tiktok2026.recovery import (
     reconcile_recovery,
     validate_pre_registration_assignment,
 )
-from tiktok2026.use_cases import make_service_transitions
+from tiktok2026.use_cases import (
+    ServiceTransitions,
+    closure_updates_without_agents,
+    make_service_transitions,
+)
 
 
 @dataclass(frozen=True)
@@ -162,32 +167,42 @@ def _persist_finalization(
     repository: ApplicationRepository, runtime_root: Path, run_id: str
 ) -> Any:
     finalization_id = f"finalization-{run_id}"
-    existing = repository.get_finalization(finalization_id)
-    if existing is not None:
-        return existing
-    events = repository.list_audit_events(run_id)
-    experiment_id = next(
-        (event.experiment_id for event in reversed(events) if event.experiment_id), None
-    )
-    if experiment_id is None:
-        raise ValueError("no experiment found for this run")
     store = RepositoryRunStore(repository)
-    evaluation_values: list[EvaluationResult] = []
-    for raw in repository.list_json("evaluation"):
-        value = json.loads(raw)
-        evaluation = EvaluationResult.model_validate(value.get("result", value))
-        if evaluation.experiment_id == experiment_id:
-            evaluation_values.append(evaluation)
-    evaluation = evaluation_values[-1] if evaluation_values else None
-    source = (
-        store.get_source_registration_by_id(f"source-{evaluation.source_commit}")
-        if evaluation is not None and evaluation.source_commit is not None
-        else store.get_source_registration(experiment_id)
-    )
+    closure = store.get_run_closure(run_id)
+    if closure is None or closure.champion is None:
+        raise ValueError("finalization requires a closure with an eligible champion")
+    champion = closure.champion
+    observation = store.get_scored_observation(champion.observation_id)
+    if observation is None:
+        raise ValueError("finalization champion observation is unavailable")
+    experiment_id = observation.experiment_id
+    evaluation = store.get_evaluation_result(champion.evaluation_id)
+    source = store.get_source_registration_by_id(f"source-{champion.source_commit}")
     if source is None or evaluation is None:
         raise ValueError("finalization provenance is unavailable")
-    if evaluation.run_id != run_id:
-        raise ValueError("evaluation provenance does not match this run")
+    if (
+        observation.run_id != run_id
+        or observation.evaluation_id != evaluation.evaluation_id
+        or observation.checkpoint_id != champion.checkpoint_id
+        or observation.source_commit != source.source_commit
+        or evaluation.run_id != run_id
+        or evaluation.experiment_id != experiment_id
+        or evaluation.checkpoint_id != champion.checkpoint_id
+        or source.run_id != run_id
+        or source.experiment_id != experiment_id
+    ):
+        raise ValueError("finalization provenance does not match closure champion")
+    existing = repository.get_finalization(finalization_id)
+    if existing is not None:
+        if (
+            existing.run_id != run_id
+            or existing.experiment_id != experiment_id
+            or existing.source_commit != source.source_commit
+            or existing.checkpoint_id != evaluation.checkpoint_id
+            or existing.evaluation_id != evaluation.evaluation_id
+        ):
+            raise ValueError("persisted finalization is not bound to the closure champion")
+        return existing
     bundle = RepositoryFinalizationBundleService(repository, runtime_root).create(
         FinalizationBundleRequest(
             run_id=run_id,
@@ -527,12 +542,68 @@ class ProductionOperations:
         )
 
     def resume(self, run_id: str, *, synthetic: bool = False) -> OperationResult:
+        lock = (
+            _exclusive_runtime_run(self.runtime_root, run_id)
+            if not synthetic
+            else nullcontext()
+        )
+        with lock:
+            return self._resume_locked(run_id, synthetic=synthetic)
+
+    def _resume_locked(self, run_id: str, *, synthetic: bool = False) -> OperationResult:
         repository = initialize_runtime(self.repository_root, self.runtime_root).repository
+        if not synthetic:
+            repository.adopt_legacy_lifecycle(run_id)
         checkpoint = self._load_checkpoint(run_id)
         if checkpoint is None:
             raise OperationalError(f"no durable checkpoint exists for run {run_id}")
         state = _checkpoint_state(checkpoint)
         phase = str(state.get("phase"))
+        store = RepositoryRunStore(repository)
+        closure = store.get_run_closure(run_id)
+        checkpointer = SqliteCheckpointer(self.runtime_root / "graph.sqlite3")
+        closure_updates: dict[str, object] | None = None
+        if closure is not None and phase not in {RunPhase.COMPLETE.value, str(RunPhase.COMPLETE)}:
+            try:
+                closure_updates = closure_updates_without_agents(
+                    ServiceTransitions(run_store=cast(RunStore, store)),
+                    cast(ProductionState, state),
+                    closure,
+                )
+                durable = asyncio.run(
+                    checkpointer.aget_tuple({"configurable": {"thread_id": run_id}})
+                )
+                if durable is None:
+                    raise OperationalError("durable checkpoint disappeared during closure recovery")
+                asyncio.run(
+                    cast(Any, checkpointer).aupdate_state(
+                        cast(dict[str, object], durable.config),
+                        closure_updates,
+                        as_node="update_frontier",
+                    )
+                )
+                if closure.champion is None:
+                    self._resume_audit(
+                        repository,
+                        run_id,
+                        True,
+                        "closed without an eligible scored observation",
+                    )
+                    return _result(
+                        "resume",
+                        run_id=run_id,
+                        phase=RunPhase.COMPLETE,
+                        status="resumed",
+                        values={
+                            "pending_route": "complete",
+                            "state_version": state.get("state_version", 0),
+                        },
+                    )
+            except Exception as error:
+                self._resume_audit(repository, run_id, False, str(error))
+                raise OperationalError(str(error)) from error
+            state = {**state, **closure_updates}
+            phase = str(state.get("phase"))
         baseline: RunBaselineBinding | None = None
         settings: Any | None = None
         if not synthetic:
@@ -559,7 +630,7 @@ class ProductionOperations:
                 status="already_complete",
                 values={"resumed": False},
             )
-        if not synthetic:
+        if not synthetic and not (closure is not None and closure.champion is not None):
             self._reconcile_resume_boundary(repository, run_id, state)
         if synthetic:
             _controller, _store, graph = build_synthetic_controller(
@@ -568,7 +639,8 @@ class ProductionOperations:
         else:
             assert settings is not None
             services = build_production_services(settings)
-            self._bind_resumed_implementor(services, repository, state)
+            if closure is None or closure.champion is None:
+                self._bind_resumed_implementor(services, repository, state)
             graph = services.graph
         try:
             result = asyncio.run(graph.ainvoke(None, {"configurable": {"thread_id": run_id}}))
@@ -1716,8 +1788,8 @@ def build_production_services(settings: Any) -> ProductionServices:
         bundle_service=RepositoryFinalizationBundleService(repo, paths.root),
         frontier_service=RepositoryFrontierService(
             repo,
-            epsilon=float(getattr(app_settings, "plateau_epsilon", 0.002)),
-            patience=int(getattr(app_settings, "plateau_patience", 3)),
+            epsilon=app_settings.plateau_epsilon,
+            patience=app_settings.plateau_patience,
         ),
         runtime_root=str(paths.root),
         repository_root=str(app_settings.repository_root),
@@ -1737,6 +1809,8 @@ def build_production_services(settings: Any) -> ProductionServices:
         smoke_disk_bytes=app_settings.execution.smoke_disk_bytes,
         max_repairs=app_settings.budget.max_repairs,
         requires_run_baseline=app_settings.profile == "production",
+        plateau_epsilon=app_settings.plateau_epsilon,
+        plateau_patience=app_settings.plateau_patience,
     )
     controller = ProductionController(ControllerServices(transitions=transitions, store=run_store))
     graph = build_production_graph(controller, checkpointer=SqliteCheckpointer(paths.graph_db))

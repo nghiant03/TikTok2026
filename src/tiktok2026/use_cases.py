@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NoReturn, cast
+from typing import Literal, NoReturn, cast
 
 from loguru import logger
 
@@ -15,7 +15,6 @@ from tiktok2026.contracts import (
     AgentClient,
     AgentFailure,
     AgentRole,
-    BaselineCalibrationRecord,
     ControllerContext,
     CriterionAssessmentStatus,
     DatasetViewProvenance,
@@ -33,6 +32,7 @@ from tiktok2026.contracts import (
     FinalizationBundleRequest,
     FinalizationBundleService,
     FrontierService,
+    FullAttemptClaimRequest,
     ImplementationAttemptRecord,
     ImplementationCriterion,
     ImplementationCriterionAssessment,
@@ -50,10 +50,11 @@ from tiktok2026.contracts import (
     ResourceAccountant,
     ResourceReservation,
     ResourceState,
-    RunBaselineBinding,
+    RunClosure,
     RunPhase,
     RunRecord,
     RunStore,
+    ScoredObservationRequest,
     ValidationBlocker,
     ValidationBlockerContext,
     ValidationOperationIdentity,
@@ -232,6 +233,8 @@ class ServiceTransitions:
     dataset_view_provenance: Callable[[ExecutionRequest], DatasetViewProvenance] | None = None
     max_repairs: int = 3
     requires_run_baseline: bool = False
+    plateau_epsilon: float = 0.002
+    plateau_patience: int = 3
 
 
 def _unresolved_blockers(
@@ -243,14 +246,7 @@ def _unresolved_blockers(
 
 
 def _has_validation_ledger(s: ServiceTransitions) -> bool:
-    return s.run_store is not None and all(
-        callable(getattr(s.run_store, method, None))
-        for method in (
-            "put_validation_report",
-            "get_validation_report_by_operation",
-            "get_unresolved_blockers",
-        )
-    )
+    return s.run_store is not None
 
 
 def _canonical_validation_report(
@@ -349,6 +345,8 @@ def make_service_transitions(
     dataset_view_provenance: Callable[[ExecutionRequest], DatasetViewProvenance] | None = None,
     max_repairs: int = 3,
     requires_run_baseline: bool = False,
+    plateau_epsilon: float = 0.002,
+    plateau_patience: int = 3,
 ) -> Mapping[str, Transition]:
     s = ServiceTransitions(
         agent_client=agent_client,
@@ -378,6 +376,8 @@ def make_service_transitions(
         dataset_view_provenance=dataset_view_provenance,
         max_repairs=max_repairs,
         requires_run_baseline=requires_run_baseline,
+        plateau_epsilon=plateau_epsilon,
+        plateau_patience=plateau_patience,
     )
     return {
         "bootstrap": _bootstrap(s),
@@ -414,9 +414,7 @@ def _bootstrap(s: ServiceTransitions) -> Transition:
             RunRecord(run_id=state["run_id"], status="active"), f"{state['run_id']}-active"
         )
         if s.frontier_service is not None:
-            initialize = getattr(s.frontier_service, "initialize", None)
-            if initialize is not None:
-                initialize(state["run_id"])
+            s.frontier_service.initialize(state["run_id"])
         return {"phase": RunPhase.BOOTSTRAP, "pending_route": "inspect"}
 
     return transition
@@ -432,18 +430,21 @@ def _inspect(s: ServiceTransitions) -> Transition:
 
 def _orchestrate(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
+        if s.run_store is not None:
+            closure = s.run_store.get_run_closure(state["run_id"])
+            if closure is not None:
+                return closure_updates_without_agents(s, state, closure)
         client = _agent(s, AgentRole.ORCHESTRATION)
         if client is None:
             return {"pending_route": "research"}
-        finalization_ready = _finalization_ready(s, state)
+        evaluated_candidate_ready = _evaluated_candidate_ready(s, state)
         allowed_actions = (DecisionAction.RESEARCH,)
-        if finalization_ready:
+        if evaluated_candidate_ready:
             allowed_actions = (
                 DecisionAction.RESEARCH,
                 DecisionAction.REPLICATE,
                 DecisionAction.INCREASE_FIDELITY,
                 DecisionAction.REVISIT_BRANCH,
-                DecisionAction.STOP,
             )
         request = OrchestrationRequest(
             request_id=f"orchestration-{state['run_id']}-{state['state_version']}",
@@ -453,7 +454,7 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
             resource_state=_resource_state(s),
             current_experiment_id=state.get("current_experiment_id"),
             latest_evaluation_result_id=state.get("latest_evaluation_result_id"),
-            finalization_ready=finalization_ready,
+            finalization_ready=False,
             failure_summary=state.get("terminal_reason"),
             controller_context=_controller_context(s),
         )
@@ -485,7 +486,7 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
     return transition
 
 
-def _finalization_ready(s: ServiceTransitions, state: ProductionState) -> bool:
+def _evaluated_candidate_ready(s: ServiceTransitions, state: ProductionState) -> bool:
     experiment_id = state.get("current_experiment_id")
     evaluation_id = state.get("latest_evaluation_result_id")
     if (
@@ -511,6 +512,10 @@ def _finalization_ready(s: ServiceTransitions, state: ProductionState) -> bool:
 
 def _research(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
+        if s.run_store is not None:
+            closure = s.run_store.get_run_closure(state["run_id"])
+            if closure is not None:
+                return closure_updates_without_agents(s, state, closure)
         client = _agent(s, AgentRole.RESEARCH)
         if client is None:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, "research role is not configured")
@@ -1394,6 +1399,7 @@ def _fresh_execution_output_path(runtime_root: str, execution_id: str) -> Path:
     execution_root = artifacts_root / ".execution"
     if artifacts_root.is_symlink() or execution_root.is_symlink():
         raise ValueError("execution output root must not be a symlink")
+    output: Path | None = None
     try:
         execution_root.mkdir(parents=True, exist_ok=True, mode=0o755)
         execution_root.chmod(0o755)
@@ -1406,8 +1412,18 @@ def _fresh_execution_output_path(runtime_root: str, execution_id: str) -> Path:
         # expose other runtime state.
         output.chmod(0o777)
     except OSError as error:
+        if output is not None:
+            _remove_empty_execution_output(output)
         raise ValueError("execution output directory could not be prepared") from error
     return output
+
+
+def _remove_empty_execution_output(output_path: Path) -> None:
+    try:
+        if output_path.is_dir() and not output_path.is_symlink() and not any(output_path.iterdir()):
+            output_path.rmdir()
+    except OSError:
+        logger.warning("could not remove empty execution output path {}", output_path)
 
 
 def _execute(s: ServiceTransitions) -> Transition:
@@ -1417,8 +1433,14 @@ def _execute(s: ServiceTransitions) -> Transition:
             or s.run_store is None
             or s.dataset_root is None
             or s.runtime_root is None
+            or s.resource_accountant is None
         ):
             return _failure(state, FailureKind.MISSING_PATH, "execution provenance is incomplete")
+        reservation_id = ""
+        reservation_held = False
+        dispatch_started = False
+        settlement_replay = False
+        output_path: Path | None = None
         try:
             spec = _spec(s, state)
             registration = s.run_store.get_source_registration(spec.experiment_id)
@@ -1449,23 +1471,97 @@ def _execute(s: ServiceTransitions) -> Transition:
                 raise MissingAuthorityError(
                     "persisted execution result does not match the requested execution"
                 )
-            reservation_id = f"reservation-{execution_id}"
-            reserved_wall_seconds = float(s.default_timeout_seconds + 5)
-            reservation = ResourceReservation(
-                reservation_id=reservation_id,
-                run_id=state["run_id"],
-                experiment_id=spec.experiment_id,
-                gpu_hours=max(
-                    spec.predicted_gpu_hours,
-                    reserved_wall_seconds * s.default_gpu_count / 3600.0,
-                ),
-                wall_seconds=reserved_wall_seconds,
-                tokens=0,
-                disk_bytes=0,
-            )
-            if s.resource_accountant is not None and not s.resource_accountant.reserve(reservation):
-                return _failure(state, FailureKind.DISK, "resource reservation was denied")
-            if result is None:
+            if result is not None:
+                claim = s.run_store.claim_full_attempt(
+                    FullAttemptClaimRequest(
+                        attempt_id=f"attempt-{execution_id}",
+                        execution_id=execution_id,
+                        run_id=state["run_id"],
+                        experiment_id=spec.experiment_id,
+                        source_registration_id=registration.registration_id,
+                        source_commit=registration.source_commit,
+                    )
+                )
+                if claim is None:
+                    return _failure(
+                        state,
+                        FailureKind.SCIENTIFIC_NON_IMPROVEMENT,
+                        "persisted execution cannot be adopted because the attempt cap "
+                        "is exhausted",
+                    )
+                reservation_id = f"reservation-{execution_id}"
+                reservation = ResourceReservation(
+                    reservation_id=reservation_id,
+                    run_id=state["run_id"],
+                    experiment_id=spec.experiment_id,
+                    gpu_hours=max(
+                        spec.predicted_gpu_hours,
+                        float(s.default_timeout_seconds + 5)
+                        * s.default_gpu_count
+                        / 3600.0,
+                    ),
+                    wall_seconds=float(s.default_timeout_seconds + 5),
+                    tokens=0,
+                    disk_bytes=0,
+                )
+                settlement_replay = True
+                if not s.resource_accountant.reserve(reservation):
+                    raise MissingAuthorityError(
+                        "persisted execution resource reservation is unavailable"
+                    )
+                if not s.resource_accountant.consume(
+                    reservation_id,
+                    gpu_hours=result.gpu_hours,
+                    wall_seconds=result.elapsed_seconds,
+                    tokens=0,
+                    disk_bytes=0,
+                ):
+                    raise MissingAuthorityError(
+                        "persisted execution resource settlement is unavailable"
+                    )
+                if not s.resource_accountant.reconcile(
+                    reservation_id,
+                    gpu_hours=result.gpu_hours,
+                    wall_seconds=result.elapsed_seconds,
+                    tokens=0,
+                    disk_bytes=0,
+                ):
+                    raise MissingAuthorityError(
+                        "persisted execution resource reconciliation is unavailable"
+                    )
+            else:
+                existing_claim = next(
+                    (
+                        claim
+                        for claim in s.run_store.list_full_attempt_claims(state["run_id"])
+                        if claim.execution_id == execution_id
+                    ),
+                    None,
+                )
+                if existing_claim is not None:
+                    return _failure(
+                        state,
+                        FailureKind.SCHEMA_MISMATCH,
+                        "full execution is already claimed but its result is absent",
+                        (execution_id,),
+                    )
+                reservation_id = f"reservation-{execution_id}"
+                reserved_wall_seconds = float(s.default_timeout_seconds + 5)
+                reservation = ResourceReservation(
+                    reservation_id=reservation_id,
+                    run_id=state["run_id"],
+                    experiment_id=spec.experiment_id,
+                    gpu_hours=max(
+                        spec.predicted_gpu_hours,
+                        reserved_wall_seconds * s.default_gpu_count / 3600.0,
+                    ),
+                    wall_seconds=reserved_wall_seconds,
+                    tokens=0,
+                    disk_bytes=0,
+                )
+                if not s.resource_accountant.reserve(reservation):
+                    return _failure(state, FailureKind.DISK, "resource reservation was denied")
+                reservation_held = True
                 output_path = _fresh_execution_output_path(s.runtime_root, execution_id)
                 request = ExecutionRequest(
                     run_id=state["run_id"],
@@ -1484,24 +1580,54 @@ def _execute(s: ServiceTransitions) -> Transition:
                     cpus=s.default_cpus,
                     gpu_count=s.default_gpu_count,
                 )
+                claim = s.run_store.claim_full_attempt(
+                    FullAttemptClaimRequest(
+                        attempt_id=f"attempt-{execution_id}",
+                        execution_id=execution_id,
+                        run_id=state["run_id"],
+                        experiment_id=spec.experiment_id,
+                        source_registration_id=registration.registration_id,
+                        source_commit=registration.source_commit,
+                    )
+                )
+                if claim is None:
+                    s.resource_accountant.release(reservation_id)
+                    reservation_held = False
+                    _remove_empty_execution_output(output_path)
+                    return _failure(
+                        state,
+                        FailureKind.SCIENTIFIC_NON_IMPROVEMENT,
+                        "full attempt cap exhausted before dispatch",
+                    )
+                dispatch_started = True
                 result = await s.executor.execute(request)
                 s.run_store.put_execution_result(result)
-            if s.resource_accountant is not None:
-                s.resource_accountant.consume(
+                if not s.resource_accountant.consume(
                     reservation_id,
                     gpu_hours=result.gpu_hours,
                     wall_seconds=result.elapsed_seconds,
                     tokens=0,
                     disk_bytes=0,
-                )
-                s.resource_accountant.reconcile(
+                ):
+                    raise MissingAuthorityError("execution resource settlement is unavailable")
+                if not s.resource_accountant.reconcile(
                     reservation_id,
                     gpu_hours=result.gpu_hours,
                     wall_seconds=result.elapsed_seconds,
                     tokens=0,
                     disk_bytes=0,
-                )
-        except (MissingAuthorityError, ValueError) as error:
+                ):
+                    raise MissingAuthorityError(
+                        "execution resource reconciliation is unavailable"
+                    )
+                reservation_held = False
+        except Exception as error:
+            if reservation_held and not dispatch_started and not settlement_replay:
+                s.resource_accountant.release(reservation_id)
+            if output_path is not None and not dispatch_started and not settlement_replay:
+                _remove_empty_execution_output(output_path)
+            if dispatch_started or settlement_replay:
+                raise
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         if result.failure_kind is not None:
             return _failure(
@@ -1559,30 +1685,21 @@ def _evaluate(s: ServiceTransitions) -> Transition:
                 raise MissingAuthorityError(
                     "execution did not return a registered prediction artifact"
                 )
-            get_artifact = getattr(s.run_store, "get_artifact", None)
-            prediction_record = (
-                get_artifact(prediction.artifact_id) if get_artifact is not None else None
+            prediction_record = s.run_store.get_artifact(prediction.artifact_id)
+            checkpoint_artifacts = tuple(
+                artifact
+                for artifact_id in execution.artifact_ids
+                if (artifact := s.run_store.get_artifact(artifact_id)) is not None
+                and artifact.kind == "checkpoint"
             )
-            checkpoint_artifacts = (
-                tuple(
-                    artifact
-                    for artifact_id in execution.artifact_ids
-                    if (artifact := get_artifact(artifact_id)) is not None
-                    and artifact.kind == "checkpoint"
-                )
-                if get_artifact is not None
-                else (True,)
+            artifact_invalid = (
+                prediction_record is None
+                or prediction_record.kind != "prediction"
+                or prediction_record.run_id != state["run_id"]
+                or prediction_record.experiment_id != _exp_id(state)
+                or prediction_record.sha256 != prediction.sha256
+                or not checkpoint_artifacts
             )
-            artifact_invalid = False
-            if get_artifact is not None:
-                artifact_invalid = (
-                    prediction_record is None
-                    or prediction_record.kind != "prediction"
-                    or prediction_record.run_id != state["run_id"]
-                    or prediction_record.experiment_id != _exp_id(state)
-                    or prediction_record.sha256 != prediction.sha256
-                    or not checkpoint_artifacts
-                )
             if (
                 artifact_invalid
                 or prediction.checkpoint_id != checkpoint_id
@@ -1609,15 +1726,11 @@ def _evaluate(s: ServiceTransitions) -> Transition:
                 evaluator_sha256=evaluator.evaluator_sha256,
             )
             if s.requires_run_baseline:
-                get_binding = getattr(s.run_store, "get_run_baseline", None)
-                binding = (
-                    cast(RunBaselineBinding | None, get_binding(state["run_id"]))
-                    if callable(get_binding)
-                    else None
-                )
+                binding = s.run_store.get_run_baseline(state["run_id"])
                 if binding is None:
                     raise MissingAuthorityError(
-                        f"run baseline binding is absent for production run {state['run_id']}"
+                        f"run baseline authority binding is absent for production run "
+                        f"{state['run_id']}"
                     )
                 if (
                     binding.dataset_manifest_id != context.dataset_manifest_id
@@ -1686,12 +1799,11 @@ def _log_evaluation_metrics(s: ServiceTransitions, result: EvaluationResult) -> 
         s.requires_run_baseline
         and result.run_id is not None
         and s.run_store is not None
-        and callable(getattr(s.run_store, "get_run_baseline", None))
     ):
         binding = s.run_store.get_run_baseline(result.run_id)
         if binding is None:
             raise MissingAuthorityError(
-                f"run baseline binding is absent for production run {result.run_id}"
+                f"run baseline authority binding is absent for production run {result.run_id}"
             )
         if (
             binding.dataset_manifest_id != result.dataset_manifest_id
@@ -1703,22 +1815,7 @@ def _log_evaluation_metrics(s: ServiceTransitions, result: EvaluationResult) -> 
             raise MissingAuthorityError(
                 f"run baseline binding does not match evaluation {result.evaluation_id}"
             )
-        calibration_getter = getattr(s.run_store, "get_baseline_calibration", None)
-        baseline_calibration: BaselineCalibrationRecord | None
-        if callable(calibration_getter):
-            baseline_calibration = cast(
-                BaselineCalibrationRecord | None,
-                calibration_getter(binding.calibration_id),
-            )
-        else:
-            baseline_calibration = next(
-                (
-                    calibration
-                    for calibration in s.run_store.list_baseline_calibrations()
-                    if calibration.calibration_id == binding.calibration_id
-                ),
-                None,
-            )
+        baseline_calibration = s.run_store.get_baseline_calibration(binding.calibration_id)
         if (
             baseline_calibration is None
             or baseline_calibration.evaluation.evaluation_id != binding.baseline_evaluation_id
@@ -1771,14 +1868,7 @@ def _log_evaluation_metrics(s: ServiceTransitions, result: EvaluationResult) -> 
         raise MissingAuthorityError("production run baseline authority is unavailable")
 
     # Synthetic and unit-test evaluators may retain the prior-champion diagnostic path.
-    legacy_fixture_store = s.run_store is not None and not callable(
-        getattr(s.run_store, "get_run_baseline", None)
-    )
-    calibrations = (
-        s.run_store.list_baseline_calibrations()
-        if s.run_store is not None and (result.run_id is None or legacy_fixture_store)
-        else ()
-    )
+    calibrations = s.run_store.list_baseline_calibrations() if s.run_store is not None else ()
     matching_calibrations = tuple(
         calibration
         for calibration in calibrations
@@ -1865,13 +1955,15 @@ def _log_evaluation_metrics(s: ServiceTransitions, result: EvaluationResult) -> 
 
 def _result_validation(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
-        return await _validation(s, state, ValidationStage.RESULT, "interpret")(state)
+        return await _validation(s, state, ValidationStage.RESULT, "persist")(state)
 
     return transition
 
 
 def _interpret(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
+        if s.run_store is not None and s.run_store.get_run_closure(state["run_id"]) is not None:
+            return {"pending_route": "finalize"}
         client = _agent(s, AgentRole.RESEARCH)
         if client is not None:
             response = await client.invoke(
@@ -1883,7 +1975,7 @@ def _interpret(s: ServiceTransitions) -> Transition:
             )
             if isinstance(response, AgentFailure):
                 return _agent_failure(state, response)
-        return {"pending_route": "persist"}
+        return {"pending_route": "orchestrate"}
 
     return transition
 
@@ -1907,41 +1999,177 @@ def _persist(s: ServiceTransitions) -> Transition:
     return transition
 
 
+def _closure_champion_updates(
+    s: ServiceTransitions, state: ProductionState, closure: RunClosure
+) -> dict[str, object]:
+    if s.run_store is None or closure.champion is None:
+        raise MissingAuthorityError("run closure has no eligible champion")
+    champion = closure.champion
+    observation = s.run_store.get_scored_observation(champion.observation_id)
+    if observation is None:
+        raise MissingAuthorityError("run closure champion observation is absent")
+    spec = s.run_store.get_experiment(observation.experiment_id)
+    evaluation = s.run_store.get_evaluation_result(observation.evaluation_id)
+    source = s.run_store.get_source_registration_by_id(f"source-{observation.source_commit}")
+    attempt = next(
+        (
+            item
+            for item in s.run_store.list_full_attempt_claims(state["run_id"])
+            if item.attempt_id == champion.attempt_id
+        ),
+        None,
+    )
+    if spec is None or evaluation is None or source is None or attempt is None:
+        raise MissingAuthorityError("run closure champion authority is incomplete")
+    if (
+        observation.run_id != state["run_id"]
+        or observation.experiment_id != spec.experiment_id
+        or observation.attempt_id != champion.attempt_id
+        or observation.execution_id != champion.execution_id
+        or observation.evaluation_id != champion.evaluation_id
+        or observation.checkpoint_id != champion.checkpoint_id
+        or observation.source_commit != champion.source_commit
+        or observation.primary_score != champion.primary_score
+        or attempt.execution_id != champion.execution_id
+        or attempt.run_id != state["run_id"]
+        or attempt.experiment_id != observation.experiment_id
+        or attempt.source_registration_id != source.registration_id
+        or attempt.source_commit != source.source_commit
+        or attempt.attempt_sequence != champion.attempt_sequence
+        or source.run_id != state["run_id"]
+        or source.experiment_id != spec.experiment_id
+        or source.source_commit != observation.source_commit
+        or not source.eligible
+        or evaluation.evaluation_id != observation.evaluation_id
+        or evaluation.experiment_id != observation.experiment_id
+        or evaluation.run_id != state["run_id"]
+        or evaluation.execution_id != observation.execution_id
+        or evaluation.checkpoint_id != observation.checkpoint_id
+        or evaluation.source_commit != observation.source_commit
+    ):
+        raise MissingAuthorityError("run closure champion provenance is inconsistent")
+    s.run_store.put_experiment(
+        spec,
+        "converged",
+        state["run_id"],
+        f"converged-{spec.experiment_id}",
+        expected_predecessor=f"completed-{spec.experiment_id}",
+    )
+    s.run_store.put_run(
+        RunRecord(run_id=state["run_id"], status="converged"),
+        f"{state['run_id']}-converged",
+        expected_predecessor=f"{state['run_id']}-active",
+    )
+    return {
+        "phase": RunPhase.FINALIZE,
+        "current_experiment_id": spec.experiment_id,
+        "current_hypothesis_id": spec.hypothesis_id,
+        "latest_execution_result_id": champion.execution_id,
+        "latest_evaluation_result_id": evaluation.evaluation_id,
+        "latest_validation_report_id": observation.validation_report_id,
+        "terminal_reason": closure.reason,
+        "pending_route": "finalize",
+    }
+
+
+def closure_updates_without_agents(
+    s: ServiceTransitions, state: ProductionState, closure: RunClosure
+) -> dict[str, object]:
+    """Route an already authoritative closure without consulting a model."""
+    if closure.champion is not None:
+        return _closure_champion_updates(s, state, closure)
+    if s.run_store is not None:
+        s.run_store.put_run(
+            RunRecord(run_id=state["run_id"], status="failed"),
+            f"{state['run_id']}-terminal-no-observation",
+            expected_predecessor=f"{state['run_id']}-active",
+        )
+    return {
+        "phase": RunPhase.COMPLETE,
+        "terminal_reason": f"{closure.reason}:no_eligible_observation",
+        "pending_route": "complete",
+    }
+
+
 def _update_frontier(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         evaluation_id = state.get("latest_evaluation_result_id")
-        if s.run_store is None or not evaluation_id:
+        report_id = state.get("latest_validation_report_id")
+        execution_id = state.get("latest_execution_result_id")
+        if s.run_store is None or not evaluation_id or not report_id or not execution_id:
             return _failure(
-                state, FailureKind.SCIENTIFIC_NON_IMPROVEMENT, "evaluation evidence is absent"
+                state,
+                FailureKind.SCIENTIFIC_NON_IMPROVEMENT,
+                "scored observation evidence is absent",
             )
         result = s.run_store.get_evaluation_result(evaluation_id)
-        if result is None:
+        execution = s.run_store.get_execution_result(execution_id)
+        report = s.run_store.get_validation_report(report_id)
+        attempts = s.run_store.list_full_attempt_claims(state["run_id"])
+        attempt = next((item for item in attempts if item.execution_id == execution_id), None)
+        if (
+            result is None
+            or execution is None
+            or report is None
+            or attempt is None
+            or result.source_commit is None
+            or result.dataset_manifest_id is None
+            or result.dataset_manifest_sha256 is None
+            or result.split != "valid"
+            or result.validity not in {"provisional", "official"}
+        ):
             return _failure(
-                state, FailureKind.SCIENTIFIC_NON_IMPROVEMENT, "evaluation evidence is absent"
+                state,
+                FailureKind.SCIENTIFIC_NON_IMPROVEMENT,
+                "scored observation authority is absent",
             )
-        score = result.validation_score
-        terminal_reason = (
-            s.frontier_service.update(_exp_id(state), score) if s.frontier_service else None
-        )
-        if terminal_reason is None:
-            return {"pending_route": "orchestrate"}
         try:
-            spec = _spec(s, state)
-            s.run_store.put_experiment(
-                spec,
-                "converged",
+            observation = s.run_store.put_scored_observation(
+                ScoredObservationRequest(
+                    observation_id=f"observation-{result.evaluation_id}",
+                    run_id=state["run_id"],
+                    experiment_id=result.experiment_id,
+                    attempt_id=attempt.attempt_id,
+                    execution_id=execution.execution_id,
+                    evaluation_id=result.evaluation_id,
+                    checkpoint_id=result.checkpoint_id,
+                    source_commit=result.source_commit,
+                    evaluator_id=result.evaluator_artifact_id,
+                    evaluator_sha256=result.evaluator_sha256,
+                    dataset_manifest_id=result.dataset_manifest_id,
+                    dataset_manifest_sha256=result.dataset_manifest_sha256,
+                    split="valid",
+                    validity=cast(Literal["provisional", "official"], result.validity),
+                    primary_score=result.validation_score,
+                    validation_report_id=report.report_id,
+                    validation_evidence_refs=report.evidence_refs,
+                )
+            )
+            del observation
+            epsilon = (
+                s.frontier_service.epsilon
+                if s.frontier_service is not None
+                else s.plateau_epsilon
+            )
+            patience = (
+                s.frontier_service.patience
+                if s.frontier_service is not None
+                else s.plateau_patience
+            )
+            closure = s.run_store.close_run_if_ready(
                 state["run_id"],
-                f"converged-{spec.experiment_id}",
-                expected_predecessor=f"completed-{spec.experiment_id}",
+                epsilon=epsilon,
+                patience=patience,
             )
-            s.run_store.put_run(
-                RunRecord(run_id=state["run_id"], status="converged"),
-                f"{state['run_id']}-converged",
-                expected_predecessor=f"{state['run_id']}-active",
-            )
+            # Keep the synthetic diagnostic mirror for legacy fixture exports;
+            # production routing is determined only by the typed closure above.
+            if not s.requires_run_baseline and s.frontier_service is not None:
+                s.frontier_service.update(_exp_id(state), result.validation_score)
+            if closure is None:
+                return {"pending_route": "orchestrate"}
+            return _closure_champion_updates(s, state, closure)
         except (MissingAuthorityError, ValueError) as error:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
-        return {"terminal_reason": terminal_reason, "pending_route": "finalize"}
 
     return transition
 
@@ -1979,19 +2207,36 @@ def _persist_failure(s: ServiceTransitions) -> Transition:
             evidence_refs=evidence or (message,),
             repair_attempt=state["repair_attempts"],
         )
-        if s.run_store is not None:
+        if s.run_store is None:
+            closure = None
+        else:
             s.run_store.put_failure(record, state["run_id"])
+            closure = s.run_store.close_run_if_ready(state["run_id"], after_failure=True)
         route = route_after_failure(state, record, s.max_repairs)
-        if route == "orchestrate" and s.run_store is not None:
+        champion_observation = (
+            s.run_store.get_scored_observation(closure.champion.observation_id)
+            if closure is not None and closure.champion is not None and s.run_store is not None
+            else None
+        )
+        champion_experiment_id = (
+            champion_observation.experiment_id if champion_observation is not None else None
+        )
+        if (route == "orchestrate" or closure is not None) and s.run_store is not None:
             try:
                 spec = _spec(s, state)
-                s.run_store.put_experiment(
-                    spec,
-                    "failed",
-                    state["run_id"],
-                    f"failed-{spec.experiment_id}",
-                    expected_predecessor=f"proposed-{spec.experiment_id}",
-                )
+                if spec.experiment_id != champion_experiment_id:
+                    s.run_store.put_experiment(
+                        spec,
+                        "failed",
+                        state["run_id"],
+                        f"failed-{spec.experiment_id}",
+                        expected_predecessor=f"proposed-{spec.experiment_id}",
+                    )
+            except (MissingAuthorityError, ValueError) as error:
+                raise TerminalLifecycleError(str(error)) from error
+        if closure is not None:
+            try:
+                return closure_updates_without_agents(s, state, closure)
             except (MissingAuthorityError, ValueError) as error:
                 raise TerminalLifecycleError(str(error)) from error
         if route == "terminal":
@@ -2010,35 +2255,56 @@ def _persist_failure(s: ServiceTransitions) -> Transition:
 
 def _finalize(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
+        if s.run_store is None:
+            return _failure(state, FailureKind.SCHEMA_MISMATCH, "run closure authority is absent")
+        closure = s.run_store.get_run_closure(state["run_id"])
+        if closure is None:
+            return {
+                "terminal_reason": None,
+                "phase": RunPhase.PERSIST,
+                "pending_route": "orchestrate",
+            }
+        if closure.champion is None:
+            _mark_terminal_failure(
+                s,
+                state,
+                FailureKind.SCHEMA_MISMATCH,
+                "run closure has no eligible champion",
+            )
         try:
-            if s.run_store is None or s.bundle_service is None:
+            if s.bundle_service is None:
                 raise MissingAuthorityError("finalization bundle authority is absent")
-            exp_id = _exp_id(state)
-            registration = s.run_store.get_source_registration(exp_id)
-            evaluation_id = state.get("latest_evaluation_result_id")
-            evaluation = s.run_store.get_evaluation_result(evaluation_id) if evaluation_id else None
-            if registration is None or evaluation is None or s.evaluator_id is None:
+            champion = closure.champion
+            observation = s.run_store.get_scored_observation(champion.observation_id)
+            if observation is None:
+                raise MissingAuthorityError("finalization provenance is absent")
+            spec = s.run_store.get_experiment(observation.experiment_id)
+            evaluation = s.run_store.get_evaluation_result(observation.evaluation_id)
+            registration = s.run_store.get_source_registration_by_id(
+                f"source-{observation.source_commit}"
+            )
+            if spec is None or registration is None or evaluation is None:
                 raise MissingAuthorityError("finalization provenance is absent")
             bundle = s.bundle_service.create(
                 FinalizationBundleRequest(
                     run_id=state["run_id"],
-                    experiment_id=exp_id,
+                    experiment_id=spec.experiment_id,
                     source_commit=registration.source_commit,
                     checkpoint_id=evaluation.checkpoint_id,
                     evaluation_id=evaluation.evaluation_id,
-                    evaluator_id=s.evaluator_id,
+                    evaluator_id=evaluation.evaluator_artifact_id,
                 )
             )
             s.run_store.persist_provisional_finalization(
                 ProvisionalFinalizationRequest(
                     finalization_id=f"finalization-{state['run_id']}",
                     run_id=state["run_id"],
-                    experiment_id=exp_id,
+                    experiment_id=spec.experiment_id,
                     source_commit=registration.source_commit,
                     checkpoint_id=evaluation.checkpoint_id,
                     evaluation_id=evaluation.evaluation_id,
                     bundle_artifact_id=bundle.artifact_id,
-                    evaluator_id=s.evaluator_id,
+                    evaluator_id=evaluation.evaluator_artifact_id,
                 )
             )
         except Exception as error:

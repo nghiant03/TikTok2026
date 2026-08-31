@@ -127,7 +127,7 @@ def test_research_failure_with_experiment_can_route_to_proposal_repair() -> None
     )
 
 
-def test_approved_result_routes_to_interpretation() -> None:
+def test_approved_result_routes_to_persist() -> None:
     report = ValidationReport(
         report_id="report-1",
         experiment_id="experiment-1",
@@ -136,7 +136,7 @@ def test_approved_result_routes_to_interpretation() -> None:
         leakage_risk="none",
     )
 
-    assert route_after_validation(state(), report) == "interpret"
+    assert route_after_validation(state(), report) == "persist"
 
 
 def test_stop_decision_routes_to_finalization() -> None:
