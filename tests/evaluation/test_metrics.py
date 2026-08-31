@@ -1,7 +1,10 @@
 import hashlib
+import importlib.util
 import json
 from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
+from typing import cast
 
 import pytest
 
@@ -31,13 +34,82 @@ def test_provisional_metrics_match_fixture() -> None:
         [1, 0, 1, 0, 1],
         [0.9, 0.1, 0.8, 0.2, 0.7],
     )
-    assert result["NDCG@10"] == pytest.approx(1.0)
-    assert result["Recall@50"] == pytest.approx(1.0)
+    assert result["GAUC"] == pytest.approx(1.0)
+    assert result["nDCG@5"] == pytest.approx(1.0)
+
+
+def test_metrics_match_starter_semantics_for_weights_ties_and_zero_positives() -> None:
+    result = evaluate_rankings(
+        ["mixed-low", "mixed-low", "mixed-low", "mixed-high", "mixed-high", "mixed-high",
+         "zero", "all-positive"],
+        [1, 0, 0, 1, 1, 0, 0, 1],
+        [0.1, 0.9, 0.8, 0.9, 0.8, 0.1, 0.7, 0.2],
+    )
+    assert result["GAUC"] == pytest.approx(2 / 3)
+    assert result["nDCG@5"] == pytest.approx((0.5 + 1.0 + 0.0 + 1.0) / 4)
+
+    tied = evaluate_rankings(["user", "user"], [1, 0], [0.5, 0.5])
+    assert tied["GAUC"] == pytest.approx(0.5)
+
+
+def test_gauc_falls_back_when_no_user_has_both_labels() -> None:
+    result = evaluate_rankings(["zero", "positive"], [0, 1], [0.1, 0.9])
+    assert result["GAUC"] == pytest.approx(0.5)
+    assert result["nDCG@5"] == pytest.approx(0.5)
 
 
 def test_invalid_predictions_are_rejected() -> None:
     with pytest.raises(PredictionValidationError):
         evaluate_rankings(["1"], [1], [float("nan")])
+
+
+def _protected_evaluator() -> ModuleType:
+    path = Path("baseline/evaluate.py")
+    spec = importlib.util.spec_from_file_location("protected_baseline_evaluate", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    ("user_ids", "labels", "scores"),
+    (
+        (
+            ["u1", "u1", "u1", "u2", "u2", "u3"],
+            [1, 0, 0, 1, 1, 0],
+            [0.2, 0.9, 0.1, 0.3, 0.3, 0.7],
+        ),
+        (
+            ["mixed", "mixed", "mixed", "zero", "all"],
+            [1, 0, 0, 0, 1],
+            [0.5, 0.5, 0.2, 0.8, 0.1],
+        ),
+    ),
+)
+def test_metrics_differentially_match_protected_baseline_evaluator(
+    user_ids: list[str], labels: list[int], scores: list[float]
+) -> None:
+    evaluate = cast(Callable[..., object], _protected_evaluator().__dict__["evaluate"])
+    protected = cast(dict[str, object], evaluate(user_ids, labels, scores))
+    current = evaluate_rankings(user_ids, labels, scores)
+
+    assert current["GAUC"] == pytest.approx(protected["GAUC"])
+    assert current["nDCG@5"] == pytest.approx(protected["nDCG@5"])
+    assert current["GAUC"] / 2 + current["nDCG@5"] / 2 == pytest.approx(
+        protected["primary"]
+    )
+
+
+def test_evaluator_identity_changes_for_changed_metric_implementation_bytes() -> None:
+    metric_bytes = Path("src/tiktok2026/evaluation/metrics.py").read_bytes()
+    original = evaluator_implementation_sha256(metric_implementation_bytes=metric_bytes)
+    changed = evaluator_implementation_sha256(
+        metric_implementation_bytes=metric_bytes + b"\n# identity test change\n"
+    )
+
+    assert original == evaluator_implementation_sha256()
+    assert original != changed
 
 
 def _evaluation_fixture(tmp_path: Path) -> tuple[EvaluationRequest, ProvisionalEvaluator, Path]:
@@ -148,7 +220,7 @@ def test_registry_returns_explicitly_provisional_result(tmp_path: Path) -> None:
     request, evaluator, _ = _evaluation_fixture(tmp_path)
     result = evaluator.evaluate(request)
     assert result.validity == "provisional"
-    assert {metric.name for metric in result.metrics} == {"NDCG@10", "Recall@50"}
+    assert {metric.name for metric in result.metrics} == {"GAUC", "nDCG@5"}
     assert result.evaluator_sha256 == evaluator_implementation_sha256()
 
 

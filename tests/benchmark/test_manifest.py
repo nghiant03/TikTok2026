@@ -22,8 +22,22 @@ from tiktok2026.contracts import PredictionRow
 def test_canonical_manifest_uses_judging_metrics() -> None:
     path = Path("src/tiktok2026/benchmark/kuaireand_pure/manifest.json")
     manifest = BenchmarkManifest.model_validate(json.loads(path.read_text(encoding="utf-8")))
-    assert manifest.judging_metrics == ("NDCG@10", "Recall@50")
+    assert manifest.judging_metrics == ("GAUC", "nDCG@5")
     assert manifest.judging_evaluator_status == "provisional"
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    (("nDCG@5", "GAUC"), ("GAUC", "GAUC")),
+)
+def test_benchmark_manifest_rejects_noncanonical_judging_metric_order(
+    metrics: tuple[str, str],
+) -> None:
+    path = Path("src/tiktok2026/benchmark/kuaireand_pure/manifest.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["judging_metrics"] = metrics
+    with pytest.raises(ValueError, match="current order"):
+        BenchmarkManifest.model_validate(payload)
 
 
 def test_protected_file_hash_mismatch_is_rejected(tmp_path: Path) -> None:

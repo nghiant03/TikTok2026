@@ -5,9 +5,9 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from tiktok2026.contracts import AgentRole, RuntimePaths
+from tiktok2026.contracts import CURRENT_EVALUATOR_ID, AgentRole, RuntimePaths
 
 
 class ModelSettings(BaseModel):
@@ -57,10 +57,16 @@ class AppSettings(BaseModel):
     execution: ExecutionSettings = ExecutionSettings()
     models: dict[AgentRole, ModelSettings] = {role: ModelSettings() for role in AgentRole}
     docker_image: str = "tiktok2026:local"
-    evaluator_id: str = "provisional-within-user-v1"
+    evaluator_id: str = CURRENT_EVALUATOR_ID
     mlflow_uri: str | None = None
     plateau_epsilon: float = Field(default=0.002, ge=0.0)
     plateau_patience: int = Field(default=3, ge=1)
+
+    @model_validator(mode="after")
+    def validate_production_evaluator(self) -> AppSettings:
+        if self.profile == "production" and self.evaluator_id != CURRENT_EVALUATOR_ID:
+            raise ValueError("production requires the current authoritative evaluator")
+        return self
 
     @property
     def paths(self) -> RuntimePaths:

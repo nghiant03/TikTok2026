@@ -59,7 +59,7 @@ rejects high-cardinality nested scans and duplicate full materialization rather
 than accepting an estimate that merely fits today's budget. The current
 structural limit is four dataset passes. Proposal validation then checks only
 the scientific claims, novelty and authoritative duplicate evidence, bounded
-scope, measurable NDCG@10/Recall@50 criteria, leakage, informativeness, and
+scope, measurable GAUC/nDCG@5 criteria, leakage, informativeness, and
 proportional cost. Source commits, data staging, evaluator arithmetic, artifact
 publication, sandboxing, and test access remain controller-owned lifecycle facts.
 
@@ -157,7 +157,9 @@ Each role has independent `ModelSettings`: `base_url`, `model`, `api_key_env`, `
 
 The Docker executor accepts a typed request, verifies registered source identity, stages only the authorized train/valid dataset view, disables network access, applies read-only and resource limits, and publishes bounded output artifacts. The staged manifest describes only files visible to training and therefore has a different canonical hash from the full authoritative manifest. The executor supplies the authoritative manifest SHA as a separate controller-owned argument; training records that opaque identity in its artifacts, and publication verifies it against the registered dataset authority. Failure classification distinguishes execution failures from scientific non-improvement.
 
-The evaluation registry validates prediction shape, row identity, ordering, hashes, dataset manifest identity, source, checkpoint, and execution provenance. NDCG@10 and Recall@50 are the judging metrics and their mean is the local validation ranking. The repository's evaluator is `provisional`; the protected Starter Kit's incompatible metrics are diagnostic only. Current production composition does not configure an organizer evaluator or expose a CLI final-test operation. Therefore all current evaluation records and finalization records are provisional and must not be described as official results.
+The evaluation registry validates prediction shape, row identity, ordering, hashes, dataset manifest identity, source, checkpoint, and execution provenance. GAUC and nDCG@5 are the judging metrics and their arithmetic mean is the local validation ranking. GAUC uses positive-count weighting over users with both labels and average-rank tie correction; nDCG@5 averages all users, including zero-positive users as zero. The repository's evaluator is `provisional`; current evaluation records and finalization records must not be described as official results.
+
+Every production run is bound before graph execution to one immutable Starter Kit FM validation calibration. The calibration and run binding are typed database authorities with content hashes and atomic audit events; only their identifiers, provenance, and scalar GAUC/nDCG@5 values enter controller comparisons, never graph state or prediction rows.
 
 Finalization is controller/persistence controlled and guarded. Orchestration may
 select `stop` only when the controller marks `finalization_ready`; an agent's

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from tiktok2026.contracts.models import (
     ArtifactRecord,
@@ -24,6 +24,7 @@ from tiktok2026.contracts.models import (
     PredictionArtifactRegistration,
     ProvenanceRequest,
     ResourceState,
+    RunBaselineBinding,
     RunRecord,
     SourceRegistration,
     ValidationBlocker,
@@ -214,7 +215,9 @@ class RunStore(Protocol):
 
     def get_experiment(self, experiment_id: str) -> ExperimentSpec | None: ...
 
-    def get_experiment_registry(self, limit: int = 50) -> ExperimentRegistrySnapshot: ...
+    def get_experiment_registry(
+        self, limit: int = 50, exclude_experiment_id: str | None = None
+    ) -> ExperimentRegistrySnapshot: ...
 
     def put_source_registration(self, registration: SourceRegistration) -> None: ...
 
@@ -227,6 +230,19 @@ class RunStore(Protocol):
     def list_evaluation_results(self) -> tuple[EvaluationResult, ...]: ...
 
     def list_baseline_calibrations(self) -> tuple[BaselineCalibrationRecord, ...]: ...
+
+    def get_baseline_calibration(self, calibration_id: str) -> BaselineCalibrationRecord | None: ...
+
+    def put_baseline_calibration(
+        self,
+        record: BaselineCalibrationRecord,
+        actor_type: Literal["agent", "controller", "human"],
+        actor_id: str,
+    ) -> None: ...
+
+    def put_run_baseline(self, binding: RunBaselineBinding) -> None: ...
+
+    def get_run_baseline(self, run_id: str) -> RunBaselineBinding | None: ...
 
     def get_artifact(self, artifact_id: str) -> ArtifactRecord | None: ...
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import sqlite3
 from datetime import UTC, datetime
@@ -21,6 +22,15 @@ class MigrationRunner:
 
     def apply(self) -> None:
         self.database.parent.mkdir(parents=True, exist_ok=True)
+        lock = self.database.with_name(f"{self.database.name}.migration.lock")
+        with lock.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                self._apply_locked()
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _apply_locked(self) -> None:
         paths = sorted(self.migrations.glob("[0-9][0-9][0-9]_*.sql"))
         first_sql = paths[0].read_text(encoding="utf-8") if paths else ""
         with sqlite3.connect(self.database) as connection:

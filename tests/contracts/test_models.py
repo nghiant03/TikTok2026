@@ -60,6 +60,17 @@ def test_controller_context_exposes_the_concrete_experiment_interface() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "metrics",
+    (("nDCG@5", "GAUC"), ("GAUC", "GAUC")),
+)
+def test_controller_context_rejects_noncanonical_judging_metric_order(
+    metrics: tuple[str, str],
+) -> None:
+    with pytest.raises(ValidationError, match="current order"):
+        ControllerContext(judging_metrics=metrics)  # type: ignore[arg-type]
+
+
 def test_prediction_and_checkpoint_envelopes_require_dataset_view_key() -> None:
     assert "dataset_view_sha256" in PredictionArtifactEnvelope().required_fields
     assert "dataset_view_sha256" in CheckpointArtifactEnvelope().required_fields
@@ -485,8 +496,8 @@ def test_validation_score_uses_equal_weight_judging_metrics() -> None:
         experiment_id="experiment-1",
         checkpoint_id="checkpoint-1",
         metrics=(
-            MetricValue(name="NDCG@10", value=0.6),
-            MetricValue(name="Recall@50", value=0.8),
+            MetricValue(name="GAUC", value=0.6),
+            MetricValue(name="nDCG@5", value=0.8),
         ),
         evaluator_artifact_id="evaluator-1",
         evaluator_sha256="a" * 64,
@@ -495,6 +506,55 @@ def test_validation_score_uses_equal_weight_judging_metrics() -> None:
     )
 
     assert result.validation_score == pytest.approx(0.7)
+
+
+def test_historical_evaluation_result_json_remains_parseable() -> None:
+    result = EvaluationResult(
+        evaluation_id="historical-evaluation-1",
+        experiment_id="experiment-1",
+        checkpoint_id="checkpoint-1",
+        metrics=(
+            MetricValue(name="NDCG@10", value=0.6),
+            MetricValue(name="Recall@50", value=0.8),
+        ),
+        evaluator_artifact_id="provisional-within-user-v1",
+        evaluator_sha256="a" * 64,
+        prediction_sha256="b" * 64,
+        validity="provisional",
+    )
+
+    restored = EvaluationResult.model_validate_json(result.model_dump_json())
+    assert restored.validation_score == pytest.approx(0.7)
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    (
+        (MetricValue(name="GAUC", value=0.5),),
+        (
+            MetricValue(name="GAUC", value=0.5),
+            MetricValue(name="NDCG@10", value=0.5),
+        ),
+        (
+            MetricValue(name="GAUC", value=0.5),
+            MetricValue(name="GAUC", value=0.6),
+        ),
+    ),
+)
+def test_evaluation_result_rejects_incomplete_or_mixed_metric_pairs(
+    metrics: tuple[MetricValue, ...],
+) -> None:
+    with pytest.raises(ValidationError, match="metric pair"):
+        EvaluationResult(
+            evaluation_id="evaluation-1",
+            experiment_id="experiment-1",
+            checkpoint_id="checkpoint-1",
+            metrics=metrics,
+            evaluator_artifact_id="evaluator-1",
+            evaluator_sha256="a" * 64,
+            prediction_sha256="b" * 64,
+            validity="provisional",
+        )
 
 
 def test_failed_execution_requires_failure_classification() -> None:

@@ -15,7 +15,8 @@ containing an `ExperimentSpec`. For a proposal, preserve
 `implementation_scope` to unique canonical POSIX paths
 under `allowed_paths`, and ensure `train.py` is in the scope so the mechanism is
 actually executable. State measurable success and failure criteria using only
-NDCG@10 and Recall@50; diagnostics cannot select the experiment. Include leakage
+GAUC and nDCG@5; their arithmetic mean is the primary validation score and
+diagnostics cannot select the experiment. Include leakage
 risk and cite the evidence supporting the hypothesis and novelty.
 
 Every proposal must include a quantitative, technique-neutral

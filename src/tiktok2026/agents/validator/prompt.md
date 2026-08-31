@@ -40,7 +40,8 @@ claim a resolution without evidence.
 
 At proposal stage assess only proposal-owned scientific claims: rationale,
 novelty and duplicate evidence, bounded scope, expected signal, measurable
-NDCG@10 and Recall@50 criteria, leakage, informativeness, and proportional cost.
+GAUC and nDCG@5 criteria, leakage, informativeness, and proportional cost; their
+arithmetic mean is the primary validation score.
 Check the quantitative `implementation_resource_estimate` against the supplied
 execution envelope, including dataset passes and the absence of nested scans or
 duplicate full materialization. Treat the complete experiment registry as
@@ -53,6 +54,11 @@ At implementation stage use `implementation_authority` as the controller-
 computed live worktree diff identity. Check scope, protected/unrelated changes,
 scientific fidelity, leakage, execution wiring, and full-fidelity resource
 feasibility. A required path not wired into `execution_entrypoint` is a blocker.
+The controller has already verified file hashes, schemas, split identities, and
+the authorized dataset view before its read-only mount. Treat candidate-side
+full-dataset integrity verification, including `verify_dataset_manifest`, as
+redundant work and a resource-feasibility blocker unless the approved experiment
+mechanism itself requires that pass.
 Guarded pre-submit contract checking is static only and never executes candidate
 code. Treat executable smoke as post-validation evidence: the controller may run
 it only after implementation validation passes, the source is committed and

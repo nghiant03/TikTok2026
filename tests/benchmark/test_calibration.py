@@ -12,6 +12,7 @@ from tiktok2026.benchmark.kuaireand_pure.manifest import (
     DatasetSplit,
     encode_row_identity,
 )
+from tiktok2026.contracts import CURRENT_EVALUATOR_ID
 
 COLUMNS = (
     "row_id",
@@ -143,6 +144,7 @@ def test_calibration_is_validation_only_and_identity_cached(tmp_path: Path) -> N
 
     assert created is True
     assert record.split == "valid"
+    assert record.evaluator_id == CURRENT_EVALUATOR_ID
     assert record.evaluation.validation_score == 1.0
     assert {metric.name for metric in record.diagnostic_metrics} == {
         "GAUC",

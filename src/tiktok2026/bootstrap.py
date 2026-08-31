@@ -9,11 +9,11 @@ import os
 import sqlite3
 import subprocess
 import uuid
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from loguru import logger
 
@@ -34,6 +34,7 @@ from tiktok2026.contracts import (
     ArtifactRecord,
     ArtifactRetention,
     AuditEvent,
+    BaselineCalibrationRecord,
     ContractModel,
     CriterionAssessmentStatus,
     DatasetManifestIdentity,
@@ -61,6 +62,7 @@ from tiktok2026.contracts import (
     ResearchDecision,
     ResearchRequest,
     ResourceState,
+    RunBaselineBinding,
     RunPhase,
     RunRecord,
     RuntimePaths,
@@ -236,6 +238,18 @@ def _exclusive_runtime_run(runtime_root: Path, run_id: str) -> Generator[None, N
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def _exclusive_baseline_calibration(runtime_root: Path) -> Generator[None, None, None]:
+    locks = runtime_root / "locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    with (locks / "baseline-calibration.lock").open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _initial_state(run_id: str) -> dict[str, object]:
     return {
         "run_id": run_id,
@@ -295,11 +309,13 @@ class ProductionOperations:
         runtime_root: Path,
         profile_path: Path | None = None,
         operator_config: Path | None = None,
+        baseline_calibrator: Callable[..., tuple[BaselineCalibrationRecord, bool]] | None = None,
     ) -> None:
         self.repository_root = repository_root.resolve()
         self.runtime_root = runtime_root.resolve()
         self.profile_path = profile_path
         self.operator_config = operator_config
+        self.baseline_calibrator = baseline_calibrator
 
     def runtime_init(self) -> OperationResult:
         services = initialize_runtime(self.repository_root, self.runtime_root)
@@ -329,40 +345,16 @@ class ProductionOperations:
         )
 
     def calibrate_baseline(self) -> OperationResult:
-        from tiktok2026.benchmark.kuaireand_pure.calibration import calibrate_baseline
-
         settings = self._production_settings()
         if settings.dataset_root is None:
             raise OperationalError("baseline calibration requires a configured dataset_root")
-        verify_manifests(self.repository_root)
         services = initialize_runtime(self.repository_root, self.runtime_root)
-        record, created = calibrate_baseline(
-            self.repository_root,
-            self.runtime_root,
+        record, created = self._ensure_current_baseline(
+            services.repository,
             settings.dataset_root,
-            services.repository.list_json("baseline_calibration"),
+            actor_type="human",
+            actor_id="cli-operator",
         )
-        if created:
-            services.repository.put_json(
-                "baseline_calibration", record.calibration_id, record.model_dump_json()
-            )
-            services.repository.put_audit_event(
-                AuditEvent(
-                    event_id=f"baseline-calibrated-{record.calibration_id}",
-                    run_id=record.calibration_id,
-                    event_type="baseline_calibrated",
-                    actor_type="human",
-                    actor_id="cli-operator",
-                    payload={
-                        "calibration_id": record.calibration_id,
-                        "dataset_manifest_sha256": record.dataset_manifest_sha256,
-                        "evaluator_sha256": record.evaluator_sha256,
-                        "baseline_source_sha256": record.baseline_source_sha256,
-                        "config_sha256": record.config_sha256,
-                        "split": record.split,
-                    },
-                )
-            )
         metrics = {metric.name: metric.value for metric in record.evaluation.metrics}
         diagnostics = {metric.name: metric.value for metric in record.diagnostic_metrics}
         return _result(
@@ -371,14 +363,59 @@ class ProductionOperations:
             values={
                 "calibration_id": record.calibration_id,
                 "split": record.split,
-                "NDCG@10": metrics["NDCG@10"],
-                "Recall@50": metrics["Recall@50"],
+                "GAUC": metrics["GAUC"],
+                "nDCG@5": metrics["nDCG@5"],
                 "composite": record.evaluation.validation_score,
-                "GAUC": diagnostics["GAUC"],
-                "nDCG@5": diagnostics["nDCG@5"],
+                "diagnostic_GAUC": diagnostics["GAUC"],
+                "diagnostic_nDCG@5": diagnostics["nDCG@5"],
                 "diagnostic_primary": diagnostics["primary"],
                 "prediction_artifact_uri": record.prediction_artifact_uri,
             },
+        )
+
+    def _ensure_current_baseline(
+        self,
+        repository: ApplicationRepository,
+        dataset_root: Path,
+        *,
+        actor_type: Literal["agent", "controller", "human"] = "controller",
+        actor_id: str = "production-operations",
+    ) -> tuple[BaselineCalibrationRecord, bool]:
+        """Load or create the current Starter Kit calibration without retraining on cache hits."""
+        from tiktok2026.benchmark.kuaireand_pure.calibration import calibrate_baseline
+
+        with _exclusive_baseline_calibration(self.runtime_root):
+            verify_manifests(self.repository_root)
+            calibrator = self.baseline_calibrator or calibrate_baseline
+            existing = tuple(
+                record.model_dump_json()
+                for record in repository.list_baseline_calibrations()
+            )
+            record, created = calibrator(
+                self.repository_root,
+                self.runtime_root,
+                dataset_root,
+                existing,
+            )
+            repository.put_baseline_calibration(
+                record,
+                actor_type=actor_type,
+                actor_id=actor_id,
+            )
+        return record, created
+
+    @staticmethod
+    def _binding(run_id: str, calibration: BaselineCalibrationRecord) -> RunBaselineBinding:
+        return RunBaselineBinding(
+            run_id=run_id,
+            calibration_id=calibration.calibration_id,
+            baseline_evaluation_id=calibration.evaluation.evaluation_id,
+            dataset_manifest_id=calibration.dataset_manifest_id,
+            dataset_manifest_sha256=calibration.dataset_manifest_sha256,
+            evaluator_id=calibration.evaluator_id,
+            evaluator_sha256=calibration.evaluator_sha256,
+            split=calibration.split,
+            metrics=calibration.evaluation.metrics,
         )
 
     def synthetic_run(self, iterations: int) -> OperationResult:
@@ -405,6 +442,7 @@ class ProductionOperations:
             self.runtime_root,
         )
         ledger: ResourceLedger | None = None
+        baseline: RunBaselineBinding | None = None
         if synthetic:
             _controller, _store, graph = build_synthetic_controller(
                 self.repository_root, self.runtime_root
@@ -426,6 +464,11 @@ class ProductionOperations:
             services = build_production_services(settings)
             graph, repository = services.graph, services.repository
             ledger = services.resource_ledger
+            dataset_root = settings.dataset_root
+            if dataset_root is None:
+                raise OperationalError("baseline calibration requires a configured dataset_root")
+            calibration, _created = self._ensure_current_baseline(repository, dataset_root)
+            baseline = self._binding(actual_run_id, calibration)
         run_lock = (
             _exclusive_runtime_run(self.runtime_root, actual_run_id)
             if not synthetic
@@ -436,6 +479,8 @@ class ProductionOperations:
                 ledger.claim_run(actual_run_id)
             try:
                 if not synthetic:
+                    assert baseline is not None
+                    RepositoryRunStore(repository).put_run_baseline(baseline)
                     repository.put_run(
                         RunRecord(run_id=actual_run_id, status="active"),
                         f"{actual_run_id}-active",
@@ -451,6 +496,11 @@ class ProductionOperations:
                         payload={
                             "run_id": actual_run_id,
                             "mode": "synthetic" if synthetic else "production",
+                            **(
+                                {"baseline_binding": baseline.model_dump(mode="json")}
+                                if baseline is not None
+                                else {}
+                            ),
                         },
                     )
                 )
@@ -477,14 +527,31 @@ class ProductionOperations:
         )
 
     def resume(self, run_id: str, *, synthetic: bool = False) -> OperationResult:
+        repository = initialize_runtime(self.repository_root, self.runtime_root).repository
         checkpoint = self._load_checkpoint(run_id)
         if checkpoint is None:
             raise OperationalError(f"no durable checkpoint exists for run {run_id}")
         state = _checkpoint_state(checkpoint)
         phase = str(state.get("phase"))
-        repository = ApplicationRepository(self.runtime_root / "application.sqlite3")
+        baseline: RunBaselineBinding | None = None
+        settings: Any | None = None
+        if not synthetic:
+            try:
+                production_settings = self._production_settings()
+                settings = production_settings
+                dataset_root = production_settings.dataset_root
+                if dataset_root is None:
+                    raise OperationalError(
+                        "baseline calibration requires a configured dataset_root"
+                    )
+                calibration, _created = self._ensure_current_baseline(repository, dataset_root)
+                baseline = self._binding(run_id, calibration)
+                RepositoryRunStore(repository).put_run_baseline(baseline)
+            except Exception as error:
+                self._resume_audit(repository, run_id, False, str(error))
+                raise OperationalError(str(error)) from error
         if phase in {RunPhase.COMPLETE.value, str(RunPhase.COMPLETE)}:
-            self._resume_audit(repository, run_id, True, "run is already complete")
+            self._resume_audit(repository, run_id, True, "run is already complete", baseline)
             return _result(
                 "resume",
                 run_id=run_id,
@@ -499,16 +566,16 @@ class ProductionOperations:
                 self.repository_root, self.runtime_root
             )
         else:
-            settings = self._production_settings()
+            assert settings is not None
             services = build_production_services(settings)
             self._bind_resumed_implementor(services, repository, state)
             graph = services.graph
         try:
             result = asyncio.run(graph.ainvoke(None, {"configurable": {"thread_id": run_id}}))
         except Exception as error:
-            self._resume_audit(repository, run_id, False, str(error))
+            self._resume_audit(repository, run_id, False, str(error), baseline)
             raise OperationalError(str(error)) from error
-        self._resume_audit(repository, run_id, True, "checkpoint resumed")
+        self._resume_audit(repository, run_id, True, "checkpoint resumed", baseline)
         return _result(
             "resume",
             run_id=run_id,
@@ -937,7 +1004,12 @@ class ProductionOperations:
             raise OperationalError(f"invalid production settings: {error}") from error
 
     def _resume_audit(
-        self, repository: ApplicationRepository, run_id: str, accepted: bool, reason: str
+        self,
+        repository: ApplicationRepository,
+        run_id: str,
+        accepted: bool,
+        reason: str,
+        baseline: RunBaselineBinding | None = None,
     ) -> None:
         repository.put_audit_event(
             AuditEvent(
@@ -949,7 +1021,14 @@ class ProductionOperations:
                 event_type="resume_accepted" if accepted else "resume_rejected",
                 actor_type="controller",
                 actor_id="production-operations",
-                payload={"reason": reason},
+                payload={
+                    "reason": reason,
+                    **(
+                        {"baseline_binding": baseline.model_dump(mode="json")}
+                        if baseline is not None
+                        else {}
+                    ),
+                },
             )
         )
 
@@ -1140,9 +1219,16 @@ def build_production_operations(
     runtime_root: Path,
     profile_path: Path | None = None,
     operator_config: Path | None = None,
+    baseline_calibrator: Callable[..., tuple[BaselineCalibrationRecord, bool]] | None = None,
 ) -> ProductionOperations:
     """Build the sole operator-facing composition used by the CLI."""
-    return ProductionOperations(repository_root, runtime_root, profile_path, operator_config)
+    return ProductionOperations(
+        repository_root,
+        runtime_root,
+        profile_path,
+        operator_config,
+        baseline_calibrator,
+    )
 
 
 class _ExecutionArtifactContractError(ValueError):
@@ -1650,6 +1736,7 @@ def build_production_services(settings: Any) -> ProductionServices:
         smoke_memory_bytes=app_settings.execution.smoke_memory_bytes,
         smoke_disk_bytes=app_settings.execution.smoke_disk_bytes,
         max_repairs=app_settings.budget.max_repairs,
+        requires_run_baseline=app_settings.profile == "production",
     )
     controller = ProductionController(ControllerServices(transitions=transitions, store=run_store))
     graph = build_production_graph(controller, checkpointer=SqliteCheckpointer(paths.graph_db))

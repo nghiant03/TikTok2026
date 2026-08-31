@@ -13,17 +13,20 @@ import pytest
 from tiktok2026.adapters import (
     IMPLEMENTOR_CHECK_NAMES,
     DeterministicPolicyGate,
+    RepositoryFrontierService,
     RepositoryRunStore,
     ScopedWorktreeRepository,
 )
 from tiktok2026.contracts import (
     ArtifactRecord,
     ArtifactRetention,
+    EvaluationResult,
     ExecutionRequest,
     ExecutionResult,
     ExperimentSpec,
     Fidelity,
     ImplementationEdit,
+    MetricValue,
     RunRecord,
     WorktreeAssignment,
 )
@@ -167,6 +170,114 @@ def test_policy_gate_rejects_fourth_repair() -> None:
     assert gate.can_repair(2).allowed is True
     assert gate.can_repair(3).allowed is False
     assert gate.can_repair(3).reason == "repair_limit"
+
+
+def test_frontier_excludes_historical_metric_pair_on_resumed_run() -> None:
+    """Only compatible current-metric evaluations contribute to convergence."""
+
+    class FrontierRepository:
+        def __init__(self) -> None:
+            self.records: dict[str, list[str]] = {}
+            self.experiments: dict[str, ExperimentSpec] = {}
+
+        def list_json(self, kind: str) -> tuple[str, ...]:
+            return tuple(self.records.get(kind, ()))
+
+        def get_experiment(self, experiment_id: str) -> ExperimentSpec | None:
+            return self.experiments.get(experiment_id)
+
+        def put_json(self, kind: str, record_id: str, payload_json: str) -> None:
+            del record_id
+            self.records.setdefault(kind, []).append(payload_json)
+
+    repository = FrontierRepository()
+    run_id = "resumed-run"
+    manifest_sha256 = "a" * 64
+    evaluator_sha256 = "b" * 64
+    spec = ExperimentSpec(
+        experiment_id="placeholder",
+        hypothesis_id="hypothesis",
+        hypothesis="test",
+        mechanism="test",
+        motivation="test",
+        expected_signal="test",
+        implementation_scope=("src/tiktok2026/experiment",),
+        fidelity=Fidelity.SMOKE,
+        success_criteria="test",
+        failure_criteria="test",
+    )
+
+    def add_evaluation(
+        evaluation_id: str,
+        experiment_id: str,
+        execution_id: str,
+        metrics: tuple[MetricValue, ...],
+    ) -> None:
+        repository.experiments[experiment_id] = spec.model_copy(
+            update={"experiment_id": experiment_id}
+        )
+        repository.records.setdefault("execution", []).append(
+            ExecutionResult(
+                execution_id=execution_id,
+                experiment_id=experiment_id,
+                source_commit="c" * 40,
+                command=("train",),
+                exit_code=0,
+                elapsed_seconds=1.0,
+                gpu_hours=0.0,
+            ).model_dump_json()
+        )
+        result = EvaluationResult(
+            evaluation_id=evaluation_id,
+            experiment_id=experiment_id,
+            checkpoint_id=f"checkpoint-{evaluation_id}",
+            metrics=metrics,
+            evaluator_artifact_id="evaluator-v2",
+            evaluator_sha256=evaluator_sha256,
+            prediction_sha256="d" * 64,
+            validity="provisional",
+            dataset_manifest_sha256=manifest_sha256,
+            split="valid",
+            run_id=run_id,
+            execution_id=execution_id,
+        )
+        repository.records.setdefault("evaluation", []).append(
+            json.dumps({"result": result.model_dump(mode="json")})
+        )
+
+    add_evaluation(
+        "eval-v1",
+        "exp-v1",
+        "execution-v1",
+        (MetricValue(name="NDCG@10", value=1.0), MetricValue(name="Recall@50", value=1.0)),
+    )
+    add_evaluation(
+        "eval-v2-current",
+        "exp-v2-current",
+        "execution-v2-current",
+        (MetricValue(name="GAUC", value=0.0), MetricValue(name="nDCG@5", value=0.0)),
+    )
+
+    service = RepositoryFrontierService(repository, epsilon=0.0, patience=1)  # type: ignore[arg-type]
+    service.initialize(run_id)
+
+    assert service.update("exp-v2-current", 0.0) is None
+    observations = [
+        json.loads(raw) for raw in repository.list_json("frontier_observation")
+    ]
+    assert [observation["evaluation_id"] for observation in observations] == [
+        "eval-v2-current",
+    ]
+    decisions = [json.loads(raw) for raw in repository.list_json("frontier_decision")]
+    assert decisions == [
+        {
+            "decision": "continue",
+            "experiment_id": "exp-v2-current",
+            "observation_count": 1,
+            "reason": "configured policy requires more evidence",
+            "run_id": run_id,
+        }
+    ]
 
 
 def test_scoped_implementor_capability_applies_real_bounded_diff(tmp_path: Path) -> None:

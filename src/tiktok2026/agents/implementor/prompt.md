@@ -42,6 +42,14 @@ it with a locally recomputed or invented identity. Propagate the supplied
 dataset/source/execution provenance to the artifacts, and never add an alternate
 stdin, path, candidate-set, split, or output protocol.
 
+The controller has already verified file hashes, schemas, split identities, and
+the authorized dataset view before mounting it read-only. Candidate code must not
+repeat those full-dataset integrity checks or call `verify_dataset_manifest`.
+Load the supplied manifest for columns and ordered file paths, trust the mounted
+controller-authorized view, and count only experiment-required train/valid reads
+in the implementation. A candidate-side pass is justified only when the approved
+experiment mechanism itself requires it.
+
 Use authorized train and valid rows only. Produce exactly one finite,
 non-boolean numeric score for every valid manifest row, in exact manifest order,
 with fields `row_id`, `row_identity`, `user_id`, `item_id`, and `score`. Valid

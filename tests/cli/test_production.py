@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
 from tiktok2026.cli import app
+from tiktok2026.contracts import BaselineCalibrationRecord, RunBaselineBinding
 from tiktok2026.persistence.repositories import ApplicationRepository
 
 ROOT = Path(__file__).parents[2]
@@ -27,6 +30,220 @@ def _setup_runtime(tmp_path: Path) -> tuple[Path, Path]:
 
 def _repo(runtime_root: Path) -> ApplicationRepository:
     return ApplicationRepository(runtime_root / "application.sqlite3")
+
+
+def _baseline_calibration() -> BaselineCalibrationRecord:
+    from tiktok2026.contracts import (
+        CURRENT_EVALUATOR_ID,
+        DiagnosticMetricValue,
+        EvaluationResult,
+        MetricValue,
+    )
+
+    evaluation = EvaluationResult(
+        evaluation_id="starter-kit-fm-evaluation",
+        experiment_id="starter-kit-fm-baseline",
+        checkpoint_id="starter-kit-fm-checkpoint",
+        metrics=(
+            MetricValue(name="GAUC", value=0.6674),
+            MetricValue(name="nDCG@5", value=0.5357),
+        ),
+        evaluator_artifact_id=CURRENT_EVALUATOR_ID,
+        evaluator_sha256="b" * 64,
+        prediction_sha256="c" * 64,
+        validity="provisional",
+        dataset_manifest_sha256="a" * 64,
+        split="valid",
+        dataset_manifest_id="manifest-1",
+    )
+    return BaselineCalibrationRecord(
+        calibration_id="calibration-1",
+        dataset_manifest_id="manifest-1",
+        dataset_manifest_sha256="a" * 64,
+        evaluator_id=CURRENT_EVALUATOR_ID,
+        evaluator_sha256="b" * 64,
+        baseline_source_sha256="d" * 64,
+        config_sha256="e" * 64,
+        prediction_sha256="c" * 64,
+        prediction_artifact_uri="file:///runtime/baseline-predictions.csv",
+        evaluation=evaluation,
+        diagnostic_metrics=(
+            DiagnosticMetricValue(name="GAUC", value=0.6674),
+            DiagnosticMetricValue(name="nDCG@5", value=0.5357),
+            DiagnosticMetricValue(name="primary", value=0.60155),
+        ),
+    )
+
+
+def _baseline_binding(run_id: str, calibration_id: str = "calibration-1") -> RunBaselineBinding:
+    calibration = _baseline_calibration()
+    return RunBaselineBinding(
+        run_id=run_id,
+        calibration_id=calibration_id,
+        baseline_evaluation_id=calibration.evaluation.evaluation_id,
+        dataset_manifest_id=calibration.dataset_manifest_id,
+        dataset_manifest_sha256=calibration.dataset_manifest_sha256,
+        evaluator_id=calibration.evaluator_id,
+        evaluator_sha256=calibration.evaluator_sha256,
+        split=calibration.split,
+        metrics=calibration.evaluation.metrics,
+    )
+
+
+class _CompletingGraph:
+    async def ainvoke(
+        self, state: dict[str, object], config: object
+    ) -> dict[str, object]:
+        del config
+        return {**state, "phase": "complete", "pending_route": "complete"}
+
+
+def test_production_runs_bind_cached_starter_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tiktok2026 import bootstrap
+    from tiktok2026.adapters import RepositoryRunStore
+    from tiktok2026.bootstrap import ProductionOperations
+
+    runtime_root, repo_dir = _setup_runtime(tmp_path)
+    repository = _repo(runtime_root)
+    calibration = _baseline_calibration()
+    existing_counts: list[int] = []
+
+    def calibrator(
+        repository_root: Path,
+        runtime_root_: Path,
+        dataset_root: Path,
+        existing: tuple[str, ...],
+    ) -> tuple[BaselineCalibrationRecord, bool]:
+        del repository_root, runtime_root_, dataset_root
+        existing_counts.append(len(existing))
+        return calibration, not existing
+
+    def fake_verify(repository_root: Path) -> object:
+        del repository_root
+        return object()
+
+    def fake_services(settings_: object) -> SimpleNamespace:
+        del settings_
+        return SimpleNamespace(
+            graph=_CompletingGraph(), repository=repository, resource_ledger=None
+        )
+
+    settings = SimpleNamespace(models={}, dataset_root=tmp_path / "dataset")
+    monkeypatch.setattr(bootstrap, "verify_manifests", fake_verify)
+    monkeypatch.setattr(bootstrap, "build_production_services", fake_services)
+    operations = ProductionOperations(
+        repo_dir, runtime_root, baseline_calibrator=calibrator
+    )
+    monkeypatch.setattr(operations, "_production_settings", lambda: settings)
+
+    operations.run(run_id="run-1")
+    operations.run(run_id="run-2")
+
+    store = RepositoryRunStore(repository)
+    first = store.get_run_baseline("run-1")
+    second = store.get_run_baseline("run-2")
+    assert first is not None
+    assert second is not None
+    assert first.calibration_id == second.calibration_id == "calibration-1"
+    assert existing_counts == [0, 1]
+    assert [
+        event.event_type
+        for event in repository.list_audit_events("calibration-1")
+    ] == ["baseline_calibrated"]
+
+
+def test_production_resume_backfills_baseline_without_checkpoint_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tiktok2026 import bootstrap
+    from tiktok2026.adapters import RepositoryRunStore
+    from tiktok2026.bootstrap import ProductionOperations
+    from tiktok2026.contracts import RunRecord
+
+    runtime_root, repo_dir = _setup_runtime(tmp_path)
+    repository = _repo(runtime_root)
+    store = RepositoryRunStore(repository)
+    store.put_run(RunRecord(run_id="legacy-run", status="active"), "legacy-run-active")
+    operations = ProductionOperations(
+        repo_dir,
+        runtime_root,
+        baseline_calibrator=lambda *args: (_baseline_calibration(), True),
+    )
+    settings = SimpleNamespace(models={}, dataset_root=tmp_path / "dataset")
+    checkpoint: dict[str, object] = {
+        "phase": "complete",
+        "state_version": 9,
+        "pending_route": "complete",
+    }
+
+    def fake_verify(repository_root: Path) -> object:
+        del repository_root
+        return object()
+
+    def load_checkpoint(run_id: str) -> dict[str, object]:
+        del run_id
+        return checkpoint.copy()
+
+    monkeypatch.setattr(bootstrap, "verify_manifests", fake_verify)
+    monkeypatch.setattr(operations, "_production_settings", lambda: settings)
+    monkeypatch.setattr(operations, "_load_checkpoint", load_checkpoint)
+
+    result = operations.resume("legacy-run")
+
+    assert result.status == "already_complete"
+    assert checkpoint == {
+        "phase": "complete",
+        "state_version": 9,
+        "pending_route": "complete",
+    }
+    assert store.get_run_baseline("legacy-run") is not None
+    assert "baseline_bound" in {
+        event.event_type for event in repository.list_audit_events("legacy-run")
+    }
+
+
+def test_production_resume_rejects_conflicting_baseline_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tiktok2026 import bootstrap
+    from tiktok2026.bootstrap import OperationalError, ProductionOperations
+
+    runtime_root, repo_dir = _setup_runtime(tmp_path)
+    repository = _repo(runtime_root)
+    operations = ProductionOperations(
+        repo_dir,
+        runtime_root,
+        baseline_calibrator=lambda *args: (_baseline_calibration(), True),
+    )
+    older_calibration = _baseline_calibration().model_copy(
+        update={"calibration_id": "older-calibration"}
+    )
+    repository.put_baseline_calibration(
+        older_calibration, actor_type="controller", actor_id="test"
+    )
+    existing = _baseline_binding("run-1", "older-calibration")
+    repository.put_run_baseline(existing)
+    settings = SimpleNamespace(models={}, dataset_root=tmp_path / "dataset")
+    def fake_verify(repository_root: Path) -> object:
+        del repository_root
+        return object()
+
+    def load_checkpoint(run_id: str) -> dict[str, object]:
+        del run_id
+        return {"phase": "complete", "pending_route": "complete"}
+
+    monkeypatch.setattr(bootstrap, "verify_manifests", fake_verify)
+    monkeypatch.setattr(operations, "_production_settings", lambda: settings)
+    monkeypatch.setattr(operations, "_load_checkpoint", load_checkpoint)
+
+    with pytest.raises(OperationalError, match="content changed"):
+        operations.resume("run-1")
+
+    assert "resume_rejected" in {
+        event.event_type for event in repository.list_audit_events("run-1")
+    }
 
 
 # ---------------------------------------------------------------------------

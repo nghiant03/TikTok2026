@@ -15,6 +15,7 @@ from tiktok2026.contracts import (
     AgentClient,
     AgentFailure,
     AgentRole,
+    BaselineCalibrationRecord,
     ControllerContext,
     CriterionAssessmentStatus,
     DatasetViewProvenance,
@@ -49,6 +50,7 @@ from tiktok2026.contracts import (
     ResourceAccountant,
     ResourceReservation,
     ResourceState,
+    RunBaselineBinding,
     RunPhase,
     RunRecord,
     RunStore,
@@ -229,6 +231,7 @@ class ServiceTransitions:
     smoke_disk_bytes: int = 64 * 1024 * 1024
     dataset_view_provenance: Callable[[ExecutionRequest], DatasetViewProvenance] | None = None
     max_repairs: int = 3
+    requires_run_baseline: bool = False
 
 
 def _unresolved_blockers(
@@ -345,6 +348,7 @@ def make_service_transitions(
     smoke_disk_bytes: int = 64 * 1024 * 1024,
     dataset_view_provenance: Callable[[ExecutionRequest], DatasetViewProvenance] | None = None,
     max_repairs: int = 3,
+    requires_run_baseline: bool = False,
 ) -> Mapping[str, Transition]:
     s = ServiceTransitions(
         agent_client=agent_client,
@@ -373,6 +377,7 @@ def make_service_transitions(
         smoke_disk_bytes=smoke_disk_bytes,
         dataset_view_provenance=dataset_view_provenance,
         max_repairs=max_repairs,
+        requires_run_baseline=requires_run_baseline,
     )
     return {
         "bootstrap": _bootstrap(s),
@@ -516,12 +521,13 @@ def _research(s: ServiceTransitions) -> Transition:
         if state.get("terminal_reason"):
             _, message, _ = _failure_details(state)
             objective += f"; address validator feedback: {message}"
-            try:
-                unresolved_context = _blocker_context(
-                    _unresolved_blockers(s, _exp_id(state))
-                )
-            except MissingAuthorityError as error:
-                return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
+            if prior_experiment_id is not None:
+                try:
+                    unresolved_context = _blocker_context(
+                        _unresolved_blockers(s, prior_experiment_id)
+                    )
+                except MissingAuthorityError as error:
+                    return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         request = ResearchRequest(
             request_id=f"research-{state['run_id']}-{state['state_version']}",
             objective=objective,
@@ -704,7 +710,10 @@ def _resource_feasibility_escalated(
 
 
 def _controller_context(
-    s: ServiceTransitions, *, include_experiment_registry: bool = True
+    s: ServiceTransitions,
+    *,
+    include_experiment_registry: bool = True,
+    exclude_experiment_id: str | None = None,
 ) -> ControllerContext:
     dataset = s.run_store.get_dataset_manifest_identity() if s.run_store is not None else None
     evaluator = (
@@ -718,7 +727,11 @@ def _controller_context(
         parent_commit=s.parent_commit,
         docker_image=s.docker_image,
         experiment_registry=(
-            s.run_store.get_experiment_registry() if s.run_store is not None else None
+            s.run_store.get_experiment_registry(
+                exclude_experiment_id=exclude_experiment_id
+            )
+            if s.run_store is not None
+            else None
         )
         if include_experiment_registry
         else None,
@@ -783,7 +796,9 @@ def _proposal_validation(s: ServiceTransitions) -> Transition:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         subject: dict[str, object] = {
             "experiment_spec": spec.model_dump(mode="json"),
-            "controller_context": _controller_context(s).model_dump(mode="json"),
+            "controller_context": _controller_context(
+                s, exclude_experiment_id=spec.experiment_id
+            ).model_dump(mode="json"),
             "execution_resources": _execution_resources(s),
             "implementation_resource_estimate": (
                 spec.implementation_resource_estimate.model_dump(mode="json")
@@ -1180,7 +1195,9 @@ def _validation_subject(
         if evaluation is None or execution is None:
             raise MissingAuthorityError("result validation evidence is absent")
         subject["evaluation_result"] = evaluation.model_dump(mode="json")
-        subject["execution_result"] = execution.model_dump(mode="json")
+        subject["execution_result"] = execution.model_dump(
+            mode="json", exclude={"dataset_valid_rows"}
+        )
     return subject
 
 
@@ -1591,9 +1608,36 @@ def _evaluate(s: ServiceTransitions) -> Transition:
                 evaluator_id=evaluator.evaluator_id,
                 evaluator_sha256=evaluator.evaluator_sha256,
             )
+            if s.requires_run_baseline:
+                get_binding = getattr(s.run_store, "get_run_baseline", None)
+                binding = (
+                    cast(RunBaselineBinding | None, get_binding(state["run_id"]))
+                    if callable(get_binding)
+                    else None
+                )
+                if binding is None:
+                    raise MissingAuthorityError(
+                        f"run baseline binding is absent for production run {state['run_id']}"
+                    )
+                if (
+                    binding.dataset_manifest_id != context.dataset_manifest_id
+                    or binding.dataset_manifest_sha256 != context.dataset_manifest_sha256
+                    or binding.evaluator_id != context.evaluator_id
+                    or binding.evaluator_sha256 != context.evaluator_sha256
+                    or binding.split != context.split
+                ):
+                    raise MissingAuthorityError(
+                        f"run baseline binding does not match evaluation {context.evaluation_id}"
+                    )
             result = s.evaluator.evaluate(
                 EvaluationRequest(evaluation_id=context.evaluation_id, context=context)
             )
+            if s.requires_run_baseline and {
+                metric.name for metric in result.metrics
+            } != {"GAUC", "nDCG@5"}:
+                raise MissingAuthorityError(
+                    "production evaluation does not use the current judging metric pair"
+                )
             provenance = ProvenanceRequest(
                 run_id=state["run_id"],
                 experiment_id=_exp_id(state),
@@ -1619,41 +1663,153 @@ def _evaluate(s: ServiceTransitions) -> Transition:
 
 def _log_evaluation_metrics(s: ServiceTransitions, result: EvaluationResult) -> None:
     metrics = {metric.name: metric.value for metric in result.metrics}
-    ndcg = metrics["NDCG@10"]
-    recall = metrics["Recall@50"]
+    if set(metrics) != {"GAUC", "nDCG@5"} or len(metrics) != 2:
+        if s.requires_run_baseline:
+            raise MissingAuthorityError(
+                "production evaluation does not use the current judging metric pair"
+            )
+        logger.info(
+            "Historical evaluation metrics experiment_id={} evaluation_id={} "
+            "evaluator_id={} are not comparable to the current judging contract",
+            result.experiment_id,
+            result.evaluation_id,
+            result.evaluator_artifact_id,
+        )
+        return
+    gauc = metrics["GAUC"]
+    ndcg = metrics["nDCG@5"]
+    # Production evaluations are compared only against the immutable binding
+    # selected for their run.  In particular, never select the first calibration
+    # in the database: that can silently compare different dataset/evaluator
+    # identities after a resume or an evaluator upgrade.
+    if (
+        s.requires_run_baseline
+        and result.run_id is not None
+        and s.run_store is not None
+        and callable(getattr(s.run_store, "get_run_baseline", None))
+    ):
+        binding = s.run_store.get_run_baseline(result.run_id)
+        if binding is None:
+            raise MissingAuthorityError(
+                f"run baseline binding is absent for production run {result.run_id}"
+            )
+        if (
+            binding.dataset_manifest_id != result.dataset_manifest_id
+            or binding.dataset_manifest_sha256 != result.dataset_manifest_sha256
+            or binding.evaluator_id != result.evaluator_artifact_id
+            or binding.evaluator_sha256 != result.evaluator_sha256
+            or binding.split != result.split
+        ):
+            raise MissingAuthorityError(
+                f"run baseline binding does not match evaluation {result.evaluation_id}"
+            )
+        calibration_getter = getattr(s.run_store, "get_baseline_calibration", None)
+        baseline_calibration: BaselineCalibrationRecord | None
+        if callable(calibration_getter):
+            baseline_calibration = cast(
+                BaselineCalibrationRecord | None,
+                calibration_getter(binding.calibration_id),
+            )
+        else:
+            baseline_calibration = next(
+                (
+                    calibration
+                    for calibration in s.run_store.list_baseline_calibrations()
+                    if calibration.calibration_id == binding.calibration_id
+                ),
+                None,
+            )
+        if (
+            baseline_calibration is None
+            or baseline_calibration.evaluation.evaluation_id != binding.baseline_evaluation_id
+        ):
+            raise MissingAuthorityError(
+                f"bound baseline calibration is unavailable for run {result.run_id}"
+            )
+        calibration_identity_matches = (
+            baseline_calibration.dataset_manifest_id == binding.dataset_manifest_id
+            and baseline_calibration.dataset_manifest_sha256 == binding.dataset_manifest_sha256
+            and baseline_calibration.evaluator_id == binding.evaluator_id
+            and baseline_calibration.evaluator_sha256 == binding.evaluator_sha256
+            and baseline_calibration.split == binding.split
+        )
+        baseline_metrics = {metric.name: metric.value for metric in binding.metrics}
+        if (
+            not calibration_identity_matches
+            or set(baseline_metrics) != {"GAUC", "nDCG@5"}
+            or {
+                metric.name: metric.value for metric in baseline_calibration.evaluation.metrics
+            }
+            != baseline_metrics
+        ):
+            raise MissingAuthorityError(
+                f"bound baseline calibration does not match run {result.run_id}"
+            )
+        baseline_gauc = baseline_metrics["GAUC"]
+        baseline_ndcg = baseline_metrics["nDCG@5"]
+        logger.info(
+            "Provisional pipeline metrics experiment_id={} evaluation_id={} "
+            "GAUC={:.6f} nDCG@5={:.6f} composite={:.6f} "
+            "baseline=starter_kit_fm baseline_calibration_id={} "
+            "baseline_GAUC={:.6f} baseline_nDCG@5={:.6f} "
+            "delta_GAUC={:+.6f} delta_nDCG@5={:+.6f} delta_composite={:+.6f}",
+            result.experiment_id,
+            result.evaluation_id,
+            gauc,
+            ndcg,
+            result.validation_score,
+            binding.calibration_id,
+            baseline_gauc,
+            baseline_ndcg,
+            gauc - baseline_gauc,
+            ndcg - baseline_ndcg,
+            result.validation_score - (baseline_gauc + baseline_ndcg) / 2.0,
+        )
+        return
+
+    if s.requires_run_baseline:
+        raise MissingAuthorityError("production run baseline authority is unavailable")
+
+    # Synthetic and unit-test evaluators may retain the prior-champion diagnostic path.
+    legacy_fixture_store = s.run_store is not None and not callable(
+        getattr(s.run_store, "get_run_baseline", None)
+    )
     calibrations = (
-        s.run_store.list_baseline_calibrations() if s.run_store is not None else ()
+        s.run_store.list_baseline_calibrations()
+        if s.run_store is not None and (result.run_id is None or legacy_fixture_store)
+        else ()
     )
     matching_calibrations = tuple(
         calibration
         for calibration in calibrations
         if calibration.dataset_manifest_sha256 == result.dataset_manifest_sha256
+        and calibration.evaluator_id == result.evaluator_artifact_id
         and calibration.evaluator_sha256 == result.evaluator_sha256
         and calibration.split == result.split
+        and {metric.name for metric in calibration.evaluation.metrics}
+        == {"GAUC", "nDCG@5"}
     )
     if matching_calibrations:
         baseline = matching_calibrations[0]
-        baseline_metrics = {
-            metric.name: metric.value for metric in baseline.evaluation.metrics
-        }
-        baseline_ndcg = baseline_metrics["NDCG@10"]
-        baseline_recall = baseline_metrics["Recall@50"]
+        baseline_metrics = {metric.name: metric.value for metric in baseline.evaluation.metrics}
+        baseline_gauc = baseline_metrics["GAUC"]
+        baseline_ndcg = baseline_metrics["nDCG@5"]
         logger.info(
             "Provisional pipeline metrics experiment_id={} evaluation_id={} "
-            "NDCG@10={:.6f} Recall@50={:.6f} composite={:.6f} "
+            "GAUC={:.6f} nDCG@5={:.6f} composite={:.6f} "
             "baseline=starter_kit_fm baseline_calibration_id={} "
-            "baseline_NDCG@10={:.6f} baseline_Recall@50={:.6f} "
-            "delta_NDCG@10={:+.6f} delta_Recall@50={:+.6f} delta_composite={:+.6f}",
+            "baseline_GAUC={:.6f} baseline_nDCG@5={:.6f} "
+            "delta_GAUC={:+.6f} delta_nDCG@5={:+.6f} delta_composite={:+.6f}",
             result.experiment_id,
             result.evaluation_id,
+            gauc,
             ndcg,
-            recall,
             result.validation_score,
             baseline.calibration_id,
+            baseline_gauc,
             baseline_ndcg,
-            baseline_recall,
+            gauc - baseline_gauc,
             ndcg - baseline_ndcg,
-            recall - baseline_recall,
             result.validation_score - baseline.evaluation.validation_score,
         )
         return
@@ -1666,41 +1822,43 @@ def _log_evaluation_metrics(s: ServiceTransitions, result: EvaluationResult) -> 
         if candidate.evaluation_id != result.evaluation_id
         and candidate.run_id == result.run_id
         and candidate.dataset_manifest_sha256 == result.dataset_manifest_sha256
+        and candidate.evaluator_artifact_id == result.evaluator_artifact_id
         and candidate.evaluator_sha256 == result.evaluator_sha256
         and candidate.split == result.split
         and candidate.validity == result.validity
+        and {metric.name for metric in candidate.metrics} == {"GAUC", "nDCG@5"}
     )
     if not comparable:
         logger.info(
             "Provisional pipeline metrics experiment_id={} evaluation_id={} "
-            "NDCG@10={:.6f} Recall@50={:.6f} composite={:.6f} baseline=unavailable",
+            "GAUC={:.6f} nDCG@5={:.6f} composite={:.6f} baseline=unavailable",
             result.experiment_id,
             result.evaluation_id,
+            gauc,
             ndcg,
-            recall,
             result.validation_score,
         )
         return
     baseline = max(comparable, key=lambda candidate: candidate.validation_score)
     baseline_metrics = {metric.name: metric.value for metric in baseline.metrics}
-    baseline_ndcg = baseline_metrics["NDCG@10"]
-    baseline_recall = baseline_metrics["Recall@50"]
+    baseline_gauc = baseline_metrics["GAUC"]
+    baseline_ndcg = baseline_metrics["nDCG@5"]
     logger.info(
         "Provisional pipeline metrics experiment_id={} evaluation_id={} "
-        "NDCG@10={:.6f} Recall@50={:.6f} composite={:.6f} "
+        "GAUC={:.6f} nDCG@5={:.6f} composite={:.6f} "
         "baseline=prior_champion baseline_evaluation_id={} "
-        "baseline_NDCG@10={:.6f} baseline_Recall@50={:.6f} "
-        "delta_NDCG@10={:+.6f} delta_Recall@50={:+.6f} delta_composite={:+.6f}",
+        "baseline_GAUC={:.6f} baseline_nDCG@5={:.6f} "
+        "delta_GAUC={:+.6f} delta_nDCG@5={:+.6f} delta_composite={:+.6f}",
         result.experiment_id,
         result.evaluation_id,
+        gauc,
         ndcg,
-        recall,
         result.validation_score,
         baseline.evaluation_id,
+        baseline_gauc,
         baseline_ndcg,
-        baseline_recall,
+        gauc - baseline_gauc,
         ndcg - baseline_ndcg,
-        recall - baseline_recall,
         result.validation_score - baseline.validation_score,
     )
 
@@ -1838,7 +1996,14 @@ def _persist_failure(s: ServiceTransitions) -> Transition:
                 raise TerminalLifecycleError(str(error)) from error
         if route == "terminal":
             raise TerminalLifecycleError(message)
-        return {"pending_route": route}
+        updates: dict[str, object] = {"pending_route": route}
+        if route == "orchestrate":
+            updates |= {
+                "current_experiment_id": None,
+                "current_hypothesis_id": None,
+                "repair_attempts": 0,
+            }
+        return updates
 
     return transition
 

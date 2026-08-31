@@ -51,24 +51,30 @@ def _canonical_json(payload: object) -> bytes:
     return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def _evaluator_bundle() -> bytes:
+def _evaluator_bundle(
+    *, registry_bytes: bytes | None = None, metric_bytes: bytes | None = None
+) -> bytes:
     metrics_path = Path(__file__).with_name("metrics.py")
+    registry_source = Path(__file__).read_bytes() if registry_bytes is None else registry_bytes
+    metric_source = metrics_path.read_bytes() if metric_bytes is None else metric_bytes
     return _canonical_json(
         {
             "schema_version": "1",
-            "evaluator_version": "provisional-v2",
+            "evaluator_version": "provisional-v3-gauc-ndcg5",
             "registry_implementation_sha256": hashlib.sha256(
-                Path(__file__).read_bytes()
+                registry_source
             ).hexdigest(),
-            "metric_implementation_sha256": hashlib.sha256(metrics_path.read_bytes()).hexdigest(),
-            "metric_parameters": {"ndcg_cutoff": 10, "recall_cutoff": 50},
-            "ranking_config": {"validation_ranking": "mean(NDCG@10, Recall@50)"},
+            "metric_implementation_sha256": hashlib.sha256(metric_source).hexdigest(),
+            "metric_parameters": {"auc": "mann_whitney_average_rank_ties", "ndcg_cutoff": 5},
+            "ranking_config": {"validation_ranking": "mean(GAUC, nDCG@5)"},
         }
     )
 
 
-def evaluator_implementation_sha256() -> str:
-    return hashlib.sha256(_evaluator_bundle()).hexdigest()
+def evaluator_implementation_sha256(*, metric_implementation_bytes: bytes | None = None) -> str:
+    return hashlib.sha256(
+        _evaluator_bundle(metric_bytes=metric_implementation_bytes)
+    ).hexdigest()
 
 
 def _expected_rows(dataset: VerifiedDataset, split: str) -> tuple[LabeledRow, ...]:
@@ -254,8 +260,8 @@ class ProvisionalEvaluator:
             experiment_id=context.experiment_id,
             checkpoint_id=context.checkpoint_id,
             metrics=(
-                MetricValue(name="NDCG@10", value=metrics["NDCG@10"]),
-                MetricValue(name="Recall@50", value=metrics["Recall@50"]),
+                MetricValue(name="GAUC", value=metrics["GAUC"]),
+                MetricValue(name="nDCG@5", value=metrics["nDCG@5"]),
             ),
             evaluator_artifact_id=self.evaluator_id,
             evaluator_sha256=evaluator_implementation_sha256(),

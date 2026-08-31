@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 from tiktok2026.contracts import EvaluationRequest, EvaluationResult, MetricValue
+from tiktok2026.evaluation.metrics import evaluate_rankings
 
 
 @dataclass(frozen=True)
@@ -31,25 +31,18 @@ def score_rows(rows: tuple[RankingRow, ...], scale: float) -> tuple[float, ...]:
 def evaluate_fixture(
     experiment_id: str, rows: tuple[RankingRow, ...], scores: tuple[float, ...]
 ) -> EvaluationResult:
-    grouped: dict[str, list[tuple[float, int]]] = {}
-    for row, score in zip(rows, scores, strict=True):
-        grouped.setdefault(row.user_id, []).append((score, row.label))
-    ndcgs: list[float] = []
-    recalls: list[float] = []
-    for values in grouped.values():
-        ranked = [label for _, label in sorted(values, reverse=True)]
-        positives = sum(ranked)
-        dcg = sum(label / math.log2(index + 2) for index, label in enumerate(ranked[:10]))
-        ideal = sum(1 / math.log2(index + 2) for index in range(min(positives, 10)))
-        ndcgs.append(0.0 if ideal == 0 else dcg / ideal)
-        recalls.append(0.0 if positives == 0 else sum(ranked[:50]) / positives)
+    metrics = evaluate_rankings(
+        [row.user_id for row in rows],
+        [row.label for row in rows],
+        scores,
+    )
     return EvaluationResult(
         evaluation_id=f"eval-{experiment_id}",
         experiment_id=experiment_id,
         checkpoint_id=f"checkpoint-{experiment_id}",
         metrics=(
-            MetricValue(name="NDCG@10", value=sum(ndcgs) / len(ndcgs)),
-            MetricValue(name="Recall@50", value=sum(recalls) / len(recalls)),
+            MetricValue(name="GAUC", value=metrics["GAUC"]),
+            MetricValue(name="nDCG@5", value=metrics["nDCG@5"]),
         ),
         evaluator_artifact_id="synthetic-evaluator-v1",
         evaluator_sha256="0" * 64,

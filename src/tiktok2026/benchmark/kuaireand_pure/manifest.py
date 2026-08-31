@@ -20,11 +20,17 @@ class BenchmarkManifest(BaseModel):
     task: str
     label: str
     splits: dict[str, tuple[int, int]]
-    judging_metrics: tuple[Literal["NDCG@10", "Recall@50"], ...]
+    judging_metrics: tuple[Literal["GAUC", "nDCG@5"], ...]
     judging_evaluator_status: Literal["provisional", "official"]
-    validation_ranking: str
+    validation_ranking: Literal["mean(GAUC, nDCG@5)"]
     convergence: dict[str, float | int]
     protected_reference_files: dict[str, str]
+
+    @model_validator(mode="after")
+    def validate_judging_metrics(self) -> BenchmarkManifest:
+        if self.judging_metrics != ("GAUC", "nDCG@5"):
+            raise ValueError("benchmark manifest requires judging metrics in current order")
+        return self
 
 
 class DatasetFile(BaseModel):

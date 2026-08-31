@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{7,64}$")]
 FullCommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
+CURRENT_EVALUATOR_ID = "provisional-within-user-v2"
 
 
 def _populate_source_identity(value: object, field: str) -> object:
@@ -224,7 +225,7 @@ class RuntimePaths(ContractModel):
 
 
 class MetricValue(ContractModel):
-    name: Literal["NDCG@10", "Recall@50"]
+    name: Literal["GAUC", "nDCG@5", "NDCG@10", "Recall@50"]
     value: Annotated[float, Field(ge=0.0, le=1.0)]
 
 
@@ -1153,12 +1154,26 @@ class EvaluationResult(ContractModel):
     dataset_manifest_id: str | None = None
     prediction_artifact_id: str | None = None
 
+    @model_validator(mode="after")
+    def validate_metric_pair(self) -> EvaluationResult:
+        names = tuple(metric.name for metric in self.metrics)
+        if len(names) != 2 or len(set(names)) != 2:
+            raise ValueError("evaluation requires exactly one complete metric pair")
+        if frozenset(names) not in {
+            frozenset(("GAUC", "nDCG@5")),
+            frozenset(("NDCG@10", "Recall@50")),
+        }:
+            raise ValueError("evaluation requires either the current or historical metric pair")
+        return self
+
     @property
     def validation_score(self) -> float:
         values = {metric.name: metric.value for metric in self.metrics}
-        if set(values) != {"NDCG@10", "Recall@50"}:
-            raise ValueError("both judging metrics are required")
-        return (values["NDCG@10"] + values["Recall@50"]) / 2.0
+        if set(values) == {"GAUC", "nDCG@5"}:
+            return (values["GAUC"] + values["nDCG@5"]) / 2.0
+        if set(values) == {"NDCG@10", "Recall@50"}:
+            return (values["NDCG@10"] + values["Recall@50"]) / 2.0
+        raise ValueError("both metrics from one judging pair are required")
 
 
 class DiagnosticMetricValue(ContractModel):
@@ -1205,6 +1220,46 @@ class BaselineCalibrationRecord(ContractModel):
             "primary",
         }:
             raise ValueError("baseline calibration requires all diagnostic metrics")
+        return self
+
+
+class RunBaselineBinding(ContractModel):
+    """The scalar Starter Kit baseline selected for one production run.
+
+    The binding deliberately contains no prediction rows or artifact payloads.  Those
+    remain behind the calibration identity; this record is the run-local comparison
+    authority used by evaluation logging.
+    """
+
+    schema_version: Literal["1"] = "1"
+    run_id: str
+    calibration_id: str
+    baseline_evaluation_id: str
+    dataset_manifest_id: str
+    dataset_manifest_sha256: Sha256
+    evaluator_id: str
+    evaluator_sha256: Sha256
+    split: Literal["valid"] = "valid"
+    metrics: tuple[MetricValue, ...]
+
+    @model_validator(mode="after")
+    def validate_identity_and_metrics(self) -> RunBaselineBinding:
+        if not all(
+            value.strip()
+            for value in (
+                self.run_id,
+                self.calibration_id,
+                self.baseline_evaluation_id,
+                self.dataset_manifest_id,
+                self.evaluator_id,
+            )
+        ):
+            raise ValueError("run baseline binding identities must be non-empty")
+        names = tuple(metric.name for metric in self.metrics)
+        if names != ("GAUC", "nDCG@5") and names != ("nDCG@5", "GAUC"):
+            raise ValueError("run baseline binding requires exactly GAUC and nDCG@5")
+        if len(names) != 2 or len(set(names)) != 2:
+            raise ValueError("run baseline binding metrics must be unique")
         return self
 
 
@@ -1328,9 +1383,9 @@ class ControllerContext(ContractModel):
     schema_version: Literal["1"] = "1"
     dataset_manifest_identity: DatasetManifestIdentity | None = None
     evaluator_identity: EvaluatorIdentity | None = None
-    judging_metrics: tuple[Literal["NDCG@10", "Recall@50"], ...] = (
-        "NDCG@10",
-        "Recall@50",
+    judging_metrics: tuple[Literal["GAUC", "nDCG@5"], ...] = (
+        "GAUC",
+        "nDCG@5",
     )
     metric_and_candidate_semantics_owner: Literal["controller"] = "controller"
     source_commit_stage: Literal["post_implementation"] = "post_implementation"
@@ -1341,6 +1396,12 @@ class ControllerContext(ContractModel):
     docker_image: str | None = None
     experiment_registry: ExperimentRegistrySnapshot | None = None
     experiment_execution: ExperimentExecutionContract = ExperimentExecutionContract()
+
+    @model_validator(mode="after")
+    def validate_judging_metrics(self) -> ControllerContext:
+        if self.judging_metrics != ("GAUC", "nDCG@5"):
+            raise ValueError("controller context requires judging metrics in current order")
+        return self
 
 
 class ResearchRequest(ContractModel):

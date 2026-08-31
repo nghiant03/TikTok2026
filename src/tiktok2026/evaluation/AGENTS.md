@@ -6,8 +6,8 @@ Evaluation is deterministic and independent of LangGraph and runtime agents. It 
 
 ## Rules
 
-- Authoritative challenge metrics are NDCG@10 and Recall@50 with equal-weight validation ranking unless the organizer contract replaces this rule.
-- The protected Starter Kit currently computes GAUC and nDCG@5. Keep it available as a diagnostic adapter only; label every result from it provisional.
+- Authoritative challenge metrics are GAUC and nDCG@5 with equal-weight validation ranking. GAUC uses per-user Mann-Whitney AUC with average-rank tie correction, includes only users with both labels, and weights included users by positive count. nDCG@5 averages all users and contributes zero for zero-positive users.
+- The repository evaluator and all local results remain provisional unless an existing official authority says otherwise.
 - Never reinterpret, round before comparison, or silently combine metrics beyond the configured official rule.
 - Reject missing, extra, reordered, duplicate-row-ID, non-finite, or schema-invalid predictions.
 - Agents cannot invoke evaluators directly or supply evaluator paths, commands, images, or parsing rules.

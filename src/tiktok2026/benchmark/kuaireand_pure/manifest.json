@@ -9,9 +9,9 @@
     "valid": [20220422, 20220428],
     "test": [20220429, 20220508]
   },
-  "judging_metrics": ["NDCG@10", "Recall@50"],
+  "judging_metrics": ["GAUC", "nDCG@5"],
   "judging_evaluator_status": "provisional",
-  "validation_ranking": "mean(NDCG@10, Recall@50)",
+  "validation_ranking": "mean(GAUC, nDCG@5)",
   "convergence": {"epsilon": 0.002, "consecutive_iterations": 3},
   "protected_reference_files": {
     "baseline/README.md": "c7a58e652a1aceea144e651ba9ef7a6a4f7dc13f0916e3c4ed342dce69699861",

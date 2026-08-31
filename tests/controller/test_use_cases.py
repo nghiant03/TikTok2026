@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from tiktok2026 import use_cases
 from tiktok2026.adapters import DeterministicPolicyGate
 from tiktok2026.contracts import (
     DEFAULT_IMPLEMENTATION_CRITERIA,
@@ -121,8 +122,15 @@ class _FakeStore:
     def get_experiment(self, experiment_id: str) -> ExperimentSpec | None:
         return self.experiments.get(experiment_id)
 
-    def get_experiment_registry(self, limit: int = 50) -> ExperimentRegistrySnapshot:
-        specs = tuple(self.experiments.values())[-limit:]
+    def get_experiment_registry(
+        self, limit: int = 50, exclude_experiment_id: str | None = None
+    ) -> ExperimentRegistrySnapshot:
+        all_specs = tuple(
+            spec
+            for spec in self.experiments.values()
+            if spec.experiment_id != exclude_experiment_id
+        )
+        specs = all_specs[-limit:]
         entries = tuple(
             ExperimentRegistryEntry(
                 experiment_id=spec.experiment_id,
@@ -151,8 +159,8 @@ class _FakeStore:
         return ExperimentRegistrySnapshot(
             evidence_id="experiment-registry-test",
             entries=entries,
-            total_experiments=len(self.experiments),
-            complete=len(self.experiments) <= limit,
+            total_experiments=len(all_specs),
+            complete=len(all_specs) <= limit,
         )
 
     def put_experiment(
@@ -321,6 +329,16 @@ class _FakeStore:
             for (record_kind, _), payload in sorted(self.json_records.items())
             if record_kind == kind
         )
+
+
+class _ContentAddressedRegistryStore(_FakeStore):
+    def get_experiment_registry(
+        self, limit: int = 50, exclude_experiment_id: str | None = None
+    ) -> ExperimentRegistrySnapshot:
+        snapshot = super().get_experiment_registry(limit, exclude_experiment_id)
+        identities = ",".join(entry.experiment_id for entry in snapshot.entries)
+        evidence_id = f"experiment-registry-{hashlib.sha256(identities.encode()).hexdigest()}"
+        return snapshot.model_copy(update={"evidence_id": evidence_id})
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +606,46 @@ async def test_rejected_validation_carries_blockers_into_failure() -> None:
     assert isinstance(registry, dict)
     assert registry["evidence_id"] == "experiment-registry-test"
     assert registry["complete"] is True
-    assert registry["total_experiments"] == 1
+    assert registry["total_experiments"] == 0
+
+
+async def test_proposal_validation_reuses_research_registry_identity() -> None:
+    store = _ContentAddressedRegistryStore()
+    proposal = _estimated_experiment(("src/tiktok2026/experiment",))
+    agent = _ScriptedAgentClient(
+        [
+            ResearchDecision(
+                request_id="research-1",
+                kind="proposal",
+                experiment_spec=proposal,
+                message="bounded proposal",
+            ),
+            ValidationReport(
+                report_id="report-1",
+                experiment_id=proposal.experiment_id,
+                stage=ValidationStage.PROPOSAL,
+                verdict=ValidationVerdict.APPROVED,
+                leakage_risk="none",
+            ),
+        ]
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=agent))
+    state = minimal_state(phase=RunPhase.RESEARCH)
+
+    research = await controller.research(state)
+    await controller.proposal_validation(state | research)  # type: ignore[arg-type]
+
+    research_request, validation_request = agent.calls
+    assert isinstance(research_request, ResearchRequest)
+    assert isinstance(validation_request, ValidationRequest)
+    assert research_request.controller_context is not None
+    research_registry = research_request.controller_context.experiment_registry
+    validation_context = validation_request.subject["controller_context"]
+    assert research_registry is not None
+    assert isinstance(validation_context, dict)
+    validation_registry = validation_context["experiment_registry"]
+    assert isinstance(validation_registry, dict)
+    assert validation_registry["evidence_id"] == research_registry.evidence_id
 
 
 async def test_repairable_proposal_returns_to_research_with_feedback() -> None:
@@ -1360,8 +1417,8 @@ class _FakeEvaluator:
             experiment_id="exp-1",
             checkpoint_id="ckpt-1",
             metrics=(
-                MetricValue(name="NDCG@10", value=0.5),
-                MetricValue(name="Recall@50", value=0.6),
+                MetricValue(name="GAUC", value=0.5),
+                MetricValue(name="nDCG@5", value=0.6),
             ),
             evaluator_artifact_id="evaluator-1",
             evaluator_sha256="0" * 64,
@@ -1796,6 +1853,71 @@ async def test_evaluate_persists_evaluation_with_provenance() -> None:
     assert result["pending_route"] == "result_validation"
 
 
+async def test_result_validation_excludes_authoritative_dataset_rows() -> None:
+    store = _FakeStore()
+    store.experiments["exp-1"] = _experiment(("src/tiktok2026/experiment",))
+    store.executions["exec-1"] = ExecutionResult(
+        execution_id="exec-1",
+        experiment_id="exp-1",
+        source_commit="a" * 40,
+        command=("python", "train.py"),
+        exit_code=0,
+        elapsed_seconds=1.0,
+        gpu_hours=0.0,
+        dataset_valid_rows=(
+            DatasetViewRow(
+                row_id="row-1",
+                row_identity=("row-1", "user-1", "item-1"),
+                user_id="user-1",
+                item_id="item-1",
+            ),
+        ),
+    )
+    store.evaluations.append(
+        EvaluationResult(
+            evaluation_id="eval-1",
+            experiment_id="exp-1",
+            checkpoint_id="ckpt-1",
+            metrics=(
+                MetricValue(name="GAUC", value=0.5),
+                MetricValue(name="nDCG@5", value=0.6),
+            ),
+            evaluator_artifact_id="evaluator-1",
+            evaluator_sha256="b" * 64,
+            prediction_sha256="c" * 64,
+            validity="provisional",
+        )
+    )
+    agent = _ScriptedAgentClient(
+        [
+            ValidationReport(
+                report_id="report-1",
+                experiment_id="exp-1",
+                stage=ValidationStage.RESULT,
+                verdict=ValidationVerdict.APPROVED,
+                leakage_risk="none",
+            )
+        ]
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=agent))
+
+    result = await controller.result_validation(
+        minimal_state(
+            current_experiment_id="exp-1",
+            latest_execution_result_id="exec-1",
+            latest_evaluation_result_id="eval-1",
+            phase=RunPhase.EVALUATE,
+        )
+    )
+
+    assert result["pending_route"] == "interpret"
+    request = agent.calls[0]
+    assert isinstance(request, ValidationRequest)
+    execution = request.subject["execution_result"]
+    assert isinstance(execution, dict)
+    assert "dataset_valid_rows" not in execution
+
+
 async def test_evaluate_logs_metrics_and_delta_from_prior_compatible_champion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1805,8 +1927,8 @@ async def test_evaluate_logs_metrics_and_delta_from_prior_compatible_champion(
         experiment_id="exp-1",
         checkpoint_id="ckpt-1",
         metrics=(
-            MetricValue(name="NDCG@10", value=0.6),
-            MetricValue(name="Recall@50", value=0.7),
+            MetricValue(name="GAUC", value=0.6),
+            MetricValue(name="nDCG@5", value=0.7),
         ),
         evaluator_artifact_id="evaluator-1",
         evaluator_sha256="0" * 64,
@@ -1822,8 +1944,8 @@ async def test_evaluate_logs_metrics_and_delta_from_prior_compatible_champion(
                 "evaluation_id": "eval-baseline",
                 "experiment_id": "exp-baseline",
                 "metrics": (
-                    MetricValue(name="NDCG@10", value=0.55),
-                    MetricValue(name="Recall@50", value=0.68),
+                    MetricValue(name="GAUC", value=0.55),
+                    MetricValue(name="nDCG@5", value=0.68),
                 ),
             }
         )
@@ -1840,11 +1962,11 @@ async def test_evaluate_logs_metrics_and_delta_from_prior_compatible_champion(
     use_cases._log_evaluation_metrics(ServiceTransitions(run_store=store), current)
 
     output = messages[-1]
-    assert "NDCG@10=0.600000" in output
-    assert "Recall@50=0.700000" in output
+    assert "GAUC=0.600000" in output
+    assert "nDCG@5=0.700000" in output
     assert "baseline_evaluation_id=eval-baseline" in output
-    assert "delta_NDCG@10=+0.050000" in output
-    assert "delta_Recall@50=+0.020000" in output
+    assert "delta_GAUC=+0.050000" in output
+    assert "delta_nDCG@5=+0.020000" in output
 
 
 async def test_evaluation_log_prefers_starter_kit_calibration(
@@ -1856,8 +1978,8 @@ async def test_evaluation_log_prefers_starter_kit_calibration(
         experiment_id="exp-1",
         checkpoint_id="ckpt-1",
         metrics=(
-            MetricValue(name="NDCG@10", value=0.6),
-            MetricValue(name="Recall@50", value=0.7),
+            MetricValue(name="GAUC", value=0.6),
+            MetricValue(name="nDCG@5", value=0.7),
         ),
         evaluator_artifact_id="evaluator-1",
         evaluator_sha256="0" * 64,
@@ -1873,8 +1995,8 @@ async def test_evaluation_log_prefers_starter_kit_calibration(
             "evaluation_id": "eval-starter",
             "experiment_id": "starter-kit-fm-baseline",
             "metrics": (
-                MetricValue(name="NDCG@10", value=0.56),
-                MetricValue(name="Recall@50", value=0.69),
+                MetricValue(name="GAUC", value=0.56),
+                MetricValue(name="nDCG@5", value=0.69),
             ),
         }
     )
@@ -1911,8 +2033,58 @@ async def test_evaluation_log_prefers_starter_kit_calibration(
     output = messages[-1]
     assert "baseline=starter_kit_fm" in output
     assert "baseline_calibration_id=baseline-calibration-test" in output
-    assert "delta_NDCG@10=+0.040000" in output
-    assert "delta_Recall@50=+0.010000" in output
+    assert "delta_GAUC=+0.040000" in output
+    assert "delta_nDCG@5=+0.010000" in output
+
+
+def test_production_evaluation_requires_run_baseline_authority() -> None:
+    result = EvaluationResult(
+        evaluation_id="eval-1",
+        experiment_id="exp-1",
+        checkpoint_id="ckpt-1",
+        metrics=(
+            MetricValue(name="GAUC", value=0.6),
+            MetricValue(name="nDCG@5", value=0.7),
+        ),
+        evaluator_artifact_id="configured-evaluator",
+        evaluator_sha256="a" * 64,
+        prediction_sha256="b" * 64,
+        validity="provisional",
+        run_id="run-1",
+    )
+
+    with pytest.raises(use_cases.MissingAuthorityError, match="baseline authority"):
+        use_cases._log_evaluation_metrics(
+            ServiceTransitions(
+                run_store=cast(Any, _FakeStore()), requires_run_baseline=True
+            ),
+            result,
+        )
+
+
+def test_production_evaluation_rejects_historical_metric_pair() -> None:
+    result = EvaluationResult(
+        evaluation_id="eval-legacy",
+        experiment_id="exp-1",
+        checkpoint_id="ckpt-1",
+        metrics=(
+            MetricValue(name="NDCG@10", value=0.6),
+            MetricValue(name="Recall@50", value=0.7),
+        ),
+        evaluator_artifact_id="configured-evaluator",
+        evaluator_sha256="a" * 64,
+        prediction_sha256="b" * 64,
+        validity="provisional",
+        run_id="run-1",
+    )
+
+    with pytest.raises(use_cases.MissingAuthorityError, match="current judging metric pair"):
+        use_cases._log_evaluation_metrics(
+            ServiceTransitions(
+                run_store=cast(Any, _FakeStore()), requires_run_baseline=True
+            ),
+            result,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1946,7 +2118,48 @@ async def test_persist_failure_repairs_then_abandons_exhausted_experiment() -> N
     result = await controller.persist_failure(state_exhausted)
 
     assert result["pending_route"] == "orchestrate"
+    assert result["current_experiment_id"] is None
+    assert result["current_hypothesis_id"] is None
+    assert result["repair_attempts"] == 0
     assert store.experiment_updates[-1] == ("exp-1", "failed")
+
+
+async def test_research_after_abandonment_starts_fresh_experiment() -> None:
+    store = _FakeStore()
+    store.experiments["exp-1"] = _experiment(("src/tiktok2026/experiment",))
+    proposal = _estimated_experiment(("src/tiktok2026/experiment",)).model_copy(
+        update={"experiment_id": "exp-2", "parent_experiment_id": None}
+    )
+    agent = _ScriptedAgentClient(
+        [
+            ResearchDecision(
+                request_id="research-1",
+                kind="proposal",
+                experiment_spec=proposal,
+                message="fresh proposal",
+            )
+        ]
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=agent))
+    failed = minimal_state(
+        phase=RunPhase.RESEARCH,
+        current_experiment_id="exp-1",
+        current_hypothesis_id="hyp-1",
+        repair_attempts=3,
+        terminal_reason=(
+            'failure:{"evidence": [], "kind": "schema_mismatch", '
+            '"message": "proposal rejected"}'
+        ),
+    )
+
+    abandoned = await controller.persist_failure(failed)
+    result = await controller.research(failed | abandoned)  # type: ignore[arg-type]
+
+    request = agent.calls[0]
+    assert isinstance(request, ResearchRequest)
+    assert request.parent_experiment_id is None
+    assert result["current_experiment_id"] == "exp-2"
+    assert result["repair_attempts"] == 0
 
 
 async def test_rejected_implementation_is_abandoned_then_orchestrated() -> None:

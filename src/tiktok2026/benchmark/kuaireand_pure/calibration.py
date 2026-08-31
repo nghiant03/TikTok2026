@@ -21,6 +21,7 @@ from tiktok2026.benchmark.kuaireand_pure.manifest import (
     verify_dataset_manifest,
 )
 from tiktok2026.contracts import (
+    CURRENT_EVALUATOR_ID,
     BaselineCalibrationRecord,
     DiagnosticMetricValue,
     EvaluationContext,
@@ -73,12 +74,17 @@ def _baseline_source_hash(baseline_root: Path) -> str:
 
 
 def _calibration_id(
-    manifest: DatasetManifest, evaluator_sha256: str, source_sha256: str, config_sha256: str
+    manifest: DatasetManifest,
+    evaluator_id: str,
+    evaluator_sha256: str,
+    source_sha256: str,
+    config_sha256: str,
 ) -> str:
     digest = _canonical_hash(
         {
             "dataset_manifest_id": manifest.manifest_id,
             "dataset_manifest_sha256": canonical_manifest_sha256(manifest),
+            "evaluator_id": evaluator_id,
             "evaluator_sha256": evaluator_sha256,
             "baseline_source_sha256": source_sha256,
             "config_sha256": config_sha256,
@@ -241,11 +247,12 @@ def calibrate_baseline(
     baseline_root = repository_root / "baseline"
     manifest = load_dataset_manifest(dataset_root / "manifest.json")
     verified = verify_dataset_manifest(manifest, dataset_root, splits={"train", "valid"})
+    evaluator_id = CURRENT_EVALUATOR_ID
     evaluator_sha256 = evaluator_implementation_sha256()
     source_sha256 = _baseline_source_hash(baseline_root)
     config_sha256 = _canonical_hash(BASELINE_CONFIG)
     calibration_id = _calibration_id(
-        manifest, evaluator_sha256, source_sha256, config_sha256
+        manifest, evaluator_id, evaluator_sha256, source_sha256, config_sha256
     )
     existing = load_calibration(existing_records, calibration_id)
     if existing is not None:
@@ -300,7 +307,6 @@ def calibrate_baseline(
         dataset_manifest_sha256=manifest_sha256,
         split="valid",
     )
-    evaluator_id = "provisional-within-user-v1"
     evaluator = ProvisionalEvaluator(
         evaluator_id,
         artifacts={prediction.artifact_id: prediction},

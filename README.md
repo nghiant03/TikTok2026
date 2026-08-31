@@ -160,9 +160,9 @@ Synthetic lifecycle tests use scripted agents, deterministic fixture rows, a fak
 
 ## Metrics and finalization
 
-The judging contract is NDCG@10 and Recall@50, with the local validation ranking defined as their mean. The repository evaluator and synthetic evaluator return `validity="provisional"`; the protected Starter Kit metrics are diagnostic only. No local metric, run, submission, or final bundle is an official organizer result.
+The judging contract is GAUC and nDCG@5, with the local validation ranking defined as their mean. The repository evaluator and synthetic evaluator return `validity="provisional"`; the protected Starter Kit evaluator is used for diagnostic parity checks only. No local metric, run, submission, or final bundle is an official organizer result.
 
-`calibrate-baseline` is standalone operator tooling, not a graph node. It verifies the protected Starter Kit and external train/valid manifest, runs the unchanged FM validation pipeline once, evaluates its predictions under both metric contracts, and persists an immutable identity-keyed record under the sibling runtime root. Repeating the command with the same dataset manifest, evaluator, Starter Kit source, and FM configuration returns the cached record without retraining. Runtime evaluation logs use the matching calibration for baseline deltas.
+`calibrate-baseline` is standalone operator tooling, not a graph node. It verifies the protected Starter Kit and external train/valid manifest, runs the unchanged FM validation pipeline once, evaluates its predictions under the current GAUC/nDCG@5 contract, and records the protected Starter Kit values as diagnostics in an immutable identity-keyed record under the sibling runtime root. Repeating the command with the same dataset manifest, evaluator, Starter Kit source, and FM configuration returns the cached record without retraining. Runtime evaluation logs use the matching calibration for baseline deltas.
 
 Iterative execution receives only the verified train/valid view. The contracts and persistence layer contain one controller-authorized test-access boundary, but the current CLI does not expose an organizer evaluator or a separate final-test command. Until that evaluator is supplied and configured, finalization is provisional only.
 

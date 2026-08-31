@@ -5,7 +5,7 @@ import json
 import subprocess
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Literal, TypeVar, cast
 
 from tiktok2026.agents.common.client import OpenAICompatibleClient
 from tiktok2026.agents.common.structured import invoke_agentic, invoke_structured
@@ -41,6 +41,7 @@ from tiktok2026.contracts import (
     ResearchRequest,
     ResourceReservation,
     ResourceState,
+    RunBaselineBinding,
     RunRecord,
     ScopedRepository,
     SourceRegistration,
@@ -1032,8 +1033,10 @@ class RepositoryRunStore:
     def get_experiment(self, experiment_id: str) -> ExperimentSpec | None:
         return self._repo.get_experiment(experiment_id)
 
-    def get_experiment_registry(self, limit: int = 50) -> ExperimentRegistrySnapshot:
-        experiments, total = self._repo.list_experiments(limit)
+    def get_experiment_registry(
+        self, limit: int = 50, exclude_experiment_id: str | None = None
+    ) -> ExperimentRegistrySnapshot:
+        experiments, total = self._repo.list_experiments(limit, exclude_experiment_id)
         evaluations_by_experiment: dict[str, list[EvaluationResult]] = {}
         for raw in self._repo.list_json("evaluation"):
             value = json.loads(raw)
@@ -1105,10 +1108,40 @@ class RepositoryRunStore:
         return tuple(results)
 
     def list_baseline_calibrations(self) -> tuple[BaselineCalibrationRecord, ...]:
-        return tuple(
-            BaselineCalibrationRecord.model_validate_json(item)
-            for item in self._repo.list_json("baseline_calibration")
-        )
+        return self._repo.list_baseline_calibrations()
+
+    def get_baseline_calibration(self, calibration_id: str) -> BaselineCalibrationRecord | None:
+        return self._repo.get_baseline_calibration(calibration_id)
+
+    def put_baseline_calibration(
+        self,
+        record: BaselineCalibrationRecord,
+        actor_type: Literal["agent", "controller", "human"],
+        actor_id: str,
+    ) -> None:
+        self._repo.put_baseline_calibration(record, actor_type, actor_id)
+
+    def put_run_baseline(self, binding: RunBaselineBinding) -> None:
+        calibration = self.get_baseline_calibration(binding.calibration_id)
+        if calibration is None:
+            raise ValueError("run baseline binding references an unknown calibration")
+        evaluation = calibration.evaluation
+        calibration_metrics = {metric.name: metric.value for metric in evaluation.metrics}
+        binding_metrics = {metric.name: metric.value for metric in binding.metrics}
+        if (
+            evaluation.evaluation_id != binding.baseline_evaluation_id
+            or calibration.dataset_manifest_id != binding.dataset_manifest_id
+            or calibration.dataset_manifest_sha256 != binding.dataset_manifest_sha256
+            or calibration.evaluator_id != binding.evaluator_id
+            or calibration.evaluator_sha256 != binding.evaluator_sha256
+            or calibration.split != binding.split
+            or calibration_metrics != binding_metrics
+        ):
+            raise ValueError("run baseline binding does not match its calibration")
+        self._repo.put_run_baseline(binding)
+
+    def get_run_baseline(self, run_id: str) -> RunBaselineBinding | None:
+        return self._repo.get_run_baseline(run_id)
 
     def get_artifact(self, artifact_id: str) -> ArtifactRecord | None:
         return self._repo.get_artifact(artifact_id)
@@ -1296,15 +1329,34 @@ class RepositoryFrontierService:
             EvaluationResult.model_validate(json.loads(raw).get("result", json.loads(raw)))
             for raw in self.repository.list_json("evaluation")
         ]
-        run_id = next(
-            (result.run_id for result in raw_evaluations if result.experiment_id == experiment_id),
+        current_metric_pair = frozenset(("GAUC", "nDCG@5"))
+        current = next(
+            (
+                result
+                for result in reversed(raw_evaluations)
+                if result.experiment_id == experiment_id
+                and result.validation_score == score
+                and frozenset(metric.name for metric in result.metrics) == current_metric_pair
+                and result.run_id is not None
+                and result.dataset_manifest_sha256 is not None
+                and result.split is not None
+            ),
             None,
         )
-        if run_id is None:
+        if current is None:
             return None
+        run_id = current.run_id
         evaluations: list[float] = []
         for result in raw_evaluations:
-            if result.run_id != run_id:
+            if (
+                result.run_id != run_id
+                or result.dataset_manifest_sha256 != current.dataset_manifest_sha256
+                or result.split != current.split
+                or result.evaluator_artifact_id != current.evaluator_artifact_id
+                or result.evaluator_sha256 != current.evaluator_sha256
+                or result.validity != current.validity
+                or frozenset(metric.name for metric in result.metrics) != current_metric_pair
+            ):
                 continue
             spec = self.repository.get_experiment(result.experiment_id)
             execution = None

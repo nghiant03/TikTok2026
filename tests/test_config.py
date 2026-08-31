@@ -4,12 +4,26 @@ import pytest
 from pydantic import ValidationError
 
 from tiktok2026.config import AppSettings, BudgetSettings, ExecutionSettings, ModelSettings
-from tiktok2026.contracts import RuntimePaths
+from tiktok2026.contracts import CURRENT_EVALUATOR_ID, RuntimePaths
 
 
 def test_runtime_root_must_be_outside_repository(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="outside the repository"):
         RuntimePaths.create(tmp_path, tmp_path / ".runtime")
+
+
+def test_production_evaluator_default_is_the_versioned_current_identity() -> None:
+    assert AppSettings.model_fields["evaluator_id"].default == CURRENT_EVALUATOR_ID
+
+
+def test_production_rejects_non_authoritative_evaluator(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="current authoritative evaluator"):
+        AppSettings(
+            repository_root=tmp_path / "repo",
+            runtime_root=tmp_path / "runtime",
+            profile="production",
+            evaluator_id="custom-evaluator",
+        )
 
 
 def test_model_settings_support_common_openai_endpoints() -> None:

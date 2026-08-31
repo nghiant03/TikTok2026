@@ -9,12 +9,17 @@ from tiktok2026.contracts import (
     ArtifactRecord,
     ArtifactRetention,
     AuditEvent,
+    BaselineCalibrationRecord,
+    DiagnosticMetricValue,
+    EvaluationResult,
     EvaluatorIdentity,
     ExperimentRegistryEntry,
     ExperimentSpec,
     Fidelity,
     FinalTestAuthorizationRequest,
     FinalTestRequest,
+    MetricValue,
+    RunBaselineBinding,
     RunRecord,
     SourceRegistration,
 )
@@ -122,6 +127,12 @@ def test_experiment_registry_source_is_bounded_and_reports_total(tmp_path: Path)
         ),
     )
 
+    excluded_entries, excluded_total = repository.list_experiments(
+        limit=1, exclude_experiment_id="exp-1"
+    )
+    assert excluded_entries == ()
+    assert excluded_total == 0
+
 
 def test_audit_event_round_trips(tmp_path: Path) -> None:
     repository = ApplicationRepository(tmp_path / "app.sqlite3")
@@ -136,6 +147,138 @@ def test_audit_event_round_trips(tmp_path: Path) -> None:
     )
     repository.put_audit_event(event)
     assert repository.list_audit_events("run-1") == (event,)
+
+
+def test_baseline_authority_migration_creates_typed_tables(tmp_path: Path) -> None:
+    repository = ApplicationRepository(tmp_path / "app.sqlite3")
+    repository.initialize()
+
+    with sqlite3.connect(repository.database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(authority_run_baseline_bindings)"
+        ).fetchall()
+
+    assert {
+        "authority_baseline_calibrations",
+        "authority_run_baseline_bindings",
+    } <= tables
+    assert any(
+        foreign_key[2] == "authority_baseline_calibrations"
+        for foreign_key in foreign_keys
+    )
+
+
+def test_run_baseline_binding_is_immutable_idempotent_and_audited(tmp_path: Path) -> None:
+    repository = ApplicationRepository(tmp_path / "app.sqlite3")
+    repository.initialize()
+    calibration = BaselineCalibrationRecord(
+        calibration_id="calibration-1",
+        dataset_manifest_id="manifest-1",
+        dataset_manifest_sha256="a" * 64,
+        evaluator_id="provisional-within-user-v2",
+        evaluator_sha256="b" * 64,
+        baseline_source_sha256="c" * 64,
+        config_sha256="d" * 64,
+        prediction_sha256="e" * 64,
+        prediction_artifact_uri="file:///calibration/predictions.json",
+        evaluation=EvaluationResult(
+            evaluation_id="baseline-evaluation-1",
+            experiment_id="baseline",
+            checkpoint_id="baseline-checkpoint",
+            metrics=(
+                MetricValue(name="GAUC", value=0.6674),
+                MetricValue(name="nDCG@5", value=0.5357),
+            ),
+            evaluator_artifact_id="provisional-within-user-v2",
+            evaluator_sha256="b" * 64,
+            prediction_sha256="e" * 64,
+            validity="provisional",
+            dataset_manifest_id="manifest-1",
+            dataset_manifest_sha256="a" * 64,
+            split="valid",
+        ),
+        diagnostic_metrics=(
+            DiagnosticMetricValue(name="GAUC", value=0.6674),
+            DiagnosticMetricValue(name="nDCG@5", value=0.5357),
+            DiagnosticMetricValue(name="primary", value=0.60155),
+        ),
+    )
+    repository.put_baseline_calibration(calibration, "controller", "test")
+    assert repository.list_baseline_calibrations() == (calibration,)
+    with sqlite3.connect(repository.database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM records WHERE kind = 'baseline_calibration'"
+        ).fetchone() == (0,)
+        connection.execute(
+            "DELETE FROM audit_events WHERE event_id = ?",
+            ("baseline-calibrated-calibration-1",),
+        )
+    repository.put_baseline_calibration(calibration, "controller", "test")
+    assert [event.event_type for event in repository.list_audit_events("calibration-1")] == [
+        "baseline_calibrated"
+    ]
+    with pytest.raises(PersistenceConflictError, match="content changed"):
+        repository.put_baseline_calibration(
+            calibration.model_copy(update={"config_sha256": "f" * 64}),
+            "controller",
+            "test",
+        )
+    binding = RunBaselineBinding(
+        run_id="run-1",
+        calibration_id="calibration-1",
+        baseline_evaluation_id="baseline-evaluation-1",
+        dataset_manifest_id="manifest-1",
+        dataset_manifest_sha256="a" * 64,
+        evaluator_id="provisional-within-user-v2",
+        evaluator_sha256="b" * 64,
+        metrics=(
+            MetricValue(name="GAUC", value=0.6674),
+            MetricValue(name="nDCG@5", value=0.5357),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unknown calibration"):
+        repository.put_run_baseline(
+            binding.model_copy(update={"calibration_id": "unknown-calibration"})
+        )
+    with pytest.raises(ValueError, match="does not match its calibration"):
+        repository.put_run_baseline(
+            binding.model_copy(
+                update={"run_id": "run-2", "baseline_evaluation_id": "wrong-evaluation"}
+            )
+        )
+    with pytest.raises(ValueError, match="typed atomic persistence"):
+        repository.put_json(
+            "baseline_calibration", calibration.calibration_id, calibration.model_dump_json()
+        )
+    repository.put_run_baseline(binding)
+    with sqlite3.connect(repository.database) as connection:
+        connection.execute(
+            "DELETE FROM audit_events WHERE event_id = ?",
+            ("baseline-bound-run-1",),
+        )
+    repository.put_run_baseline(binding)
+
+    assert repository.get_run_baseline("run-1") == binding
+    events = repository.list_audit_events("run-1")
+    assert [event.event_type for event in events] == ["baseline_bound"]
+
+    changed = binding.model_copy(
+        update={
+            "metrics": (
+                MetricValue(name="GAUC", value=0.7),
+                MetricValue(name="nDCG@5", value=0.6),
+            )
+        }
+    )
+    with pytest.raises(PersistenceConflictError, match="content changed"):
+        repository.put_run_baseline(changed)
 
 
 def test_authority_records_reject_conflicting_replays(tmp_path: Path) -> None:

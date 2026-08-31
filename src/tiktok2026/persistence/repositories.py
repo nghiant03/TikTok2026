@@ -5,10 +5,12 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from tiktok2026.contracts import (
     ArtifactRecord,
     AuditEvent,
+    BaselineCalibrationRecord,
     BlockerResolution,
     CriterionAssessmentStatus,
     CriterionResolutionClaim,
@@ -22,6 +24,7 @@ from tiktok2026.contracts import (
     ImplementationCriterionAssessment,
     ImplementationValidationAuthority,
     ProvisionalFinalizationRequest,
+    RunBaselineBinding,
     RunRecord,
     SourceRegistration,
     ValidationBlocker,
@@ -70,7 +73,7 @@ class ApplicationRepository:
         self._adopt_legacy_records()
 
     def _adopt_legacy_records(self) -> None:
-        """Copy 001-003 records into append-only authority tables once."""
+        """Copy legacy records into append-only authority tables once."""
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             now = datetime.now(UTC).isoformat()
@@ -125,6 +128,38 @@ class ApplicationRepository:
                             now,
                         ),
                     )
+            # Baseline calibration predates its dedicated authority table in
+            # some runtime databases.  Adopt only this explicitly supported
+            # legacy authority kind; other generic records remain generic.
+            legacy_calibrations = connection.execute(
+                "SELECT record_id, payload_json FROM records "
+                "WHERE kind = 'baseline_calibration' ORDER BY record_id"
+            ).fetchall()
+            for record_id, legacy_payload in legacy_calibrations:
+                record = BaselineCalibrationRecord.model_validate_json(legacy_payload)
+                payload = record.model_dump_json()
+                digest = _content_hash(payload)
+                existing = connection.execute(
+                    "SELECT content_sha256 FROM authority_baseline_calibrations "
+                    "WHERE calibration_id = ?",
+                    (record.calibration_id,),
+                ).fetchone()
+                if existing is not None:
+                    if existing[0] != digest:
+                        raise PersistenceConflictError(
+                            f"baseline calibration {record.calibration_id} conflicts with authority"
+                        )
+                    continue
+                if record_id != record.calibration_id:
+                    raise PersistenceConflictError(
+                        f"legacy baseline calibration {record_id} has mismatched identity"
+                    )
+                connection.execute(
+                    "INSERT INTO authority_baseline_calibrations "
+                    "(calibration_id, payload_json, content_sha256, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (record.calibration_id, payload, digest, now),
+                )
 
     @staticmethod
     def _transition(
@@ -265,7 +300,21 @@ class ApplicationRepository:
                 "INSERT INTO records (kind, record_id, payload_json) VALUES ('transition', ?, ?)",
                 (record_id, payload),
             )
-            self._insert_audit(connection, event)
+            audit = connection.execute(
+                "SELECT payload_json FROM audit_events WHERE event_id = ?",
+                (event.event_id,),
+            ).fetchone()
+            if audit is None:
+                self._insert_audit(connection, event)
+            else:
+                actual = json.loads(audit[0])
+                expected = event.model_dump(mode="json")
+                actual.pop("created_at", None)
+                expected.pop("created_at", None)
+                if actual != expected:
+                    raise PersistenceConflictError(
+                        f"audit event {event.event_id} content changed"
+                    )
 
     def register_artifact(self, record: ArtifactRecord) -> None:
         payload = record.model_dump_json()
@@ -1299,24 +1348,38 @@ class ApplicationRepository:
         return ExperimentSpec.model_validate_json(row[0]) if row else None
 
     def list_experiments(
-        self, limit: int = 50
+        self, limit: int = 50, exclude_experiment_id: str | None = None
     ) -> tuple[tuple[ExperimentRegistryEntry, ...], int]:
         if limit < 1:
             raise ValueError("experiment registry limit must be positive")
         with self._connect() as connection:
-            total = int(
-                connection.execute("SELECT COUNT(*) FROM authority_experiments").fetchone()[0]
-            )
-            rows = connection.execute(
+            where = ""
+            parameters: tuple[object, ...] = (limit,)
+            if exclude_experiment_id is not None:
+                where = "WHERE authority.experiment_id != ? "
+                parameters = (exclude_experiment_id, limit)
+                total = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM authority_experiments AS authority "
+                        "WHERE authority.experiment_id != ?",
+                        (exclude_experiment_id,),
+                    ).fetchone()[0]
+                )
+            else:
+                total = int(
+                    connection.execute("SELECT COUNT(*) FROM authority_experiments").fetchone()[0]
+                )
+            query = (
                 "SELECT authority.spec_json, COALESCE(("
                 "SELECT state.status FROM experiment_states AS state "
                 "WHERE state.experiment_id = authority.experiment_id "
                 "ORDER BY state.sequence DESC LIMIT 1"
                 "), 'proposed') "
                 "FROM authority_experiments AS authority "
-                "ORDER BY authority.created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+                + where
+                + "ORDER BY authority.created_at DESC LIMIT ?"
+            )
+            rows = connection.execute(query, parameters).fetchall()
         entries: list[ExperimentRegistryEntry] = []
         for payload, status in rows:
             value = json.loads(payload)
@@ -1853,11 +1916,225 @@ class ApplicationRepository:
             ).fetchall()
         return tuple(AuditEvent.model_validate_json(row[0]) for row in rows)
 
+    def _ensure_audit_event(
+        self,
+        connection: sqlite3.Connection,
+        event: AuditEvent,
+        *,
+        preserve_existing_actor: bool = False,
+    ) -> None:
+        """Insert an audit event or verify an identical event already exists."""
+        row = connection.execute(
+            "SELECT payload_json FROM audit_events WHERE event_id = ?",
+            (event.event_id,),
+        ).fetchone()
+        if row is None:
+            self._insert_audit(connection, event)
+            return
+        actual = json.loads(row[0])
+        expected = event.model_dump(mode="json")
+        # Persistence timestamps are not identity.  This permits an
+        # interrupted write to repair its audit row on an identical replay.
+        actual.pop("created_at", None)
+        expected.pop("created_at", None)
+        if preserve_existing_actor:
+            actual.pop("actor_type", None)
+            actual.pop("actor_id", None)
+            expected.pop("actor_type", None)
+            expected.pop("actor_id", None)
+        if actual != expected:
+            raise PersistenceConflictError(f"audit event {event.event_id} content changed")
+
+    @staticmethod
+    def _baseline_calibration_event(
+        record: BaselineCalibrationRecord,
+        actor_type: Literal["agent", "controller", "human"],
+        actor_id: str,
+        now: str,
+    ) -> AuditEvent:
+        return AuditEvent(
+            event_id=f"baseline-calibrated-{record.calibration_id}",
+            run_id=record.calibration_id,
+            event_type="baseline_calibrated",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            payload={
+                "calibration_id": record.calibration_id,
+                "dataset_manifest_id": record.dataset_manifest_id,
+                "dataset_manifest_sha256": record.dataset_manifest_sha256,
+                "evaluator_id": record.evaluator_id,
+                "evaluator_sha256": record.evaluator_sha256,
+                "baseline_source_sha256": record.baseline_source_sha256,
+                "config_sha256": record.config_sha256,
+                "split": record.split,
+            },
+            created_at=datetime.fromisoformat(now),
+        )
+
+    def list_baseline_calibrations(self) -> tuple[BaselineCalibrationRecord, ...]:
+        """List typed calibrations, with a narrow legacy generic fallback."""
+        with self._connect() as connection:
+            typed_rows = connection.execute(
+                "SELECT calibration_id, payload_json "
+                "FROM authority_baseline_calibrations ORDER BY created_at, calibration_id"
+            ).fetchall()
+            legacy_rows = connection.execute(
+                "SELECT record_id, payload_json FROM records "
+                "WHERE kind = 'baseline_calibration' ORDER BY record_id"
+            ).fetchall()
+        records = [
+            BaselineCalibrationRecord.model_validate_json(payload)
+            for _calibration_id, payload in typed_rows
+        ]
+        typed_ids = {record.calibration_id for record in records}
+        records.extend(
+            record
+            for record_id, payload in legacy_rows
+            if record_id not in typed_ids
+            for record in (BaselineCalibrationRecord.model_validate_json(payload),)
+        )
+        return tuple(records)
+
+    def put_baseline_calibration(
+        self,
+        record: BaselineCalibrationRecord,
+        actor_type: Literal["agent", "controller", "human"],
+        actor_id: str,
+    ) -> None:
+        """Atomically persist an immutable calibration and its audit event."""
+        payload = record.model_dump_json()
+        digest = _content_hash(payload)
+        now = datetime.now(UTC).isoformat()
+        event = self._baseline_calibration_event(record, actor_type, actor_id, now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT content_sha256 FROM authority_baseline_calibrations "
+                "WHERE calibration_id = ?",
+                (record.calibration_id,),
+            ).fetchone()
+            if existing is not None and existing[0] != digest:
+                raise PersistenceConflictError(
+                    f"baseline calibration {record.calibration_id} content changed"
+                )
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO authority_baseline_calibrations "
+                    "(calibration_id, payload_json, content_sha256, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (record.calibration_id, payload, digest, now),
+                )
+            self._ensure_audit_event(connection, event, preserve_existing_actor=True)
+
+    def get_run_baseline(self, run_id: str) -> RunBaselineBinding | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM authority_run_baseline_bindings "
+                "WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return RunBaselineBinding.model_validate_json(row[0]) if row else None
+
+    def put_run_baseline(
+        self,
+        binding: RunBaselineBinding,
+        actor_type: Literal["agent", "controller", "human"] = "controller",
+        actor_id: str = "production-operations",
+    ) -> None:
+        """Persist one immutable run binding and its audit event atomically."""
+        payload = binding.model_dump_json()
+        event = AuditEvent(
+            event_id=f"baseline-bound-{binding.run_id}",
+            run_id=binding.run_id,
+            event_type="baseline_bound",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            payload={
+                "run_id": binding.run_id,
+                "calibration_id": binding.calibration_id,
+                "baseline_evaluation_id": binding.baseline_evaluation_id,
+                "dataset_manifest_id": binding.dataset_manifest_id,
+                "dataset_manifest_sha256": binding.dataset_manifest_sha256,
+                "evaluator_id": binding.evaluator_id,
+                "evaluator_sha256": binding.evaluator_sha256,
+                "split": binding.split,
+                "metrics": binding.model_dump(mode="json")["metrics"],
+            },
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT content_sha256 FROM authority_run_baseline_bindings "
+                "WHERE run_id = ?",
+                (binding.run_id,),
+            ).fetchone()
+            if existing is not None and existing[0] != _content_hash(payload):
+                raise PersistenceConflictError(
+                    f"run baseline binding {binding.run_id} content changed"
+                )
+            calibration = connection.execute(
+                "SELECT payload_json FROM authority_baseline_calibrations "
+                "WHERE calibration_id = ?",
+                (binding.calibration_id,),
+            ).fetchone()
+            if calibration is None:
+                raise ValueError("run baseline binding references an unknown calibration")
+            calibration_record = BaselineCalibrationRecord.model_validate_json(calibration[0])
+            calibration_metrics = {
+                metric.name: metric.value for metric in calibration_record.evaluation.metrics
+            }
+            binding_metrics = {metric.name: metric.value for metric in binding.metrics}
+            if (
+                calibration_record.evaluation.evaluation_id
+                != binding.baseline_evaluation_id
+                or calibration_record.dataset_manifest_id != binding.dataset_manifest_id
+                or calibration_record.dataset_manifest_sha256
+                != binding.dataset_manifest_sha256
+                or calibration_record.evaluator_id != binding.evaluator_id
+                or calibration_record.evaluator_sha256 != binding.evaluator_sha256
+                or calibration_record.split != binding.split
+                or calibration_metrics != binding_metrics
+            ):
+                raise ValueError("run baseline binding does not match its calibration")
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO authority_run_baseline_bindings "
+                    "(run_id, calibration_id, payload_json, content_sha256, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        binding.run_id,
+                        binding.calibration_id,
+                        payload,
+                        _content_hash(payload),
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+            self._ensure_audit_event(connection, event)
+
+    def get_baseline_calibration(self, calibration_id: str) -> BaselineCalibrationRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM authority_baseline_calibrations "
+                "WHERE calibration_id = ?",
+                (calibration_id,),
+            ).fetchone()
+            if row is None:
+                row = connection.execute(
+                    "SELECT payload_json FROM records "
+                    "WHERE kind = 'baseline_calibration' AND record_id = ?",
+                    (calibration_id,),
+                ).fetchone()
+        return BaselineCalibrationRecord.model_validate_json(row[0]) if row else None
+
     def put_json(self, kind: str, record_id: str, payload_json: str) -> None:
         """Compatibility store for non-authority artifacts.
 
-        Authority records use their typed methods above and cannot be updated here.
+        Authority records cannot be updated through this generic seam.
         """
+        if kind == "baseline_calibration":
+            raise ValueError("baseline calibration requires typed atomic persistence")
+        if kind == "run_baseline_binding":
+            raise ValueError("run baseline binding requires typed atomic persistence")
         if kind in {
             "experiment",
             "source_registration",
@@ -1883,6 +2160,8 @@ class ApplicationRepository:
                 )
 
     def list_json(self, kind: str) -> tuple[str, ...]:
+        if kind == "baseline_calibration":
+            return tuple(record.model_dump_json() for record in self.list_baseline_calibrations())
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT payload_json FROM records WHERE kind = ? ORDER BY record_id", (kind,)

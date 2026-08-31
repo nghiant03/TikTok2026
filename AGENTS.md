@@ -11,7 +11,7 @@ Build an autonomous recommender-system research controller that can form, implem
 - LangGraph coordinates typed state transitions. It is not the research database or artifact store.
 - Runtime agents communicate through contracts in `src/tiktok2026/contracts`; do not use free-form agent-to-agent protocols for authoritative data.
 - `baseline/README.md`, `baseline/data.py`, `baseline/evaluate.py`, `baseline/submit.py`, and `baseline/baseline_scores.json` are protected reference files. Never modify them during experiments.
-- The judging metric contract is NDCG@10 and Recall@50. The current Starter Kit evaluator uses conflicting metrics and is diagnostic only. Provisional results must never be labeled official.
+- The judging metric contract is GAUC and nDCG@5, with their arithmetic mean as the primary score. The repository evaluator remains provisional; provisional results must never be labeled official.
 - Test data is unavailable to agents. A controller-only test evaluation may occur once after convergence and must not route later research decisions.
 - Do not encode recommender recipes, fixed model sequences, or technique-specific experiment tools in infrastructure.
 - Agents receive least-privilege tool sets in code, not merely prompt instructions.
