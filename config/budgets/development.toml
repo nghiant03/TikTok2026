@@ -1,8 +1,49 @@
+dataset_root = ""
+docker_image = ""
+
+[execution]
+memory_bytes = 4294967296
+timeout_seconds = 900
+cpus = 1.0
+gpu_count = 1
+
 [budget]
 gpu_hours = 1.0
 wall_clock_seconds = 7200
-tokens = 200000
+tokens = 1000000
 disk_bytes = 21474836480
 reserved_final_gpu_hours = 0.25
 frontier_capacity = 4
-max_repairs = 2
+max_repairs = 3
+
+[models.orchestration]
+base_url = "http://127.0.0.1:4000/v1"
+model = "tiktok2026-orchestration"
+api_key_env = "LITELLM_API_KEY"
+temperature = 0.0
+max_tokens = 4096
+timeout_seconds = 180.0
+
+[models.research]
+base_url = "http://127.0.0.1:4000/v1"
+model = "tiktok2026-research"
+api_key_env = "LITELLM_API_KEY"
+temperature = 0.0
+max_tokens = 8192
+timeout_seconds = 600.0
+
+[models.implementor]
+base_url = "http://127.0.0.1:4000/v1"
+model = "tiktok2026-implementor"
+api_key_env = "LITELLM_API_KEY"
+temperature = 0.0
+max_tokens = 8192
+timeout_seconds = 600.0
+
+[models.validator]
+base_url = "http://127.0.0.1:4000/v1"
+model = "tiktok2026-validator"
+api_key_env = "LITELLM_API_KEY"
+temperature = 0.0
+max_tokens = 8192
+timeout_seconds = 600.0
