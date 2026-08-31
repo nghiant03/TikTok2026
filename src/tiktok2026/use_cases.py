@@ -232,6 +232,7 @@ class ServiceTransitions:
     smoke_disk_bytes: int = 64 * 1024 * 1024
     dataset_view_provenance: Callable[[ExecutionRequest], DatasetViewProvenance] | None = None
     max_repairs: int = 3
+    min_pending_proposals: int = 3
     requires_run_baseline: bool = False
     plateau_epsilon: float = 0.002
     plateau_patience: int = 3
@@ -584,7 +585,11 @@ def _research(s: ServiceTransitions) -> Transition:
                 else 0 if is_new_experiment else state["repair_attempts"]
             ),
             "terminal_reason": None,
-            "pending_route": "proposal_policy",
+            "pending_route": (
+                "orchestrate"
+                if getattr(s, "min_pending_proposals", 1) > 1
+                else "proposal_policy"
+            ),
         }
 
     return transition
