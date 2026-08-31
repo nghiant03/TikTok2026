@@ -1527,6 +1527,25 @@ class ResearchRequest(ContractModel):
     controller_context: ControllerContext | None = None
     unresolved_blockers: tuple[ValidationBlockerContext, ...] = ()
 
+class ProposalSummary(ContractModel):
+    """A proposed-but-not-yet-run experiment, shown to the orchestration agent."""
+
+    experiment_id: str
+    hypothesis: str
+    mechanism: str
+    implementation_scope: tuple[str, ...] = ()
+    parent_experiment_id: str | None = None
+
+
+class OutcomeSummary(ContractModel):
+    """A completed experiment outcome, part of the history the agent ranks with."""
+
+    experiment_id: str
+    hypothesis: str
+    primary_score: float | None = None
+    delta_vs_parent: float | None = None
+    terminal: Literal["scored", "failed"] = "scored"
+    failure_summary: str | None = None
 
 class OrchestrationRequest(ContractModel):
     """Controller-owned feasible choices and bounded lifecycle evidence."""
@@ -1541,6 +1560,10 @@ class OrchestrationRequest(ContractModel):
     finalization_ready: bool = False
     failure_summary: str | None = None
     controller_context: ControllerContext | None = None
+    pending_proposals: tuple[ProposalSummary, ...] = ()
+    outcome_history: tuple[OutcomeSummary, ...] = ()
+    champion_experiment_id: str | None = None
+    champion_score: float | None = None
 
 
 class ArtifactRecord(ContractModel):
