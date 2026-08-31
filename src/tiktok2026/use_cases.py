@@ -42,7 +42,9 @@ from tiktok2026.contracts import (
     ImplementationValidationAuthority,
     OrchestrationDecision,
     OrchestrationRequest,
+    OutcomeSummary,
     PolicyGate,
+    ProposalSummary,
     ProvenanceRequest,
     ProvisionalFinalizationRequest,
     ResearchDecision,
@@ -439,6 +441,8 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
         if client is None:
             return {"pending_route": "research"}
         evaluated_candidate_ready = _evaluated_candidate_ready(s, state)
+        pending = _pending_proposals(s, state["run_id"])
+        history = _outcome_history(s, state["run_id"])
         allowed_actions = (DecisionAction.RESEARCH,)
         if evaluated_candidate_ready:
             allowed_actions = (
@@ -447,6 +451,8 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
                 DecisionAction.INCREASE_FIDELITY,
                 DecisionAction.REVISIT_BRANCH,
             )
+        if pending:
+            allowed_actions = (*allowed_actions, DecisionAction.IMPLEMENT)
         request = OrchestrationRequest(
             request_id=f"orchestration-{state['run_id']}-{state['state_version']}",
             run_id=state["run_id"],
@@ -458,6 +464,8 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
             finalization_ready=False,
             failure_summary=state.get("terminal_reason"),
             controller_context=_controller_context(s),
+            pending_proposals=pending,
+            outcome_history=history,
         )
         response = await client.invoke(request)
         if isinstance(response, AgentFailure):
@@ -470,9 +478,33 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
                 FailureKind.SCHEMA_MISMATCH,
                 f"orchestration selected disallowed action: {response.action.value}",
             )
+        pending_ids = {p.experiment_id for p in pending}
+        if response.action == DecisionAction.IMPLEMENT:
+            if s.run_store is None or response.target_experiment_id not in pending_ids:
+                return _failure(
+                    state,
+                    FailureKind.SCHEMA_MISMATCH,
+                    "orchestration selected an unknown proposal",
+                )
+            chosen = s.run_store.get_experiment(response.target_experiment_id)
+            if chosen is None:
+                return _failure(
+                    state,
+                    FailureKind.SCHEMA_MISMATCH,
+                    "selected proposal is not persisted",
+                )
+            return {
+                "orchestration_decision_id": response.decision_id,
+                "current_experiment_id": chosen.experiment_id,
+                "current_hypothesis_id": chosen.hypothesis_id,
+                "repair_attempts": 0,
+                "terminal_reason": None,
+                "pending_route": "proposal_policy",
+            }
         if (
             response.target_experiment_id is not None
             and response.target_experiment_id != request.current_experiment_id
+            and response.target_experiment_id not in pending_ids
         ):
             return _failure(
                 state,
@@ -718,6 +750,54 @@ def _resource_feasibility_escalated(
         typed_getter(experiment_id, ImplementationCriterionId.RESOURCE_FEASIBILITY)
     ) >= 2
 
+def _pending_proposals(s: ServiceTransitions, run_id: str) -> tuple[ProposalSummary, ...]:
+    if s.run_store is None:
+        return ()
+    lister = getattr(s.run_store, "list_experiments_by_status", None)
+    if lister is None:
+        return ()
+    attempted: set[str] = set()
+    obs_lister = getattr(s.run_store, "list_scored_observations", None)
+    if obs_lister is not None:
+        attempted = {o.experiment_id for o in obs_lister(run_id)}
+    return tuple(
+        ProposalSummary(
+            experiment_id=x.experiment_id,
+            hypothesis=x.hypothesis,
+            mechanism=x.mechanism,
+            implementation_scope=x.implementation_scope,
+            parent_experiment_id=x.parent_experiment_id,
+        )
+        for x in lister(run_id, "proposed")
+        if x.experiment_id not in attempted
+    )
+
+
+def _outcome_history(s: ServiceTransitions, run_id: str) -> tuple[OutcomeSummary, ...]:
+    if s.run_store is None:
+        return ()
+    obs_lister = getattr(s.run_store, "list_scored_observations", None)
+    if obs_lister is None:
+        return ()
+    out: list[OutcomeSummary] = []
+    scores: dict[str, float] = {}
+    for o in obs_lister(run_id):
+        spec = s.run_store.get_experiment(o.experiment_id)
+        scores[o.experiment_id] = o.primary_score
+        parent = spec.parent_experiment_id if spec is not None else None
+        out.append(
+            OutcomeSummary(
+                experiment_id=o.experiment_id,
+                hypothesis=spec.hypothesis if spec is not None else "",
+                primary_score=o.primary_score,
+                delta_vs_parent=(
+                    round(o.primary_score - scores[parent], 6)
+                    if parent is not None and parent in scores
+                    else None
+                ),
+            )
+        )
+    return tuple(out)
 
 def _controller_context(
     s: ServiceTransitions,

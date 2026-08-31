@@ -2811,6 +2811,18 @@ class ApplicationRepository:
                 ).fetchone()
         return ExperimentSpec.model_validate_json(row[0]) if row else None
 
+    def list_experiments_by_status(
+        self, run_id: str, status: str
+    ) -> tuple[ExperimentSpec, ...]:
+        """Return persisted experiment specs with the given status (run-scoped DB)."""
+        del run_id  # experiments table is per-run; kept for API symmetry
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT spec_json FROM experiments WHERE status = ? ORDER BY created_at",
+                (status,),
+            ).fetchall()
+        return tuple(ExperimentSpec.model_validate_json(row[0]) for row in rows)
+
     def list_experiments(
         self, limit: int = 50, exclude_experiment_id: str | None = None
     ) -> tuple[tuple[ExperimentRegistryEntry, ...], int]:
