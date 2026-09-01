@@ -3,8 +3,8 @@ base_url = "https://hyper.charm.land/v1"
 model = "glm-5.2"
 api_key_env = "HYPER_API_KEY"
 temperature = 0.0
-max_tokens = 4096
-timeout_seconds = 180.0
+max_tokens = 16384
+timeout_seconds = 600.0
 reasoning_effort = "high"
 
 [models.research]
@@ -12,8 +12,8 @@ base_url = "https://hyper.charm.land/v1"
 model = "glm-5.2"
 api_key_env = "HYPER_API_KEY"
 temperature = 0.0
-max_tokens = 8192
-timeout_seconds = 600.0
+max_tokens = 32768
+timeout_seconds = 1800.0
 reasoning_effort = "high"
 
 [models.implementor]
@@ -21,13 +21,13 @@ base_url = "https://hyper.charm.land/v1"
 model = "kimi-k2.7-code"
 api_key_env = "HYPER_API_KEY"
 temperature = 0.0
-max_tokens = 16384
-timeout_seconds = 600.0
+max_tokens = 32768
+timeout_seconds = 1800.0
 
 [models.validator]
 base_url = "https://hyper.charm.land/v1"
 model = "qwen-3.8-max"
 api_key_env = "HYPER_API_KEY"
 temperature = 0.0
-max_tokens = 4096
-timeout_seconds = 600.0
+max_tokens = 32768
+timeout_seconds = 1800.0

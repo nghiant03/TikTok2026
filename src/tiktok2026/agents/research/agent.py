@@ -31,6 +31,15 @@ class ResearchAgent:
                 repair_attempts=0,
             )
         evidence_ids = {item.evidence_id for item in evidence}
+        if request.source_context is not None:
+            evidence_ids.add(request.source_context.evidence_id)
+        if request.experiment_history is not None:
+            evidence_ids.add(request.experiment_history.evidence_id)
+        if request.controller_context is not None:
+            if request.controller_context.experiment_registry is not None:
+                evidence_ids.add(request.controller_context.experiment_registry.evidence_id)
+            if request.controller_context.dataset_context is not None:
+                evidence_ids.add(request.controller_context.dataset_context.evidence_id)
         user = json.dumps(
             {
                 "request": request.model_dump(mode="json"),

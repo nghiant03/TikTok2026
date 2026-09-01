@@ -487,8 +487,8 @@ class ImplementationRequest(ContractModel):
     repair_feedback: str | None = None
     unresolved_blocker_ids: tuple[str, ...] = ()
     unresolved_blockers: tuple[ValidationBlockerContext, ...] = ()
-    source_context: dict[str, str] = {}
-    base_source_context: dict[str, str] = {}
+    source_context: dict[str, object] = {}
+    base_source_context: dict[str, object] = {}
     execution_entrypoint: tuple[str, ...] = (
         "python",
         "-m",
@@ -1522,11 +1522,37 @@ class ExperimentExecutionContract(ContractModel):
         return self.optional_dataset_hash_arguments
 
 
+class DatasetFileContext(ContractModel):
+    """Bounded train/valid file schema exposed without dataset rows."""
+
+    relative_path: Annotated[str, Field(min_length=1, max_length=512)]
+    split: Literal["train", "valid"]
+    columns: Annotated[
+        tuple[Annotated[str, Field(min_length=1, max_length=256)], ...], Field(max_length=256)
+    ]
+
+
+class DatasetContext(ContractModel):
+    """Controller-verified train/valid schema available to planning roles."""
+
+    schema_version: Literal["1"] = "1"
+    evidence_id: Annotated[str, Field(min_length=1, max_length=256)]
+    manifest_id: Annotated[str, Field(min_length=1, max_length=256)]
+    manifest_sha256: Sha256
+    row_identity_columns: Annotated[tuple[str, ...], Field(min_length=1, max_length=16)]
+    user_id_column: Annotated[str, Field(min_length=1, max_length=256)]
+    item_id_column: Annotated[str, Field(min_length=1, max_length=256)]
+    label_column: Annotated[str, Field(min_length=1, max_length=256)]
+    non_label_feature_columns: Annotated[tuple[str, ...], Field(max_length=256)] = ()
+    files: Annotated[tuple[DatasetFileContext, ...], Field(max_length=64)] = ()
+
+
 class ControllerContext(ContractModel):
     """Controller-owned facts agents may reference but must not redefine."""
 
     schema_version: Literal["1"] = "1"
     dataset_manifest_identity: DatasetManifestIdentity | None = None
+    dataset_context: DatasetContext | None = None
     evaluator_identity: EvaluatorIdentity | None = None
     judging_metrics: tuple[Literal["GAUC", "nDCG@5"], ...] = (
         "GAUC",
@@ -1546,6 +1572,13 @@ class ControllerContext(ContractModel):
     def validate_judging_metrics(self) -> ControllerContext:
         if self.judging_metrics != ("GAUC", "nDCG@5"):
             raise ValueError("controller context requires judging metrics in current order")
+        if self.dataset_context is not None and (
+            self.dataset_manifest_identity is None
+            or self.dataset_context.manifest_id != self.dataset_manifest_identity.manifest_id
+            or self.dataset_context.manifest_sha256
+            != self.dataset_manifest_identity.manifest_sha256
+        ):
+            raise ValueError("dataset context must match the manifest identity")
         return self
 
 
@@ -1577,6 +1610,12 @@ class ProposalSummary(ContractModel):
     experiment_id: Annotated[str, Field(min_length=1, max_length=256)]
     hypothesis: Annotated[str, Field(max_length=2_000)]
     mechanism: Annotated[str, Field(max_length=2_000)]
+    motivation: Annotated[str, Field(max_length=2_000)] = ""
+    expected_signal: Annotated[str, Field(max_length=2_000)] = ""
+    success_criteria: Annotated[str, Field(max_length=2_000)] = ""
+    failure_criteria: Annotated[str, Field(max_length=2_000)] = ""
+    fidelity: Fidelity = Fidelity.FULL
+    implementation_resource_estimate: ImplementationResourceEstimate | None = None
     implementation_scope: Annotated[
         tuple[Annotated[str, Field(max_length=256)], ...], Field(max_length=16)
     ] = ()
@@ -1589,6 +1628,8 @@ class OutcomeSummary(ContractModel):
     experiment_id: Annotated[str, Field(min_length=1, max_length=256)]
     hypothesis: Annotated[str, Field(max_length=2_000)]
     primary_score: float | None = None
+    gauc: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
+    ndcg_at_5: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
     delta_vs_parent: float | None = None
     terminal: Literal["scored", "failed"] = "scored"
     failure_summary: Annotated[str, Field(max_length=2_000)] | None = None
@@ -1632,11 +1673,34 @@ class ResearchRequest(ContractModel):
     objective: str
     resource_state: ResourceState
     parent_experiment_id: str | None = None
+    proposal_mode: Literal["candidate_generation", "selected_refinement"] | None = None
+    proposal_batch_size: Annotated[int, Field(ge=3, le=50)] | None = None
+    proposals_needed: Annotated[int, Field(ge=0, le=50)] | None = None
     allowed_paths: tuple[str, ...] = ("src/tiktok2026/experiment",)
     controller_context: ControllerContext | None = None
     unresolved_blockers: tuple[ValidationBlockerContext, ...] = ()
     source_context: SourceContext | None = None
     experiment_history: ExperimentHistoryContext | None = None
+    selected_experiment: ExperimentSpec | None = None
+    latest_evaluation_result: EvaluationResult | None = None
+
+    @model_validator(mode="after")
+    def validate_proposal_operation(self) -> ResearchRequest:
+        if self.proposal_mode is None:
+            return self
+        if self.proposal_batch_size is None or self.proposals_needed is None:
+            raise ValueError("proposal operations require batch size and remaining count")
+        if self.proposal_mode == "candidate_generation":
+            if self.parent_experiment_id is not None or self.selected_experiment is not None:
+                raise ValueError("candidate generation cannot select a proposal to refine")
+            return self
+        if (
+            self.selected_experiment is None
+            or self.parent_experiment_id != self.selected_experiment.experiment_id
+            or self.proposals_needed != 1
+        ):
+            raise ValueError("selected refinement must bind exactly one parent proposal")
+        return self
 
 
 class OrchestrationRequest(ContractModel):

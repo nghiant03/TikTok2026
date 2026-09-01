@@ -38,6 +38,8 @@ from tiktok2026.contracts import (
     BaselineCalibrationRecord,
     ContractModel,
     CriterionAssessmentStatus,
+    DatasetContext,
+    DatasetFileContext,
     DatasetManifestIdentity,
     DatasetViewProvenance,
     DatasetViewRow,
@@ -1722,6 +1724,7 @@ def build_production_services(settings: Any) -> ProductionServices:
     )
     dataset_registry: dict[str, Any] = {}
     dataset_provider: Any = None
+    dataset_context: DatasetContext | None = None
     if app_settings.dataset_root is not None:
         manifest_path = app_settings.dataset_root / "manifest.json"
         if manifest_path.is_file():
@@ -1735,12 +1738,31 @@ def build_production_services(settings: Any) -> ProductionServices:
             verified = verify_dataset_manifest(
                 manifest, app_settings.dataset_root, splits={"train", "valid"}
             )
+            manifest_sha256 = canonical_manifest_sha256(manifest)
             dataset_registry[manifest.manifest_id] = verified
             dataset_provider = AuthorizedTrainingDatasetProvider(verified.training_view())
+            dataset_context = DatasetContext(
+                evidence_id=f"dataset-context-{manifest_sha256[:24]}",
+                manifest_id=manifest.manifest_id,
+                manifest_sha256=manifest_sha256,
+                row_identity_columns=manifest.row_identity_columns,
+                user_id_column=manifest.user_id_column,
+                item_id_column=manifest.item_id_column,
+                label_column=manifest.label_column,
+                non_label_feature_columns=manifest.non_label_feature_columns,
+                files=tuple(
+                    DatasetFileContext(
+                        relative_path=file.path,
+                        split=cast(Literal["train", "valid"], file.split),
+                        columns=file.columns,
+                    )
+                    for file in verified.verified_files
+                ),
+            )
             run_store.put_dataset_manifest_identity(
                 DatasetManifestIdentity(
                     manifest_id=manifest.manifest_id,
-                    manifest_sha256=canonical_manifest_sha256(manifest),
+                    manifest_sha256=manifest_sha256,
                 )
             )
     worktree_manager = GitWorktreeManager(
@@ -1814,6 +1836,7 @@ def build_production_services(settings: Any) -> ProductionServices:
         dataset_view_provenance=(
             dataset_provider.provenance if dataset_provider is not None else None
         ),
+        dataset_context=dataset_context,
         evaluator_id=app_settings.evaluator_id,
         docker_image=app_settings.docker_image,
         default_timeout_seconds=app_settings.execution.timeout_seconds,
@@ -2062,6 +2085,18 @@ class _ScriptedAgent:
 
     async def invoke(self, request: ContractModel) -> ContractModel:
         if isinstance(request, OrchestrationRequest):
+            pending = (
+                request.experiment_history.pending_proposals
+                if request.experiment_history is not None
+                else ()
+            )
+            if DecisionAction.IMPLEMENT in request.allowed_actions and pending:
+                return OrchestrationDecision(
+                    decision_id=f"decision-{request.request_id}",
+                    action=DecisionAction.IMPLEMENT,
+                    target_experiment_id=pending[0].experiment_id,
+                    rationale="fixture selects one controller-authorized candidate",
+                )
             return OrchestrationDecision(
                 decision_id=f"decision-{request.request_id}",
                 action=DecisionAction.RESEARCH,

@@ -22,6 +22,8 @@ from tiktok2026.contracts import (
     ContractModel,
     CriterionAssessmentStatus,
     CriterionResolutionClaim,
+    DatasetContext,
+    DatasetFileContext,
     DatasetManifestIdentity,
     DatasetViewProvenance,
     DatasetViewRow,
@@ -34,6 +36,7 @@ from tiktok2026.contracts import (
     ExperimentRegistrySnapshot,
     ExperimentSpec,
     FailureKind,
+    FailureRecord,
     Fidelity,
     FullAttemptClaimRequest,
     FullScientificAttemptClaim,
@@ -330,6 +333,13 @@ class _FakeStore:
     def put_failure(self, record: object, run_id: str) -> None:
         del run_id
         self.failures.append(record)
+
+    def list_failure_records(self, run_id: str) -> tuple[FailureRecord, ...]:
+        return tuple(
+            record
+            for record in self.failures
+            if isinstance(record, FailureRecord) and record.run_id == run_id
+        )
 
     def put_json(self, kind: str, record_id: str, payload_json: str) -> None:
         key = (kind, record_id)
@@ -788,7 +798,7 @@ async def test_proposal_validation_reuses_research_registry_identity() -> None:
     assert validation_registry["evidence_id"] == research_registry.evidence_id
 
 
-async def test_repairable_proposal_returns_to_research_with_feedback() -> None:
+async def test_rejected_proposal_returns_to_research_with_feedback() -> None:
     store = _FakeStore()
     store.experiments["exp-1"] = _experiment(("src/tiktok2026/experiment",))
     agent = _ScriptedAgentClient(
@@ -797,7 +807,7 @@ async def test_repairable_proposal_returns_to_research_with_feedback() -> None:
                 report_id="report-1",
                 experiment_id="exp-1",
                 stage=ValidationStage.PROPOSAL,
-                verdict=ValidationVerdict.REPAIRABLE,
+                verdict=ValidationVerdict.REJECTED,
                 blockers=("tighten the success criterion",),
                 leakage_risk="none",
             )
@@ -861,11 +871,15 @@ async def test_proposal_repair_passes_authoritative_blocker_context_to_research(
     request = researcher.calls[0]
     assert isinstance(request, ResearchRequest)
     assert request.parent_experiment_id == "exp-1"
+    assert request.proposal_mode == "selected_refinement"
+    assert request.proposals_needed == 1
+    assert request.selected_experiment == store.experiments["exp-1"]
     assert len(request.unresolved_blockers) == 1
     assert request.unresolved_blockers[0].text == "tighten the success criterion"
     assert request.unresolved_blockers[0].evidence_refs == ("evidence-1",)
     assert result["current_experiment_id"] == "exp-2"
     assert result["repair_attempts"] == 1
+    assert result["pending_route"] == "proposal_policy"
 
 
 async def test_proposal_repair_rejects_changed_content_under_same_identity() -> None:
@@ -1386,7 +1400,7 @@ class _MultiProposalStore(_FakeStore):
 
 
 def _proposal(experiment_id: str, hypothesis: str) -> ExperimentSpec:
-    return _experiment(("src/tiktok2026/experiment",)).model_copy(
+    return _estimated_experiment(("src/tiktok2026/experiment",)).model_copy(
         update={
             "experiment_id": experiment_id,
             "hypothesis_id": f"hyp-{experiment_id}",
@@ -1395,11 +1409,153 @@ def _proposal(experiment_id: str, hypothesis: str) -> ExperimentSpec:
     )
 
 
+async def test_research_accumulates_three_proposals_before_orchestration_selection() -> None:
+    store = _MultiProposalStore()
+    proposals = tuple(
+        _estimated_experiment(("src/tiktok2026/experiment",)).model_copy(
+            update={
+                "experiment_id": f"exp-{index}",
+                "hypothesis_id": f"hyp-{index}",
+                "hypothesis": f"distinct hypothesis {index}",
+            }
+        )
+        for index in range(1, 4)
+    )
+    agent = _ScriptedAgentClient(
+        [
+            *(
+                ResearchDecision(
+                    request_id=f"research-{index}",
+                    kind="proposal",
+                    experiment_spec=proposal,
+                    message="fresh candidate",
+                )
+                for index, proposal in enumerate(proposals, 1)
+            ),
+            OrchestrationDecision(
+                decision_id="select-exp-2",
+                action=DecisionAction.IMPLEMENT,
+                target_experiment_id="exp-2",
+                rationale="best bounded candidate",
+            ),
+        ]
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=agent))
+    state = minimal_state(phase=RunPhase.RESEARCH)
+
+    first = await controller.research(state)
+    second_state = cast(ProductionState, state | first)
+    second = await controller.research(second_state)
+    third_state = cast(ProductionState, second_state | second)
+    third = await controller.research(third_state)
+    selection_state = cast(ProductionState, third_state | third)
+    selection = await controller.orchestrate(selection_state)
+
+    assert first["pending_route"] == "research"
+    assert second["pending_route"] == "research"
+    assert third["pending_route"] == "orchestrate"
+    assert selection["pending_route"] == "proposal_policy"
+    assert selection["current_experiment_id"] == "exp-2"
+    research_requests = agent.calls[:3]
+    assert all(isinstance(request, ResearchRequest) for request in research_requests)
+    assert [request.proposals_needed for request in research_requests] == [3, 2, 1]
+    orchestration_request = agent.calls[3]
+    assert isinstance(orchestration_request, OrchestrationRequest)
+    assert orchestration_request.allowed_actions == (DecisionAction.IMPLEMENT,)
+    assert orchestration_request.experiment_history is not None
+    assert orchestration_request.experiment_history.total_pending_proposals == 3
+
+
+async def test_orchestration_cannot_select_before_three_proposals() -> None:
+    store = _MultiProposalStore()
+    store.experiments["exp-a"] = _proposal("exp-a", "pairwise loss")
+    store.experiments["exp-b"] = _proposal("exp-b", "bigger embeddings")
+    agent = _ScriptedAgentClient(
+        [
+            OrchestrationDecision(
+                decision_id="request-third",
+                action=DecisionAction.RESEARCH,
+                rationale="candidate batch is incomplete",
+            )
+        ]
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=agent))
+
+    result = await controller.orchestrate(minimal_state(phase=RunPhase.RESEARCH))
+
+    assert result["pending_route"] == "research"
+    request = agent.calls[0]
+    assert isinstance(request, OrchestrationRequest)
+    assert request.allowed_actions == (DecisionAction.RESEARCH,)
+
+
+async def test_orchestration_history_preserves_both_judging_metrics() -> None:
+    store = _MultiProposalStore()
+    store.experiments["exp-scored"] = _proposal("exp-scored", "scored hypothesis")
+    store.evaluations.append(
+        EvaluationResult(
+            evaluation_id="eval-scored",
+            run_id="test-run",
+            experiment_id="exp-scored",
+            checkpoint_id="checkpoint-scored",
+            metrics=(
+                MetricValue(name="GAUC", value=0.61),
+                MetricValue(name="nDCG@5", value=0.73),
+            ),
+            evaluator_artifact_id="evaluator-1",
+            evaluator_sha256="a" * 64,
+            prediction_sha256="b" * 64,
+            dataset_manifest_id="manifest-1",
+            dataset_manifest_sha256="c" * 64,
+            validity="provisional",
+        )
+    )
+    store.observations["observation-scored"] = ScoredObservation(
+        observation_id="observation-scored",
+        run_id="test-run",
+        experiment_id="exp-scored",
+        attempt_id="attempt-scored",
+        execution_id="execution-scored",
+        evaluation_id="eval-scored",
+        checkpoint_id="checkpoint-scored",
+        source_commit="d" * 40,
+        evaluator_id="evaluator-1",
+        evaluator_sha256="a" * 64,
+        dataset_manifest_id="manifest-1",
+        dataset_manifest_sha256="c" * 64,
+        validity="provisional",
+        primary_score=0.67,
+        validation_report_id="validation-scored",
+        validation_evidence_refs=("validation-evidence",),
+    )
+    agent = _ScriptedAgentClient(
+        [
+            OrchestrationDecision(
+                decision_id="research-after-score",
+                action=DecisionAction.RESEARCH,
+                rationale="form a new candidate batch",
+            )
+        ]
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=agent))
+
+    await controller.orchestrate(minimal_state(phase=RunPhase.PERSIST))
+
+    request = agent.calls[0]
+    assert isinstance(request, OrchestrationRequest)
+    assert request.experiment_history is not None
+    record = request.experiment_history.records[0]
+    assert record.gauc == 0.61
+    assert record.ndcg_at_5 == 0.73
+    assert record.primary_score == 0.67
+
+
 async def test_orchestration_selects_among_pending_proposals() -> None:
     """With pending proposals, implement is allowed and the chosen proposal becomes current."""
     store = _MultiProposalStore()
     store.experiments["exp-a"] = _proposal("exp-a", "pairwise loss")
     store.experiments["exp-b"] = _proposal("exp-b", "bigger embeddings")
+    store.experiments["exp-c"] = _proposal("exp-c", "temporal features")
     agent = _ScriptedAgentClient(
         [
             OrchestrationDecision(
@@ -1421,9 +1577,15 @@ async def test_orchestration_selects_among_pending_proposals() -> None:
     assert isinstance(request, OrchestrationRequest)
     assert DecisionAction.IMPLEMENT in request.allowed_actions
     assert request.experiment_history is not None
+    assert request.experiment_history.pending_proposals[0].expected_signal
+    assert (
+        request.experiment_history.pending_proposals[0].implementation_resource_estimate
+        is not None
+    )
     assert {p.experiment_id for p in request.experiment_history.pending_proposals} == {
         "exp-a",
         "exp-b",
+        "exp-c",
     }
 
 
@@ -1431,6 +1593,8 @@ async def test_orchestration_rejects_unknown_proposal_target() -> None:
     """Implement with an id outside pending proposals is a schema failure."""
     store = _MultiProposalStore()
     store.experiments["exp-a"] = _proposal("exp-a", "pairwise loss")
+    store.experiments["exp-b"] = _proposal("exp-b", "bigger embeddings")
+    store.experiments["exp-c"] = _proposal("exp-c", "temporal features")
     agent = _ScriptedAgentClient(
         [
             OrchestrationDecision(
@@ -1644,6 +1808,23 @@ async def test_research_receives_authoritative_controller_context() -> None:
     store.evaluator = EvaluatorIdentity(
         evaluator_id="evaluator-1", evaluator_sha256="b" * 64, validity="provisional"
     )
+    dataset_context = DatasetContext(
+        evidence_id="dataset-context-1",
+        manifest_id="manifest-1",
+        manifest_sha256="a" * 64,
+        row_identity_columns=("row_id", "user_id", "item_id"),
+        user_id_column="user_id",
+        item_id_column="item_id",
+        label_column="label",
+        non_label_feature_columns=("duration_ms",),
+        files=(
+            DatasetFileContext(
+                relative_path="train.csv",
+                split="train",
+                columns=("row_id", "user_id", "item_id", "duration_ms", "label"),
+            ),
+        ),
+    )
     agent = _ScriptedAgentClient(
         [
             ResearchDecision(
@@ -1654,7 +1835,9 @@ async def test_research_receives_authoritative_controller_context() -> None:
             )
         ]
     )
-    controller = ProductionController(_make_services(store=store, agent_client=agent))
+    controller = ProductionController(
+        _make_services(store=store, agent_client=agent, dataset_context=dataset_context)
+    )
 
     result = await controller.research(
         minimal_state(
@@ -1664,7 +1847,7 @@ async def test_research_receives_authoritative_controller_context() -> None:
         )
     )
 
-    assert result["pending_route"] == "proposal_policy"
+    assert result["pending_route"] == "research"
     assert result["repair_attempts"] == 0
     request = agent.calls[0]
     assert isinstance(request, ResearchRequest)
@@ -1674,6 +1857,10 @@ async def test_research_receives_authoritative_controller_context() -> None:
     assert request.controller_context.source_commit_stage == "post_implementation"
     assert request.controller_context.experiment_registry is not None
     assert request.controller_context.experiment_registry.complete is True
+    assert request.controller_context.dataset_context == dataset_context
+    assert request.proposal_mode == "candidate_generation"
+    assert request.proposal_batch_size == 3
+    assert request.proposals_needed == 3
 
 
 async def test_planning_requests_share_exact_parent_source_and_run_history() -> None:
@@ -2375,6 +2562,9 @@ async def test_result_validation_excludes_authoritative_dataset_rows() -> None:
     execution = request.subject["execution_result"]
     assert isinstance(execution, dict)
     assert "dataset_valid_rows" not in execution
+    history = request.subject["experiment_history"]
+    assert isinstance(history, dict)
+    assert history["run_id"] == "test-run"
 
 
 async def test_evaluate_logs_metrics_and_delta_from_prior_compatible_champion(
@@ -2726,6 +2916,7 @@ def _make_services(
     default_gpu_count: int = 0,
     repository_root: str | None = None,
     parent_commit: str | None = None,
+    dataset_context: DatasetContext | None = None,
 ) -> ControllerServices:
     """Build real service-driven transitions with fake injected services."""
     if store is None:
@@ -2744,6 +2935,7 @@ def _make_services(
         evaluator_id="evaluator-1",
         repository_root=repository_root,
         parent_commit=parent_commit,
+        dataset_context=dataset_context,
         repository_inspector=(
             RepositoryInspector(Path(repository_root)) if repository_root is not None else None
         ),

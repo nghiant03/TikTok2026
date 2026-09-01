@@ -79,6 +79,8 @@ def route_after_validation(
         return "persist"
     if report.verdict == ValidationVerdict.REPAIRABLE:
         return "repair"
+    if report.stage.value == "proposal":
+        return "repair"
     return "persist_failure"
 
 

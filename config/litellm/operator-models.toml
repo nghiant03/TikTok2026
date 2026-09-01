@@ -5,29 +5,29 @@ base_url = "http://127.0.0.1:4000/v1"
 model = "tiktok2026-orchestration"
 api_key_env = "LITELLM_API_KEY"
 temperature = 0.0
-max_tokens = 2048
-timeout_seconds = 180.0
+max_tokens = 16384
+timeout_seconds = 600.0
 
 [models.research]
 base_url = "http://127.0.0.1:4000/v1"
 model = "tiktok2026-research"
 api_key_env = "LITELLM_API_KEY"
 temperature = 0.0
-max_tokens = 8192
-timeout_seconds = 600.0
+max_tokens = 32768
+timeout_seconds = 1800.0
 
 [models.implementor]
 base_url = "http://127.0.0.1:4000/v1"
 model = "tiktok2026-implementor"
 api_key_env = "LITELLM_API_KEY"
 temperature = 0.0
-max_tokens = 16384
-timeout_seconds = 600.0
+max_tokens = 32768
+timeout_seconds = 1800.0
 
 [models.validator]
 base_url = "http://127.0.0.1:4000/v1"
 model = "tiktok2026-validator"
 api_key_env = "LITELLM_API_KEY"
 temperature = 0.0
-max_tokens = 4096
-timeout_seconds = 600.0
+max_tokens = 32768
+timeout_seconds = 1800.0

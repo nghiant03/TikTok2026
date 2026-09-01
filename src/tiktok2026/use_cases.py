@@ -17,6 +17,7 @@ from tiktok2026.contracts import (
     AgentRole,
     ControllerContext,
     CriterionAssessmentStatus,
+    DatasetContext,
     DatasetViewProvenance,
     DecisionAction,
     EvaluationContext,
@@ -249,6 +250,7 @@ class ServiceTransitions:
     smoke_memory_bytes: int = 512 * 1024 * 1024
     smoke_disk_bytes: int = 64 * 1024 * 1024
     dataset_view_provenance: Callable[[ExecutionRequest], DatasetViewProvenance] | None = None
+    dataset_context: DatasetContext | None = None
     max_repairs: int = 3
     min_pending_proposals: int = 3
     requires_run_baseline: bool = False
@@ -363,11 +365,15 @@ def make_service_transitions(
     smoke_memory_bytes: int = 512 * 1024 * 1024,
     smoke_disk_bytes: int = 64 * 1024 * 1024,
     dataset_view_provenance: Callable[[ExecutionRequest], DatasetViewProvenance] | None = None,
+    dataset_context: DatasetContext | None = None,
     max_repairs: int = 3,
+    min_pending_proposals: int = 3,
     requires_run_baseline: bool = False,
     plateau_epsilon: float = 0.002,
     plateau_patience: int = 3,
 ) -> Mapping[str, Transition]:
+    if min_pending_proposals < 3 or min_pending_proposals > MAX_CONTEXT_PROPOSALS:
+        raise ValueError("pending proposal threshold must be between 3 and 50")
     s = ServiceTransitions(
         agent_client=agent_client,
         agent_clients=agent_clients if agent_clients is not None else {},
@@ -395,7 +401,9 @@ def make_service_transitions(
         smoke_memory_bytes=smoke_memory_bytes,
         smoke_disk_bytes=smoke_disk_bytes,
         dataset_view_provenance=dataset_view_provenance,
+        dataset_context=dataset_context,
         max_repairs=max_repairs,
+        min_pending_proposals=min_pending_proposals,
         requires_run_baseline=requires_run_baseline,
         plateau_epsilon=plateau_epsilon,
         plateau_patience=plateau_patience,
@@ -458,19 +466,13 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
         client = _agent(s, AgentRole.ORCHESTRATION)
         if client is None:
             return {"pending_route": "research"}
-        evaluated_candidate_ready = _evaluated_candidate_ready(s, state)
         pending = _pending_proposals(s, state["run_id"])
         history_context = _experiment_history(s, state["run_id"], pending)
-        allowed_actions = (DecisionAction.RESEARCH,)
-        if evaluated_candidate_ready:
-            allowed_actions = (
-                DecisionAction.RESEARCH,
-                DecisionAction.REPLICATE,
-                DecisionAction.INCREASE_FIDELITY,
-                DecisionAction.REVISIT_BRANCH,
-            )
-        if pending.total:
-            allowed_actions = (*allowed_actions, DecisionAction.IMPLEMENT)
+        allowed_actions = (
+            (DecisionAction.IMPLEMENT,)
+            if pending.total >= s.min_pending_proposals
+            else (DecisionAction.RESEARCH,)
+        )
         request = OrchestrationRequest(
             request_id=f"orchestration-{state['run_id']}-{state['state_version']}",
             run_id=state["run_id"],
@@ -542,30 +544,6 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
     return transition
 
 
-def _evaluated_candidate_ready(s: ServiceTransitions, state: ProductionState) -> bool:
-    experiment_id = state.get("current_experiment_id")
-    evaluation_id = state.get("latest_evaluation_result_id")
-    if (
-        s.run_store is None
-        or s.bundle_service is None
-        or s.evaluator_id is None
-        or experiment_id is None
-        or evaluation_id is None
-    ):
-        return False
-    evaluation = s.run_store.get_evaluation_result(evaluation_id)
-    source = (
-        s.run_store.get_source_registration_by_id(f"source-{evaluation.source_commit}")
-        if evaluation is not None and evaluation.source_commit is not None
-        else s.run_store.get_source_registration(experiment_id)
-    )
-    return (
-        source is not None
-        and evaluation is not None
-        and evaluation.experiment_id == experiment_id
-    )
-
-
 def _research(s: ServiceTransitions) -> Transition:
     async def transition(state: ProductionState) -> dict[str, object]:
         if s.run_store is not None:
@@ -591,16 +569,37 @@ def _research(s: ServiceTransitions) -> Transition:
                     return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
         pending = _pending_proposals(s, state["run_id"])
         history_context = _experiment_history(s, state["run_id"], pending)
+        selected_experiment = (
+            s.run_store.get_experiment(prior_experiment_id)
+            if s.run_store is not None and is_proposal_repair and prior_experiment_id is not None
+            else None
+        )
+        if is_proposal_repair and selected_experiment is None:
+            return _failure(
+                state,
+                FailureKind.SCHEMA_MISMATCH,
+                "selected proposal authority is absent for refinement",
+            )
         request = ResearchRequest(
             request_id=f"research-{state['run_id']}-{state['state_version']}",
             objective=objective,
             resource_state=_resource_state(s),
             parent_experiment_id=(prior_experiment_id if is_proposal_repair else None),
+            proposal_mode=(
+                "selected_refinement" if is_proposal_repair else "candidate_generation"
+            ),
+            proposal_batch_size=s.min_pending_proposals,
+            proposals_needed=(
+                1
+                if is_proposal_repair
+                else max(0, s.min_pending_proposals - pending.total)
+            ),
             allowed_paths=IMPLEMENTATION_ROOTS,
             controller_context=_controller_context(s),
             unresolved_blockers=unresolved_context,
             source_context=_source_context(s),
             experiment_history=history_context,
+            selected_experiment=selected_experiment,
         )
         response = await client.invoke(request)
         if isinstance(response, AgentFailure):
@@ -611,8 +610,15 @@ def _research(s: ServiceTransitions) -> Transition:
             )
         spec = response.experiment_spec
         is_new_experiment = spec.experiment_id != prior_experiment_id
+        pending_ids = {item.experiment_id for item in pending.items}
         if s.run_store is not None:
             existing = s.run_store.get_experiment(spec.experiment_id)
+            if not is_proposal_repair and spec.experiment_id in pending_ids:
+                return _failure(
+                    state,
+                    FailureKind.SCHEMA_MISMATCH,
+                    "candidate generation requires a fresh experiment identity",
+                )
             if existing is not None and existing != spec:
                 return _failure(
                     state,
@@ -620,11 +626,13 @@ def _research(s: ServiceTransitions) -> Transition:
                     "experiment identities are immutable; return the revised proposal with a "
                     "new experiment_id and set parent_experiment_id to the proposal being repaired",
                 )
-            if (
-                is_proposal_repair
-                and is_new_experiment
-                and spec.parent_experiment_id != prior_experiment_id
-            ):
+            if is_proposal_repair and not is_new_experiment:
+                return _failure(
+                    state,
+                    FailureKind.SCHEMA_MISMATCH,
+                    "a revised proposal requires a fresh experiment identity",
+                )
+            if is_proposal_repair and spec.parent_experiment_id != prior_experiment_id:
                 return _failure(
                     state,
                     FailureKind.SCHEMA_MISMATCH,
@@ -645,9 +653,14 @@ def _research(s: ServiceTransitions) -> Transition:
             ),
             "terminal_reason": None,
             "pending_route": (
-                "orchestrate"
-                if pending.total and getattr(s, "min_pending_proposals", 1) > 1
-                else "proposal_policy"
+                "proposal_policy"
+                if is_proposal_repair
+                else (
+                    "orchestrate"
+                    if pending.total + (1 if spec.experiment_id not in pending_ids else 0)
+                    >= s.min_pending_proposals
+                    else "research"
+                )
             ),
         }
 
@@ -809,6 +822,12 @@ def _pending_proposals(s: ServiceTransitions, run_id: str) -> _PendingProposalVi
             experiment_id=x.experiment_id,
             hypothesis=_bounded_text(x.hypothesis, MAX_PROPOSAL_TEXT),
             mechanism=_bounded_text(x.mechanism, MAX_PROPOSAL_TEXT),
+            motivation=_bounded_text(x.motivation, MAX_PROPOSAL_TEXT),
+            expected_signal=_bounded_text(x.expected_signal, MAX_PROPOSAL_TEXT),
+            success_criteria=_bounded_text(x.success_criteria, MAX_PROPOSAL_TEXT),
+            failure_criteria=_bounded_text(x.failure_criteria, MAX_PROPOSAL_TEXT),
+            fidelity=x.fidelity,
+            implementation_resource_estimate=x.implementation_resource_estimate,
             implementation_scope=tuple(
                 _bounded_text(scope, MAX_PROPOSAL_SCOPE)
                 for scope in x.implementation_scope[:MAX_PROPOSAL_SCOPE_ITEMS]
@@ -834,6 +853,12 @@ def _outcome_history(s: ServiceTransitions, run_id: str) -> tuple[OutcomeSummary
     scores: dict[str, float] = {}
     for o in obs_lister(run_id):
         spec = s.run_store.get_experiment(o.experiment_id)
+        evaluation = s.run_store.get_evaluation_result(o.evaluation_id)
+        metrics = (
+            {metric.name: metric.value for metric in evaluation.metrics}
+            if evaluation is not None
+            else {}
+        )
         scores[o.experiment_id] = o.primary_score
         parent = spec.parent_experiment_id if spec is not None else None
         out.append(
@@ -845,6 +870,8 @@ def _outcome_history(s: ServiceTransitions, run_id: str) -> tuple[OutcomeSummary
                     else ""
                 ),
                 primary_score=o.primary_score,
+                gauc=metrics.get("GAUC"),
+                ndcg_at_5=metrics.get("nDCG@5"),
                 ordering_key=o.attempt_id,
                 delta_vs_parent=(
                     round(o.primary_score - scores[parent], 6)
@@ -992,6 +1019,7 @@ def _controller_context(
     )
     return ControllerContext(
         dataset_manifest_identity=dataset,
+        dataset_context=s.dataset_context,
         evaluator_identity=evaluator,
         parent_commit=s.parent_commit,
         docker_image=s.docker_image,
@@ -1063,6 +1091,7 @@ def _proposal_validation(s: ServiceTransitions) -> Transition:
             unresolved = _unresolved_blockers(s, spec.experiment_id)
         except MissingAuthorityError as error:
             return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
+        source_context = _source_context(s)
         subject: dict[str, object] = {
             "experiment_spec": spec.model_dump(mode="json"),
             "controller_context": _controller_context(
@@ -1077,6 +1106,14 @@ def _proposal_validation(s: ServiceTransitions) -> Transition:
             "unresolved_blockers": [
                 item.model_dump(mode="json") for item in _blocker_context(unresolved)
             ],
+            "source_context": (
+                source_context.model_dump(mode="json")
+                if source_context is not None
+                else None
+            ),
+            "experiment_history": _experiment_history(
+                s, state["run_id"], _pending_proposals(s, state["run_id"])
+            ).model_dump(mode="json"),
         }
         operation = _validation_operation(state, ValidationStage.PROPOSAL, subject)
         subject["validation_operation"] = operation.model_dump(mode="json")
@@ -1205,6 +1242,10 @@ def _implement(s: ServiceTransitions) -> Transition:
         unresolved = _unresolved_blockers(s, spec.experiment_id)
         unresolved_blocker_ids = tuple(blocker.blocker_id for blocker in unresolved)
         unresolved_blocker_context = _blocker_context(unresolved)
+        source_context = _source_context(s)
+        source_payload = (
+            source_context.model_dump(mode="json") if source_context is not None else {}
+        )
         response = await client.invoke(
             ImplementationRequest(
                 request_id=f"implementation-{state['run_id']}-{state['state_version']}",
@@ -1220,8 +1261,8 @@ def _implement(s: ServiceTransitions) -> Transition:
                 ),
                 unresolved_blocker_ids=unresolved_blocker_ids,
                 unresolved_blockers=unresolved_blocker_context,
-                source_context={},
-                base_source_context={},
+                source_context=source_payload,
+                base_source_context=source_payload,
                 execution_timeout_seconds=s.default_timeout_seconds,
                 execution_memory_bytes=s.default_memory_bytes,
                 execution_cpus=s.default_cpus,
@@ -1418,6 +1459,10 @@ def _validation_subject(
             for item in _blocker_context(_unresolved_blockers(s, _exp_id(state)))
         ],
     }
+    if stage == ValidationStage.RESULT:
+        subject["experiment_history"] = _experiment_history(
+            s, state["run_id"], _pending_proposals(s, state["run_id"])
+        ).model_dump(mode="json")
     if stage == ValidationStage.IMPLEMENTATION:
         implementation = _implementation_result(s, state)
         if implementation is None:
@@ -2230,11 +2275,28 @@ def _interpret(s: ServiceTransitions) -> Transition:
             return {"pending_route": "finalize"}
         client = _agent(s, AgentRole.RESEARCH)
         if client is not None:
+            experiment_id = state.get("current_experiment_id")
+            evaluation_id = state.get("latest_evaluation_result_id")
             response = await client.invoke(
                 ResearchRequest(
                     request_id=f"interpret-{state['run_id']}-{state['state_version']}",
                     objective="interpret evaluation result",
                     resource_state=_resource_state(s),
+                    controller_context=_controller_context(s),
+                    source_context=_source_context(s),
+                    experiment_history=_experiment_history(
+                        s, state["run_id"], _pending_proposals(s, state["run_id"])
+                    ),
+                    selected_experiment=(
+                        s.run_store.get_experiment(experiment_id)
+                        if s.run_store is not None and experiment_id is not None
+                        else None
+                    ),
+                    latest_evaluation_result=(
+                        s.run_store.get_evaluation_result(evaluation_id)
+                        if s.run_store is not None and evaluation_id is not None
+                        else None
+                    ),
                 )
             )
             if isinstance(response, AgentFailure):

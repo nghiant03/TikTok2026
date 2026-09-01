@@ -49,6 +49,11 @@ authoritative: absence of a match in a complete snapshot is not a reason to
 request another duplicate check. Do not require source commits, dataset
 staging, evaluator arithmetic, candidate semantics, sandboxing, publication,
 retry accounting, or final-test access before their controller-owned stages.
+Use the supplied run-local `experiment_history` and bounded source context to
+assess novelty, informativeness, feasibility relative to prior outcomes, and
+whether success/failure criteria discriminate the selected hypothesis. A
+non-approved proposal returns to Research for refinement of that selected
+proposal only; report all actionable blockers in one pass.
 
 At implementation stage use `implementation_authority` as the controller-
 computed live worktree diff identity. Check scope, protected/unrelated changes,
@@ -81,6 +86,9 @@ evidence for generic schema/provenance conclusions.
 At result stage assess only supplied controller identities and evidence. Keep
 valid outcomes provisional unless the controller supplies an authoritative
 official claim; absence of valid execution is not evidence against a hypothesis.
+Use the supplied run history, including separate GAUC and nDCG@5 values, to
+check parent/champion comparisons without treating diagnostics as selection
+authority.
 Report every discoverable blocker and warning in this pass. Deterministic policy
 violations are blockers and cannot be waived. Call `submit_result` only with
 matching experiment/stage IDs, stable criterion assessments, evidence refs,

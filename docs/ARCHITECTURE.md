@@ -50,6 +50,17 @@ The implementor receives a `ScopedWorktreeRepository` only after a worktree is a
 
 ### Proposal admission
 
+Research produces one fresh proposal per typed call until the controller has
+persisted at least three distinct, unattempted candidates for the run.
+Orchestration cannot select before that threshold and, once it is reached,
+chooses exactly one authorized pending identity. Only the selected proposal goes
+through deterministic proposal policy and Validator review. A non-approved
+proposal stays on that selected lineage: Research receives the full selected
+specification and bounded blocker contexts, returns a fresh child identity with
+the selected proposal as parent, and sends that child directly back through
+policy and Validator. Unselected candidates are not rewritten during this
+refinement loop.
+
 Research proposals must carry a quantitative, technique-neutral
 `implementation_resource_estimate`: predicted full-fidelity wall seconds, peak
 memory bytes, artifact bytes, and dataset-pass count, with both structural risk
@@ -84,17 +95,22 @@ reports; they do not create authoritative source, artifact, evaluator, dataset,
 or blocker identities. The controller owns validation of payload identity,
 policy, hashes, persistence, and routing.
 
-Planning requests also carry two bounded contexts. `SourceContext` identifies the
+Planning requests also carry bounded source, dataset, and history contexts.
+`SourceContext` identifies the
 exact approved parent commit used by `WorktreeManager.create`, the fixed training
 entrypoint and its content hash, plus a small structural summary/excerpt. It is
 assembled by the controller-side repository inspector; agents never infer source
-lineage from their checkout. `ExperimentHistoryContext` is run-local and contains
-bounded scored and explicitly run-bound failed records, pending proposals, the
+lineage from their checkout. `DatasetContext` contains only controller-verified
+train/valid schemas, feature/identity column names, and relative manifest file
+descriptions; it contains no rows, label values, or test split. An enriched
+`ExperimentHistoryContext` is run-local and contains bounded scored and
+explicitly run-bound failed records, separate GAUC and nDCG@5 values, detailed
+pending proposal decision summaries and resource estimates, the
 authoritative champion scalar when available, and total/truncation metadata. It is
 bound to its request `run_id`, and the application authority persists the
 run-to-experiment status association used for pending authorization. It is not
 the global duplicate registry: that registry remains in `ControllerContext`.
-Both contexts are request data only and are never added to compact LangGraph
+These contexts are request data only and are never added to compact LangGraph
 state. Missing repository evidence leaves `SourceContext` absent rather than
 falling back to a different revision.
 
@@ -159,7 +175,9 @@ The production graph in `src/tiktok2026/graph/build.py` and `src/tiktok2026/use_
 
 ```text
 bootstrap → inspect → orchestrate → research
-→ proposal policy → proposal validation → create worktree
+→ repeat research until at least three proposals → orchestrate selects one
+→ proposal policy → proposal validation
+→ selected-proposal refinement and revalidation when needed → create worktree
 → implement → diff policy → implementation validation
 → source registration → sandbox preflight → executable smoke/constrained execution
 → failure classification → valid-split evaluation → result validation

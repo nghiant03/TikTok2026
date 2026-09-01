@@ -10,7 +10,7 @@ from tiktok2026.config import (
     ModelSettings,
     OnlineResearchSettings,
 )
-from tiktok2026.contracts import CURRENT_EVALUATOR_ID, RuntimePaths
+from tiktok2026.contracts import CURRENT_EVALUATOR_ID, AgentRole, RuntimePaths
 
 
 def test_runtime_root_must_be_outside_repository(tmp_path: Path) -> None:
@@ -124,6 +124,11 @@ def test_development_profile_configures_execution_resources() -> None:
         overrides={"runtime_root": Path("/tmp/tiktok2026-test-runtime")},
     )
     assert settings.execution.memory_bytes == 4_294_967_296
-    assert settings.execution.timeout_seconds == 900
+    assert settings.execution.timeout_seconds == 3_600
     assert settings.execution.cpus == 1.0
     assert settings.execution.gpu_count == 1
+    assert settings.budget.gpu_hours == 48.0
+    assert settings.budget.wall_clock_seconds == 172_800
+    assert settings.budget.tokens == 2_000_000_000
+    assert settings.budget.disk_bytes == 107_374_182_400
+    assert settings.models[AgentRole.RESEARCH].max_tokens == 32_768

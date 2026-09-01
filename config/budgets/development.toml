@@ -1,18 +1,19 @@
-dataset_root = ""
-docker_image = ""
+dataset_root = "/home/nghiant/Git/Project/TikTok2026/data/Post-KuaiRand-Pure"
+docker_image = "localhost:5000/tiktok2026@sha256:2e21acbb85500217a479cedab3a8f13d9b5f7b9c611876e0921473ff608534e2"
 
 [execution]
 memory_bytes = 4294967296
-timeout_seconds = 900
+timeout_seconds = 3600
 cpus = 1.0
 gpu_count = 1
 
 [budget]
-gpu_hours = 1.0
-wall_clock_seconds = 7200
-tokens = 1000000
-disk_bytes = 21474836480
-reserved_final_gpu_hours = 0.25
+gpu_hours = 48.0
+wall_clock_seconds = 172800
+# Keep deterministic integer accounting while effectively removing the model-usage cap.
+tokens = 2000000000
+disk_bytes = 107374182400
+reserved_final_gpu_hours = 1.0
 frontier_capacity = 4
 max_repairs = 3
 
@@ -21,29 +22,29 @@ base_url = "http://127.0.0.1:4000/v1"
 model = "tiktok2026-orchestration"
 api_key_env = "LITELLM_API_KEY"
 temperature = 0.0
-max_tokens = 4096
-timeout_seconds = 180.0
+max_tokens = 16384
+timeout_seconds = 600.0
 
 [models.research]
 base_url = "http://127.0.0.1:4000/v1"
 model = "tiktok2026-research"
 api_key_env = "LITELLM_API_KEY"
 temperature = 0.0
-max_tokens = 8192
-timeout_seconds = 600.0
+max_tokens = 32768
+timeout_seconds = 1800.0
 
 [models.implementor]
 base_url = "http://127.0.0.1:4000/v1"
 model = "tiktok2026-implementor"
 api_key_env = "LITELLM_API_KEY"
 temperature = 0.0
-max_tokens = 8192
-timeout_seconds = 600.0
+max_tokens = 32768
+timeout_seconds = 1800.0
 
 [models.validator]
 base_url = "http://127.0.0.1:4000/v1"
 model = "tiktok2026-validator"
 api_key_env = "LITELLM_API_KEY"
 temperature = 0.0
-max_tokens = 8192
-timeout_seconds = 600.0
+max_tokens = 32768
+timeout_seconds = 1800.0

@@ -8,6 +8,8 @@ from tiktok2026.contracts import (
     ControllerContext,
     CriterionAssessmentStatus,
     CriterionResolutionClaim,
+    DatasetContext,
+    DatasetManifestIdentity,
     EvaluationResult,
     ExecutionResult,
     ExperimentProposalDecision,
@@ -26,6 +28,7 @@ from tiktok2026.contracts import (
     MetricValue,
     PredictionArtifactEnvelope,
     ResearchDecision,
+    ResearchRequest,
     ResourceState,
     RunPhase,
     SourceRegistration,
@@ -69,6 +72,54 @@ def test_controller_context_rejects_noncanonical_judging_metric_order(
 ) -> None:
     with pytest.raises(ValidationError, match="current order"):
         ControllerContext(judging_metrics=metrics)  # type: ignore[arg-type]
+
+
+def test_controller_context_binds_train_valid_schema_to_manifest_identity() -> None:
+    dataset = DatasetContext(
+        evidence_id="dataset-context-1",
+        manifest_id="manifest-1",
+        manifest_sha256="a" * 64,
+        row_identity_columns=("row_id", "user_id", "item_id"),
+        user_id_column="user_id",
+        item_id_column="item_id",
+        label_column="label",
+    )
+
+    context = ControllerContext(
+        dataset_manifest_identity=DatasetManifestIdentity(
+            manifest_id="manifest-1", manifest_sha256="a" * 64
+        ),
+        dataset_context=dataset,
+    )
+
+    assert context.dataset_context == dataset
+    with pytest.raises(ValidationError, match="must match"):
+        ControllerContext(
+            dataset_manifest_identity=DatasetManifestIdentity(
+                manifest_id="manifest-2", manifest_sha256="b" * 64
+            ),
+            dataset_context=dataset,
+        )
+
+
+def test_research_proposal_batch_requires_at_least_three_candidates() -> None:
+    with pytest.raises(ValidationError):
+        ResearchRequest(
+            request_id="research-1",
+            objective="propose next experiment",
+            resource_state=ResourceState(
+                remaining_gpu_hours=0,
+                accumulated_gpu_hours=0,
+                remaining_wall_seconds=1,
+                used_tokens=0,
+                remaining_tokens=0,
+                disk_bytes_available=1,
+                reserved_final_gpu_hours=0,
+            ),
+            proposal_mode="candidate_generation",
+            proposal_batch_size=2,
+            proposals_needed=2,
+        )
 
 
 def test_prediction_and_checkpoint_envelopes_require_dataset_view_key() -> None:

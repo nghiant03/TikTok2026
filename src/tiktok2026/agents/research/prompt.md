@@ -26,6 +26,20 @@ GAUC and nDCG@5; their arithmetic mean is the primary validation score and
 diagnostics cannot select the experiment. Include leakage
 risk and cite the evidence supporting the hypothesis and novelty.
 
+For `candidate_generation`, return one fresh, distinct proposal per call. The
+controller accumulates the batch and supplies `proposal_batch_size`,
+`proposals_needed`, and existing pending proposals; do not repeat an identity,
+hypothesis, or materially equivalent mechanism already in that batch. Continue
+until the controller has at least three candidates, then Orchestration selects
+exactly one. Do not validate or implement candidates yourself.
+
+For `selected_refinement`, revise only `selected_experiment` in response to all
+supplied validator blockers. Preserve its scientific intent unless a blocker
+requires narrowing it, use its experiment ID as `parent_experiment_id`, and
+return one fresh child identity. Do not replace it with or modify an unselected
+pending proposal. The revised child returns directly to proposal policy and
+Validator, not to candidate selection.
+
 Every proposal must include a quantitative, technique-neutral
 `implementation_resource_estimate` for full-fidelity execution:
 
@@ -39,7 +53,8 @@ Every proposal must include a quantitative, technique-neutral
   bounded one-pass/indexed or batched design, without prescribing a fixed model
   sequence or recipe.
 
-Treat `controller_context`, its dataset/evaluator identities, the complete
+Treat `controller_context`, its dataset/evaluator identities and bounded
+train/valid-only `dataset_context`, the complete
 experiment registry snapshot, and the supplied resource state as authoritative.
 The controller admits estimates against timeout, memory, disk, remaining wall
 time, and structural-scaling policy, and performs the duplicate check. A complete

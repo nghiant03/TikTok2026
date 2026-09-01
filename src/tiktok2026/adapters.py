@@ -533,6 +533,11 @@ class RoleSpecificAgentClient:
             and request.controller_context.experiment_registry is not None
         ):
             evidence_ids.add(request.controller_context.experiment_registry.evidence_id)
+        if (
+            request.controller_context is not None
+            and request.controller_context.dataset_context is not None
+        ):
+            evidence_ids.add(request.controller_context.dataset_context.evidence_id)
         online_ids: set[str] = set()
         searches = 0
 
