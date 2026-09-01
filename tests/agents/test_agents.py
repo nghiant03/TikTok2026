@@ -12,12 +12,16 @@ from tiktok2026.agents.common.client import ChatTransport, OpenAICompatibleClien
 from tiktok2026.agents.common.structured import invoke_agentic
 from tiktok2026.agents.research.agent import ResearchAgent
 from tiktok2026.agents.research.context import ResearchCapabilities
+from tiktok2026.agents.research.online import OpenAIWebSearchProvider
 from tiktok2026.config import ModelSettings
 from tiktok2026.contracts import (
     AgentFailure,
     AgentRole,
     ContractModel,
     EvidenceItem,
+    OnlineSearchRequest,
+    OnlineSearchResult,
+    OnlineSource,
     ResearchDecision,
     ResearchRequest,
     ResourceState,
@@ -69,6 +73,30 @@ class Reader:
 class EmptyReader:
     async def read(self, request: ResearchRequest) -> tuple[EvidenceItem, ...]:
         return ()
+
+
+class OnlineProvider:
+    def __init__(self) -> None:
+        self.requests: list[OnlineSearchRequest] = []
+
+    async def search(self, request: OnlineSearchRequest) -> OnlineSearchResult:
+        self.requests.append(request)
+        return OnlineSearchResult(
+            result_id="search-result-1",
+            request_id=request.request_id,
+            provider="fixture",
+            sources=(
+                OnlineSource(
+                    source_id="online-source-1",
+                    url="https://example.org/paper",
+                    title="A current paper",
+                    excerpt="A bounded scientific finding",
+                    content_sha256=hashlib.sha256(
+                        b"A bounded scientific finding"
+                    ).hexdigest(),
+                ),
+            ),
+        )
 
 
 def request() -> ResearchRequest:
@@ -264,6 +292,136 @@ async def test_research_rejects_test_label_evidence(monkeypatch: MonkeyPatch) ->
     result = await agent.invoke(request())
     assert isinstance(result, AgentFailure)
     assert result.kind == "policy"
+
+
+async def test_production_research_searches_online_and_enforces_citations(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    provider = OnlineProvider()
+    decision = ResearchDecision(
+        request_id="request-1",
+        kind="evidence_request",
+        message="Use the current finding",
+        evidence_refs=("online-source-1",),
+    )
+    transport = RecordingTransport(
+        [
+            _tool_calls_response(
+                "search_online", {"query": "recent recommender calibration evidence"}
+            ),
+            _tool_calls_response("submit_result", decision.model_dump(mode="json")),
+        ]
+    )
+    agent = RoleSpecificAgentClient(
+        OpenAICompatibleClient(ModelSettings(), transport),
+        AgentRole.RESEARCH,
+        "Research with evidence.",
+        online_research=provider,
+        max_online_searches=2,
+        max_online_results=4,
+        online_allowed_domains=("example.org",),
+    )
+
+    result = await agent.invoke(request())
+
+    assert isinstance(result, ResearchDecision)
+    assert result.evidence_refs == ("online-source-1",)
+    assert provider.requests[0].allowed_domains == ("example.org",)
+    assert provider.requests[0].max_results == 4
+    tools = transport.requests[0][1]["tools"]
+    assert isinstance(tools, list)
+    assert [tool["function"]["name"] for tool in tools] == [  # type: ignore[index]
+        "search_online",
+        "submit_result",
+    ]
+
+
+async def test_production_research_repairs_unknown_online_citation(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    provider = OnlineProvider()
+    invalid = ResearchDecision(
+        request_id="request-1",
+        kind="evidence_request",
+        message="Unsupported citation",
+        evidence_refs=("unknown-source",),
+    )
+    valid = invalid.model_copy(update={"evidence_refs": ("online-source-1",)})
+    transport = RecordingTransport(
+        [
+            _tool_calls_response("search_online", {"query": "recent recommender evidence"}),
+            _tool_calls_response("submit_result", invalid.model_dump(mode="json")),
+            _tool_calls_response("submit_result", valid.model_dump(mode="json")),
+        ]
+    )
+    agent = RoleSpecificAgentClient(
+        OpenAICompatibleClient(ModelSettings(), transport),
+        AgentRole.RESEARCH,
+        "Research with evidence.",
+        online_research=provider,
+    )
+
+    result = await agent.invoke(request())
+
+    assert isinstance(result, ResearchDecision)
+    assert result.evidence_refs == ("online-source-1",)
+    messages = transport.requests[2][1]["messages"]
+    assert isinstance(messages, list)
+    assert any("unknown evidence IDs" in str(message) for message in messages)
+
+
+async def test_openai_web_search_records_only_authorized_https_sources(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    transport = RecordingTransport(
+        [
+            {
+                "id": "response-1",
+                "output": [
+                    {
+                        "type": "web_search_call",
+                        "action": {
+                            "sources": [
+                                {"url": "https://arxiv.org/abs/1234", "title": "Paper"},
+                                {"url": "http://localhost/private", "title": "Blocked"},
+                            ]
+                        },
+                    },
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "The paper reports a current result.",
+                                "annotations": [],
+                            }
+                        ],
+                    },
+                ],
+            }
+        ]
+    )
+    provider = OpenAIWebSearchProvider(ModelSettings(), tmp_path, transport)
+
+    result = await provider.search(
+        OnlineSearchRequest(
+            request_id="online-1",
+            query="recent recommender evaluation methods",
+            allowed_domains=("arxiv.org",),
+        )
+    )
+
+    assert tuple(source.url for source in result.sources) == (
+        "https://arxiv.org/abs/1234",
+    )
+    assert (tmp_path / f"{result.result_id}.json").is_file()
+    assert transport.requests[0][0].endswith("/responses")
+    web_tool = transport.requests[0][1]["tools"]
+    assert isinstance(web_tool, list)
+    assert web_tool[0]["filters"] == {"allowed_domains": ["arxiv.org"]}  # type: ignore[index]
 
 
 # ---------------------------------------------------------------------------

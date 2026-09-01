@@ -219,6 +219,53 @@ class ApplicationRepository:
         return _content_hash(payload)
 
     @staticmethod
+    def _run_experiment_state_hash(
+        run_id: str,
+        experiment_id: str,
+        sequence: int,
+        status: str,
+        transition_id: str,
+        predecessor_transition_id: str | None,
+    ) -> str:
+        payload = json.dumps(
+            {
+                "experiment_id": experiment_id,
+                "predecessor_transition_id": predecessor_transition_id,
+                "run_id": run_id,
+                "sequence": sequence,
+                "status": status,
+                "transition_id": transition_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return _content_hash(payload)
+
+    def _run_experiment_status(
+        self, connection: sqlite3.Connection, run_id: str, experiment_id: str
+    ) -> str | None:
+        row = connection.execute(
+            "SELECT sequence, status, transition_id, predecessor_transition_id, "
+            "content_sha256 FROM authority_run_experiment_states "
+            "WHERE run_id = ? AND experiment_id = ? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (run_id, experiment_id),
+        ).fetchone()
+        if row is None:
+            return None
+        expected = self._run_experiment_state_hash(
+            run_id,
+            experiment_id,
+            int(row[0]),
+            str(row[1]),
+            str(row[2]),
+            str(row[3]) if row[3] is not None else None,
+        )
+        if row[4] != expected:
+            raise PersistenceConflictError("persisted run experiment state integrity check failed")
+        return str(row[1])
+
+    @staticmethod
     def _insert_audit(connection: sqlite3.Connection, event: AuditEvent) -> None:
         payload = event.model_dump_json()
         row = connection.execute(
@@ -1784,12 +1831,10 @@ class ApplicationRepository:
         ):
             raise ValueError("validation operation subject provenance is invalid")
 
-        state = connection.execute(
-            "SELECT status, experiment_id FROM experiment_states WHERE experiment_id = ? "
-            "ORDER BY sequence DESC LIMIT 1",
-            (observation.experiment_id,),
-        ).fetchone()
-        if state is None or tuple(state) != ("completed", observation.experiment_id):
+        state = self._run_experiment_status(
+            connection, observation.run_id, observation.experiment_id
+        )
+        if state != "completed":
             raise ValueError("scored observation requires a completed experiment")
 
     def get_scored_observation(self, observation_id: str) -> ScoredObservation | None:
@@ -1853,6 +1898,51 @@ class ApplicationRepository:
                 )
             values.append(observation)
         return tuple(values)
+
+    def get_run_champion(self, run_id: str) -> ChampionBinding | None:
+        """Return the persisted champion projection using closure tie semantics."""
+        closure = self.get_run_closure(run_id)
+        if closure is not None:
+            return closure.champion
+        observations = self.list_scored_observations(run_id)
+        claims = {
+            claim.attempt_id: claim
+            for claim in self.list_full_attempt_claims(run_id)
+        }
+        return self._select_champion(observations, claims)
+
+    @staticmethod
+    def _select_champion(
+        observations: list[ScoredObservation] | tuple[ScoredObservation, ...],
+        claims: dict[str, FullScientificAttemptClaim],
+    ) -> ChampionBinding | None:
+        if not observations:
+            return None
+        candidates = [
+            (observation, claims[observation.attempt_id])
+            for observation in observations
+            if observation.attempt_id in claims
+        ]
+        if len(candidates) != len(observations):
+            raise PersistenceConflictError("observation has no claim in its run")
+        observation, attempt = min(
+            candidates,
+            key=lambda item: (
+                -item[0].primary_score,
+                item[1].attempt_sequence,
+                item[0].evaluation_id,
+            ),
+        )
+        return ChampionBinding(
+            observation_id=observation.observation_id,
+            attempt_id=observation.attempt_id,
+            execution_id=observation.execution_id,
+            evaluation_id=observation.evaluation_id,
+            checkpoint_id=observation.checkpoint_id,
+            source_commit=observation.source_commit,
+            attempt_sequence=attempt.attempt_sequence,
+            primary_score=observation.primary_score,
+        )
 
     def close_run(
         self,
@@ -1948,34 +2038,8 @@ class ApplicationRepository:
                     raise PersistenceConflictError("observation attempt sequence is inconsistent")
                 observations.append(observation)
 
-            champion: object = None
-            if observations:
-                by_attempt = {claim.attempt_id: claim for claim in claims}
-                candidates = [
-                    (observation, by_attempt[observation.attempt_id])
-                    for observation in observations
-                    if observation.attempt_id in by_attempt
-                ]
-                if len(candidates) != len(observations):
-                    raise PersistenceConflictError("observation has no claim in its run")
-                selected, selected_attempt = min(
-                    candidates,
-                    key=lambda item: (
-                        -item[0].primary_score,
-                        item[1].attempt_sequence,
-                        item[0].evaluation_id,
-                    ),
-                )
-                champion = ChampionBinding(
-                    observation_id=selected.observation_id,
-                    attempt_id=selected.attempt_id,
-                    execution_id=selected.execution_id,
-                    evaluation_id=selected.evaluation_id,
-                    checkpoint_id=selected.checkpoint_id,
-                    source_commit=selected.source_commit,
-                    attempt_sequence=selected_attempt.attempt_sequence,
-                    primary_score=selected.primary_score,
-                )
+            by_attempt = {claim.attempt_id: claim for claim in claims}
+            champion = self._select_champion(observations, by_attempt)
 
             scores = [observation.primary_score for observation in observations]
             plateau = convergence_reason(scores, epsilon=epsilon, patience=patience) == "plateau"
@@ -2758,37 +2822,73 @@ class ApplicationRepository:
                             now,
                         ),
                     )
-            state = connection.execute(
-                "SELECT status, transition_id FROM experiment_states WHERE experiment_id = ? "
-                "ORDER BY sequence DESC LIMIT 1",
-                (spec.experiment_id,),
+            association = connection.execute(
+                "SELECT sequence, status, predecessor_transition_id, content_sha256 "
+                "FROM authority_run_experiment_states "
+                "WHERE run_id = ? AND experiment_id = ? AND transition_id = ?",
+                (run_id, spec.experiment_id, transition_id),
             ).fetchone()
-            transition_hash = self._transition(
-                "experiment",
+            if association is not None:
+                replay_hash = self._run_experiment_state_hash(
+                    run_id,
+                    spec.experiment_id,
+                    int(association[0]),
+                    status,
+                    transition_id,
+                    expected_predecessor,
+                )
+                if (
+                    association[1] != status
+                    or association[2] != expected_predecessor
+                    or association[3] != replay_hash
+                ):
+                    raise PersistenceConflictError(
+                        f"run experiment state {run_id}/{spec.experiment_id}/{transition_id} "
+                        "content changed"
+                    )
+                return
+            self._run_experiment_status(connection, run_id, spec.experiment_id)
+            current_association = connection.execute(
+                "SELECT transition_id FROM authority_run_experiment_states "
+                "WHERE run_id = ? AND experiment_id = ? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (run_id, spec.experiment_id),
+            ).fetchone()
+            if (current_association[0] if current_association else None) != expected_predecessor:
+                raise PersistenceConflictError(
+                    f"run experiment transition {transition_id} has a stale predecessor"
+                )
+            next_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 "
+                    "FROM authority_run_experiment_states "
+                    "WHERE run_id = ? AND experiment_id = ?",
+                    (run_id, spec.experiment_id),
+                ).fetchone()[0]
+            )
+            run_state_hash = self._run_experiment_state_hash(
+                run_id,
                 spec.experiment_id,
+                next_sequence,
                 status,
                 transition_id,
                 expected_predecessor,
             )
-            prior = connection.execute(
-                "SELECT content_sha256 FROM experiment_states WHERE transition_id = ?",
-                (transition_id,),
-            ).fetchone()
-            if prior is not None:
-                if prior[0] != transition_hash:
-                    raise PersistenceConflictError(
-                        f"experiment transition {transition_id} content changed"
-                    )
-                return
-            if (state[1] if state else None) != expected_predecessor:
-                raise PersistenceConflictError(
-                    f"experiment transition {transition_id} has a stale predecessor"
-                )
             connection.execute(
-                "INSERT INTO experiment_states "
-                "(experiment_id, status, transition_id, content_sha256, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (spec.experiment_id, status, transition_id, transition_hash, now),
+                "INSERT INTO authority_run_experiment_states "
+                "(run_id, experiment_id, sequence, status, transition_id, "
+                "predecessor_transition_id, content_sha256, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    spec.experiment_id,
+                    next_sequence,
+                    status,
+                    transition_id,
+                    expected_predecessor,
+                    run_state_hash,
+                    now,
+                ),
             )
             event = audit_event or self._automatic_event(
                 "experiment_state_changed",
@@ -2814,14 +2914,39 @@ class ApplicationRepository:
     def list_experiments_by_status(
         self, run_id: str, status: str
     ) -> tuple[ExperimentSpec, ...]:
-        """Return persisted experiment specs with the given status (run-scoped DB)."""
-        del run_id  # experiments table is per-run; kept for API symmetry
+        """Return current experiment specs with the given status for one run."""
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT spec_json FROM experiments WHERE status = ? ORDER BY created_at",
-                (status,),
+                "SELECT authority.spec_json, current.run_id, current.experiment_id, "
+                "current.sequence, current.status, current.transition_id, "
+                "current.predecessor_transition_id, current.content_sha256 "
+                "FROM authority_run_experiment_states AS current "
+                "JOIN authority_experiments AS authority "
+                "ON authority.experiment_id = current.experiment_id "
+                "WHERE current.run_id = ? "
+                "AND current.sequence = ("
+                "SELECT MAX(latest.sequence) FROM authority_run_experiment_states AS latest "
+                "WHERE latest.run_id = current.run_id "
+                "AND latest.experiment_id = current.experiment_id) "
+                "ORDER BY current.sequence, current.experiment_id",
+                (run_id,),
             ).fetchall()
-        return tuple(ExperimentSpec.model_validate_json(row[0]) for row in rows)
+        values: list[ExperimentSpec] = []
+        for row in rows:
+            if row[7] != self._run_experiment_state_hash(
+                str(row[1]),
+                str(row[2]),
+                int(row[3]),
+                str(row[4]),
+                str(row[5]),
+                str(row[6]) if row[6] is not None else None,
+            ):
+                raise PersistenceConflictError(
+                    "persisted run experiment state integrity check failed"
+                )
+            if row[4] == status:
+                values.append(ExperimentSpec.model_validate_json(row[0]))
+        return tuple(values)
 
     def list_experiments(
         self, limit: int = 50, exclude_experiment_id: str | None = None
@@ -2846,11 +2971,7 @@ class ApplicationRepository:
                     connection.execute("SELECT COUNT(*) FROM authority_experiments").fetchone()[0]
                 )
             query = (
-                "SELECT authority.spec_json, COALESCE(("
-                "SELECT state.status FROM experiment_states AS state "
-                "WHERE state.experiment_id = authority.experiment_id "
-                "ORDER BY state.sequence DESC LIMIT 1"
-                "), 'proposed') "
+                "SELECT authority.spec_json, 'registered' "
                 "FROM authority_experiments AS authority "
                 + where
                 + "ORDER BY authority.created_at DESC LIMIT ?"
@@ -3138,14 +3259,12 @@ class ApplicationRepository:
                 "SELECT status FROM run_states WHERE run_id = ? ORDER BY sequence DESC LIMIT 1",
                 (request.run_id,),
             ).fetchone()
-            experiment_status = connection.execute(
-                "SELECT status FROM experiment_states WHERE experiment_id = ? "
-                "ORDER BY sequence DESC LIMIT 1",
-                (request.experiment_id,),
-            ).fetchone()
+            experiment_status = self._run_experiment_status(
+                connection, request.run_id, request.experiment_id
+            )
             if run_status is None or run_status[0] != "converged":
                 raise FinalTestAccessError("provisional finalization requires a converged run")
-            if experiment_status is None or experiment_status[0] != "converged":
+            if experiment_status != "converged":
                 raise FinalTestAccessError(
                     "provisional finalization requires a converged experiment"
                 )
@@ -3328,16 +3447,10 @@ class ApplicationRepository:
                 "SELECT 1 FROM authority_experiments WHERE experiment_id = ?",
                 (request.experiment_id,),
             ).fetchone()
-            experiment_status = connection.execute(
-                "SELECT status FROM experiment_states WHERE experiment_id = ? "
-                "ORDER BY sequence DESC LIMIT 1",
-                (request.experiment_id,),
-            ).fetchone()
-            if (
-                experiment is None
-                or experiment_status is None
-                or experiment_status[0] != "converged"
-            ):
+            experiment_status = self._run_experiment_status(
+                connection, request.run_id, request.experiment_id
+            )
+            if experiment is None or experiment_status != "converged":
                 raise FinalTestAccessError("final test requires a converged experiment")
             self._validate_source(
                 connection, request.experiment_id, request.run_id, request.source_commit
@@ -3746,6 +3859,20 @@ class ApplicationRepository:
                     "VALUES (?, ?, ?, ?)",
                     (kind, record_id, payload_json, _content_hash(payload_json)),
                 )
+
+    def get_json(self, kind: str, record_id: str) -> str | None:
+        """Read one generic record without touching unrelated historical rows."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json, content_sha256 FROM records "
+                "WHERE kind = ? AND record_id = ?",
+                (kind, record_id),
+            ).fetchone()
+        if row is None:
+            return None
+        if row[1] is None or _content_hash(row[0]) != row[1]:
+            raise PersistenceConflictError(f"record {kind}/{record_id} integrity check failed")
+        return str(row[0])
 
     def list_json(self, kind: str) -> tuple[str, ...]:
         if kind == "baseline_calibration":

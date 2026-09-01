@@ -79,6 +79,30 @@ def test_criterion_history_migration_is_tracked_and_idempotent(tmp_path: Path) -
     } <= tables
 
 
+def test_run_experiment_state_migration_is_tracked_and_idempotent(tmp_path: Path) -> None:
+    database = tmp_path / "app.sqlite3"
+    runner = MigrationRunner(database, application_migrations_path())
+    runner.apply()
+    runner.apply()
+
+    with sqlite3.connect(database) as connection:
+        applied = connection.execute(
+            "SELECT version FROM schema_migrations WHERE version = 11"
+        ).fetchall()
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(authority_run_experiment_states)"
+            ).fetchall()
+        }
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM authority_run_experiment_states"
+        ).fetchone()
+    assert applied == [(11,)]
+    assert "predecessor_transition_id" in columns
+    assert rows == (0,)
+
+
 def test_lifecycle_migration_backfills_shared_record_hashes(tmp_path: Path) -> None:
     database = tmp_path / "app.sqlite3"
     migrations = tmp_path / "migrations"

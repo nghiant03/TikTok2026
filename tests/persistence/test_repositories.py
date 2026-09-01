@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from tiktok2026.adapters import RepositoryRunStore
 from tiktok2026.contracts import (
     ArtifactRecord,
     ArtifactRetention,
@@ -15,6 +16,8 @@ from tiktok2026.contracts import (
     EvaluatorIdentity,
     ExperimentRegistryEntry,
     ExperimentSpec,
+    FailureKind,
+    FailureRecord,
     Fidelity,
     FinalTestAuthorizationRequest,
     FinalTestRequest,
@@ -98,6 +101,121 @@ def test_experiment_write_is_idempotent(tmp_path: Path) -> None:
     assert repository.get_experiment("exp-1") == spec()
 
 
+def test_run_experiment_state_survives_restart_without_synthetic_history(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "app.sqlite3"
+    repository = ApplicationRepository(database)
+    repository.initialize()
+    repository.put_run(
+        RunRecord(run_id="run-1", status="running"),
+        transition_id="run-running",
+        expected_predecessor=None,
+    )
+    repository.put_experiment(
+        spec(), "proposed", "run-1", "exp-proposed", expected_predecessor=None
+    )
+
+    ApplicationRepository(database).initialize()
+
+    with sqlite3.connect(database) as connection:
+        states = connection.execute(
+            "SELECT sequence, transition_id, predecessor_transition_id "
+            "FROM authority_run_experiment_states"
+        ).fetchall()
+    assert states == [(1, "exp-proposed", None)]
+
+
+def test_run_experiment_replay_binds_predecessor_and_reads_validate_integrity(
+    tmp_path: Path,
+) -> None:
+    repository = ApplicationRepository(tmp_path / "app.sqlite3")
+    repository.initialize()
+    repository.put_run(
+        RunRecord(run_id="run-1", status="running"),
+        transition_id="run-running",
+        expected_predecessor=None,
+    )
+    repository.put_experiment(
+        spec(), "proposed", "run-1", "exp-proposed", expected_predecessor=None
+    )
+
+    with pytest.raises(PersistenceConflictError, match="content changed"):
+        repository.put_experiment(
+            spec(),
+            "proposed",
+            "run-1",
+            "exp-proposed",
+            expected_predecessor="different-predecessor",
+        )
+
+    with sqlite3.connect(repository.database) as connection:
+        connection.execute(
+            "UPDATE authority_run_experiment_states SET status = 'converged' "
+            "WHERE run_id = 'run-1' AND experiment_id = 'exp-1'"
+        )
+    with pytest.raises(PersistenceConflictError, match="integrity check failed"):
+        repository.list_experiments_by_status("run-1", "proposed")
+
+
+def test_experiment_status_is_scoped_to_run(tmp_path: Path) -> None:
+    repository = ApplicationRepository(tmp_path / "app.sqlite3")
+    repository.initialize()
+    for run_id in ("run-a", "run-b"):
+        repository.put_run(
+            RunRecord(run_id=run_id, status="running"),
+            transition_id=f"{run_id}-active",
+            expected_predecessor=None,
+        )
+    repository.put_experiment(spec(), "proposed", "run-a", "exp-proposed", None)
+    repository.put_experiment(spec(), "proposed", "run-b", "exp-proposed", None)
+
+    repository.put_experiment(
+        spec(), "completed", "run-a", "exp-completed", "exp-proposed"
+    )
+
+    run_a_proposals = repository.list_experiments_by_status("run-a", "proposed")
+    run_b_proposals = repository.list_experiments_by_status("run-b", "proposed")
+    assert run_a_proposals == ()
+    assert tuple(item.experiment_id for item in run_b_proposals) == (
+        "exp-1",
+    )
+
+
+def test_legacy_failure_replay_preserves_unbound_json_and_rejects_mismatch(
+    tmp_path: Path,
+) -> None:
+    repository = ApplicationRepository(tmp_path / "app.sqlite3")
+    repository.initialize()
+    store = RepositoryRunStore(repository)
+    legacy = FailureRecord(
+        failure_id="legacy-failure-" + "x" * 500,
+        kind=FailureKind.SCHEMA_MISMATCH,
+        evidence_refs=tuple("legacy-evidence-" + "x" * 500 for _ in range(100)),
+        repair_attempt=100,
+    )
+    repository.put_json("failure", legacy.failure_id, legacy.model_dump_json())
+
+    store.put_failure(legacy, "run-a")
+
+    assert repository.list_json("failure") == (legacy.model_dump_json(),)
+    with pytest.raises(ValueError, match="does not match"):
+        store.put_failure(legacy.model_copy(update={"run_id": "run-b"}), "run-a")
+    with pytest.raises(PersistenceConflictError, match="legacy content changed"):
+        store.put_failure(legacy.model_copy(update={"evidence_refs": ("changed",)}), "run-a")
+
+    # A malformed unrelated legacy row is not parsed while locating a new ID.
+    repository.put_json("failure", "malformed-history", "not-json")
+    current = FailureRecord(
+        failure_id="new-failure",
+        kind=FailureKind.TIMEOUT,
+        evidence_refs=("current-evidence",),
+        repair_attempt=0,
+    )
+    store.put_failure(current, "run-a")
+    assert any('"failure_id":"new-failure"' in item for item in repository.list_json("failure"))
+
+
 def test_experiment_registry_source_is_bounded_and_reports_total(tmp_path: Path) -> None:
     repository = ApplicationRepository(tmp_path / "app.sqlite3")
     repository.initialize()
@@ -123,7 +241,7 @@ def test_experiment_registry_source_is_bounded_and_reports_total(tmp_path: Path)
             hypothesis_id="hyp-1",
             hypothesis="A deterministic test",
             mechanism="Exercise persistence",
-            status="proposed",
+            status="registered",
         ),
     )
 

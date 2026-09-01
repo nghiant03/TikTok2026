@@ -354,8 +354,26 @@ def test_runtime_init_creates_external_layout_and_applies_actual_migrations(
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    assert {"experiments", "audit_events", "evaluations", "finalizations"} <= tables
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)]
+    assert {
+        "experiments",
+        "audit_events",
+        "evaluations",
+        "finalizations",
+        "authority_run_experiment_states",
+    } <= tables
+    assert versions == [
+        (1,),
+        (2,),
+        (3,),
+        (4,),
+        (5,),
+        (6,),
+        (7,),
+        (8,),
+        (9,),
+        (10,),
+        (11,),
+    ]
 
 
 def test_runtime_init_rejects_runtime_root_inside_repository() -> None:

@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from tiktok2026.config import AppSettings, BudgetSettings, ExecutionSettings, ModelSettings
+from tiktok2026.config import (
+    AppSettings,
+    BudgetSettings,
+    ExecutionSettings,
+    ModelSettings,
+    OnlineResearchSettings,
+)
 from tiktok2026.contracts import CURRENT_EVALUATOR_ID, RuntimePaths
 
 
@@ -44,6 +50,25 @@ def test_model_settings_reasoning_effort_defaults_none() -> None:
 def test_model_settings_accepts_reasoning_effort() -> None:
     settings = ModelSettings(reasoning_effort="high")
     assert settings.reasoning_effort == "high"
+
+
+def test_online_research_is_disabled_and_bounded_by_default() -> None:
+    settings = OnlineResearchSettings()
+    assert settings.enabled is False
+    assert settings.max_searches == 3
+    assert settings.max_results_per_search == 5
+    with pytest.raises(ValidationError):
+        OnlineResearchSettings(max_searches=9)
+
+
+def test_online_research_requires_a_research_model(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="requires research model"):
+        AppSettings(
+            repository_root=tmp_path / "repo",
+            runtime_root=tmp_path / "runtime",
+            models={},
+            online_research=OnlineResearchSettings(enabled=True),
+        )
 
 
 def test_settings_reject_unknown_fields(tmp_path: Path) -> None:

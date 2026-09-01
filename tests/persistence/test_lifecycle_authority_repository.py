@@ -104,10 +104,19 @@ def _repository(tmp_path: Path) -> ApplicationRepository:
             ("experiment-1", hashlib.sha256(b"{}").hexdigest(), now),
         )
         connection.execute(
-            "INSERT INTO experiment_states "
-            "(experiment_id, status, transition_id, content_sha256, created_at) "
-            "VALUES (?, 'completed', ?, ?, ?)",
-            ("experiment-1", "test-completed", "state", now),
+            "INSERT INTO authority_run_experiment_states "
+            "(run_id, experiment_id, sequence, status, transition_id, "
+            "predecessor_transition_id, content_sha256, created_at) "
+            "VALUES (?, ?, 1, 'completed', ?, NULL, ?, ?)",
+            (
+                "run-1",
+                "experiment-1",
+                "test-completed",
+                ApplicationRepository._run_experiment_state_hash(
+                    "run-1", "experiment-1", 1, "completed", "test-completed", None
+                ),
+                now,
+            ),
         )
         connection.execute(
             "INSERT INTO source_registrations "
@@ -665,20 +674,50 @@ def test_observation_replay_precedes_state_and_closure_checks(tmp_path: Path) ->
     record = repository.put_scored_observation(request)
     with sqlite3.connect(repository.database) as connection:
         connection.execute(
-            "INSERT INTO experiment_states "
-            "(experiment_id, status, transition_id, content_sha256, created_at) "
-            "VALUES (?, 'converged', ?, ?, ?)",
-            ("experiment-1", "test-converged", "state-2", datetime.now(UTC).isoformat()),
+            "INSERT INTO authority_run_experiment_states "
+            "(run_id, experiment_id, sequence, status, transition_id, "
+            "predecessor_transition_id, content_sha256, created_at) "
+            "VALUES (?, ?, 2, 'converged', ?, ?, ?, ?)",
+            (
+                "run-1",
+                "experiment-1",
+                "test-converged",
+                "test-completed",
+                ApplicationRepository._run_experiment_state_hash(
+                    "run-1",
+                    "experiment-1",
+                    2,
+                    "converged",
+                    "test-converged",
+                    "test-completed",
+                ),
+                datetime.now(UTC).isoformat(),
+            ),
         )
     assert repository.put_scored_observation(request) == record
     with pytest.raises(PersistenceConflictError, match="content changed"):
         repository.put_scored_observation(request.model_copy(update={"primary_score": 0.61}))
     with sqlite3.connect(repository.database) as connection:
         connection.execute(
-            "INSERT INTO experiment_states "
-            "(experiment_id, status, transition_id, content_sha256, created_at) "
-            "VALUES (?, 'completed', ?, ?, ?)",
-            ("experiment-1", "test-completed-again", "state-3", datetime.now(UTC).isoformat()),
+            "INSERT INTO authority_run_experiment_states "
+            "(run_id, experiment_id, sequence, status, transition_id, "
+            "predecessor_transition_id, content_sha256, created_at) "
+            "VALUES (?, ?, 3, 'completed', ?, ?, ?, ?)",
+            (
+                "run-1",
+                "experiment-1",
+                "test-completed-again",
+                "test-converged",
+                ApplicationRepository._run_experiment_state_hash(
+                    "run-1",
+                    "experiment-1",
+                    3,
+                    "completed",
+                    "test-completed-again",
+                    "test-converged",
+                ),
+                datetime.now(UTC).isoformat(),
+            ),
         )
     for index in range(2, 51):
         repository.claim_full_attempt(_claim_request(f"execution-{index}"))

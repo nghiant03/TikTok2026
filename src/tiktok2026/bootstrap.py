@@ -27,6 +27,7 @@ from tiktok2026.adapters import (
     RepositoryTransitionStore,
     RoleSpecificAgentClient,
 )
+from tiktok2026.agents.research.online import OpenAIWebSearchProvider
 from tiktok2026.benchmark.kuaireand_pure.manifest import BenchmarkManifest, verify_protected_files
 from tiktok2026.contracts import (
     DEFAULT_IMPLEMENTATION_CRITERIA,
@@ -1659,6 +1660,7 @@ def build_production_services(settings: Any) -> ProductionServices:
     from tiktok2026.evaluation.registry import ProvisionalEvaluator
     from tiktok2026.execution.docker import AuthorizedTrainingDatasetProvider, ExecutionPolicy
     from tiktok2026.persistence.artifacts import ArtifactStore
+    from tiktok2026.repository.inspector import RepositoryInspector
     from tiktok2026.repository.worktrees import GitWorktreeManager
 
     if isinstance(settings, AppSettings):
@@ -1770,9 +1772,22 @@ def build_production_services(settings: Any) -> ProductionServices:
             "evaluation_read",
         ),
     }
+    research_model = app_settings.models.get(AgentRole.RESEARCH)
+    online_research = (
+        OpenAIWebSearchProvider(research_model, paths.literature)
+        if app_settings.online_research.enabled and research_model is not None
+        else None
+    )
     agents: dict[AgentRole, RoleSpecificAgentClient] = {
         role: RoleSpecificAgentClient(
-            OpenAICompatibleClient(model), role, prompts[role], capabilities[role]
+            OpenAICompatibleClient(model),
+            role,
+            prompts[role],
+            capabilities[role],
+            online_research=online_research if role == AgentRole.RESEARCH else None,
+            max_online_searches=app_settings.online_research.max_searches,
+            max_online_results=app_settings.online_research.max_results_per_search,
+            online_allowed_domains=app_settings.online_research.allowed_domains,
         )
         for role, model in app_settings.models.items()
     }
@@ -1784,6 +1799,7 @@ def build_production_services(settings: Any) -> ProductionServices:
         resource_accountant=LedgerResourceAccountant(ledger),
         policy_gate=DeterministicPolicyGate(),
         run_store=run_store,
+        repository_inspector=RepositoryInspector(app_settings.repository_root),
         export_service=RepositoryExportService(repo, paths.root),
         bundle_service=RepositoryFinalizationBundleService(repo, paths.root),
         frontier_service=RepositoryFrontierService(

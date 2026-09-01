@@ -298,6 +298,32 @@ class EvidenceItem(ContractModel):
     contains_test_labels: bool = False
 
 
+class OnlineSearchRequest(ContractModel):
+    request_id: Annotated[str, Field(min_length=1, max_length=256)]
+    query: Annotated[str, Field(min_length=3, max_length=500)]
+    max_results: Annotated[int, Field(ge=1, le=8)] = 5
+    allowed_domains: Annotated[
+        tuple[Annotated[str, Field(min_length=1, max_length=253)], ...], Field(max_length=32)
+    ] = ()
+
+
+class OnlineSource(ContractModel):
+    source_id: Annotated[str, Field(min_length=1, max_length=256)]
+    url: Annotated[str, Field(min_length=1, max_length=2_048)]
+    title: Annotated[str, Field(max_length=500)] = ""
+    excerpt: Annotated[str, Field(max_length=2_000)] = ""
+    content_sha256: Sha256
+    retrieved_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class OnlineSearchResult(ContractModel):
+    result_id: Annotated[str, Field(min_length=1, max_length=256)]
+    request_id: Annotated[str, Field(min_length=1, max_length=256)]
+    provider: Annotated[str, Field(min_length=1, max_length=128)]
+    response_id: Annotated[str, Field(max_length=256)] | None = None
+    sources: Annotated[tuple[OnlineSource, ...], Field(max_length=8)] = ()
+
+
 class ResearchDecision(ContractModel):
     request_id: str
     kind: Literal["proposal", "evidence_request", "interpretation"]
@@ -1379,11 +1405,16 @@ class RunBaselineBinding(ContractModel):
 
 class FailureRecord(ContractModel):
     schema_version: Literal["1"] = "1"
+    # Failure v1 was intentionally permissive.  Keep these shapes unchanged so
+    # records written by older controllers remain replayable; the controller and
+    # persistence adapter apply limits at their write boundaries instead.
     failure_id: str
+    # New records are run-bound; the optional field keeps older records readable.
+    run_id: str | None = None
     experiment_id: str | None = None
     kind: FailureKind
     evidence_refs: tuple[str, ...]
-    repair_attempt: Annotated[int, Field(ge=0, le=3)]
+    repair_attempt: int
     scientific_evidence: bool = False
 
 
@@ -1518,6 +1549,84 @@ class ControllerContext(ContractModel):
         return self
 
 
+class SourceContext(ContractModel):
+    """Bounded view of the implementation pipeline at the approved parent."""
+
+    schema_version: Literal["1"] = "1"
+    evidence_id: Annotated[str, Field(min_length=1, max_length=256)]
+    source_commit: FullCommitSha
+    parent_commit: FullCommitSha
+    entrypoint_path: Literal["src/tiktok2026/experiment/train.py"] = (
+        "src/tiktok2026/experiment/train.py"
+    )
+    entrypoint_sha256: Sha256
+    source_summary: Annotated[str, Field(max_length=2_000)] = ""
+    source_excerpt: Annotated[str, Field(max_length=2_000)] = ""
+    structural_summary: Annotated[tuple[str, ...], Field(max_length=32)] = ()
+
+    @model_validator(mode="after")
+    def validate_parent_binding(self) -> SourceContext:
+        if self.source_commit != self.parent_commit:
+            raise ValueError("source context must describe its approved parent commit")
+        return self
+
+
+class ProposalSummary(ContractModel):
+    """A proposed-but-not-yet-run experiment, shown to the orchestration agent."""
+
+    experiment_id: Annotated[str, Field(min_length=1, max_length=256)]
+    hypothesis: Annotated[str, Field(max_length=2_000)]
+    mechanism: Annotated[str, Field(max_length=2_000)]
+    implementation_scope: Annotated[
+        tuple[Annotated[str, Field(max_length=256)], ...], Field(max_length=16)
+    ] = ()
+    parent_experiment_id: Annotated[str, Field(max_length=256)] | None = None
+
+
+class OutcomeSummary(ContractModel):
+    """A completed experiment outcome, part of the history the agent ranks with."""
+
+    experiment_id: Annotated[str, Field(min_length=1, max_length=256)]
+    hypothesis: Annotated[str, Field(max_length=2_000)]
+    primary_score: float | None = None
+    delta_vs_parent: float | None = None
+    terminal: Literal["scored", "failed"] = "scored"
+    failure_summary: Annotated[str, Field(max_length=2_000)] | None = None
+    ordering_key: Annotated[str, Field(max_length=256)] = ""
+
+
+class ExperimentHistoryContext(ContractModel):
+    """Bounded, run-local experiment history supplied to planning roles."""
+
+    schema_version: Literal["1"] = "1"
+    evidence_id: Annotated[str, Field(min_length=1, max_length=256)]
+    run_id: Annotated[str, Field(min_length=1, max_length=256)]
+    records: Annotated[tuple[OutcomeSummary, ...], Field(max_length=50)] = ()
+    pending_proposals: Annotated[tuple[ProposalSummary, ...], Field(max_length=50)] = ()
+    champion_experiment_id: str | None = None
+    champion_score: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
+    total_records: Annotated[int, Field(ge=0)] = 0
+    truncated: bool = False
+    total_pending_proposals: Annotated[int, Field(ge=0)] = 0
+    pending_truncated: bool = False
+
+    @model_validator(mode="after")
+    def validate_coverage(self) -> ExperimentHistoryContext:
+        if self.total_records < len(self.records):
+            raise ValueError("history total cannot be smaller than its records")
+        if self.total_pending_proposals < len(self.pending_proposals):
+            raise ValueError("pending proposal total cannot be smaller than its entries")
+        if self.truncated != (self.total_records > len(self.records)):
+            raise ValueError("history truncation does not match its records")
+        if self.pending_truncated != (
+            self.total_pending_proposals > len(self.pending_proposals)
+        ):
+            raise ValueError("pending proposal truncation does not match its entries")
+        if (self.champion_experiment_id is None) != (self.champion_score is None):
+            raise ValueError("champion score requires a champion experiment")
+        return self
+
+
 class ResearchRequest(ContractModel):
     request_id: str
     objective: str
@@ -1526,26 +1635,9 @@ class ResearchRequest(ContractModel):
     allowed_paths: tuple[str, ...] = ("src/tiktok2026/experiment",)
     controller_context: ControllerContext | None = None
     unresolved_blockers: tuple[ValidationBlockerContext, ...] = ()
+    source_context: SourceContext | None = None
+    experiment_history: ExperimentHistoryContext | None = None
 
-class ProposalSummary(ContractModel):
-    """A proposed-but-not-yet-run experiment, shown to the orchestration agent."""
-
-    experiment_id: str
-    hypothesis: str
-    mechanism: str
-    implementation_scope: tuple[str, ...] = ()
-    parent_experiment_id: str | None = None
-
-
-class OutcomeSummary(ContractModel):
-    """A completed experiment outcome, part of the history the agent ranks with."""
-
-    experiment_id: str
-    hypothesis: str
-    primary_score: float | None = None
-    delta_vs_parent: float | None = None
-    terminal: Literal["scored", "failed"] = "scored"
-    failure_summary: str | None = None
 
 class OrchestrationRequest(ContractModel):
     """Controller-owned feasible choices and bounded lifecycle evidence."""
@@ -1560,10 +1652,8 @@ class OrchestrationRequest(ContractModel):
     finalization_ready: bool = False
     failure_summary: str | None = None
     controller_context: ControllerContext | None = None
-    pending_proposals: tuple[ProposalSummary, ...] = ()
-    outcome_history: tuple[OutcomeSummary, ...] = ()
-    champion_experiment_id: str | None = None
-    champion_score: float | None = None
+    source_context: SourceContext | None = None
+    experiment_history: ExperimentHistoryContext | None = None
 
 
 class ArtifactRecord(ContractModel):

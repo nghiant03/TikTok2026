@@ -7,6 +7,7 @@ from tiktok2026.contracts.models import (
     ArtifactRecord,
     BaselineCalibrationRecord,
     BlockerResolution,
+    ChampionBinding,
     ContractModel,
     DatasetManifestIdentity,
     EvaluationRequest,
@@ -22,6 +23,8 @@ from tiktok2026.contracts.models import (
     FullAttemptClaimRequest,
     FullScientificAttemptClaim,
     ImplementationCriterionId,
+    OnlineSearchRequest,
+    OnlineSearchResult,
     PolicyDecisionModel,
     PredictionArtifactRegistration,
     ProvenanceRequest,
@@ -77,6 +80,20 @@ class RepositoryReader(Protocol):
     def search(self, query: str, max_results: int = 20) -> tuple[str, ...]: ...
 
 
+class RepositoryInspectorPort(Protocol):
+    """Read-only inspection of an explicitly selected repository revision."""
+
+    def read_at_commit(
+        self, commit: str, relative_path: str, max_characters: int = 20_000
+    ) -> str: ...
+
+    def sha256_at_commit(self, commit: str, relative_path: str) -> str: ...
+
+    def structural_summary_at_commit(
+        self, commit: str, relative_path: str, max_items: int = 32
+    ) -> tuple[str, ...]: ...
+
+
 class ScopedRepository(RepositoryReader, Protocol):
     def read_base(self, relative_path: str, max_characters: int = 20_000) -> str: ...
 
@@ -97,6 +114,10 @@ class MemoryReader(Protocol):
 
 class LiteratureReader(Protocol):
     async def retrieve(self, query: str, limit: int) -> tuple[ContractModel, ...]: ...
+
+
+class OnlineResearchProvider(Protocol):
+    async def search(self, request: OnlineSearchRequest) -> OnlineSearchResult: ...
 
 
 class TraceSink(Protocol):
@@ -272,6 +293,8 @@ class RunStore(Protocol):
     ) -> RunClosure: ...
 
     def get_run_closure(self, run_id: str) -> RunClosure | None: ...
+
+    def get_run_champion(self, run_id: str) -> ChampionBinding | None: ...
 
     def close_run_if_ready(
         self,

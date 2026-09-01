@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -46,6 +46,16 @@ class ExecutionSettings(BaseModel):
     smoke_disk_bytes: int = Field(default=64 * 1024 * 1024, gt=0)
 
 
+class OnlineResearchSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = False
+    provider: Literal["openai_web_search"] = "openai_web_search"
+    max_searches: int = Field(default=3, ge=1, le=8)
+    max_results_per_search: int = Field(default=5, ge=1, le=8)
+    allowed_domains: tuple[str, ...] = Field(default=(), max_length=32)
+
+
 class AppSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -55,6 +65,7 @@ class AppSettings(BaseModel):
     profile: str = "test"
     budget: BudgetSettings = BudgetSettings()
     execution: ExecutionSettings = ExecutionSettings()
+    online_research: OnlineResearchSettings = OnlineResearchSettings()
     models: dict[AgentRole, ModelSettings] = {role: ModelSettings() for role in AgentRole}
     docker_image: str = "tiktok2026:local"
     evaluator_id: str = CURRENT_EVALUATOR_ID
@@ -66,6 +77,8 @@ class AppSettings(BaseModel):
     def validate_production_evaluator(self) -> AppSettings:
         if self.profile == "production" and self.evaluator_id != CURRENT_EVALUATOR_ID:
             raise ValueError("production requires the current authoritative evaluator")
+        if self.online_research.enabled and AgentRole.RESEARCH not in self.models:
+            raise ValueError("online research requires research model settings")
         return self
 
     @property

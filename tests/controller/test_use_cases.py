@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -17,6 +18,7 @@ from tiktok2026.contracts import (
     ArtifactRetention,
     BaselineCalibrationRecord,
     BlockerResolution,
+    ChampionBinding,
     ContractModel,
     CriterionAssessmentStatus,
     CriterionResolutionClaim,
@@ -66,6 +68,7 @@ from tiktok2026.controller import (
     ProductionController,
 )
 from tiktok2026.graph.state import ProductionState
+from tiktok2026.repository.inspector import RepositoryInspector
 from tiktok2026.use_cases import (
     ModelUnavailableError,
     ServiceTransitions,
@@ -438,6 +441,10 @@ class _FakeStore:
 
     def get_run_closure(self, run_id: str) -> RunClosure | None:
         return self.closure if self.closure is not None and self.closure.run_id == run_id else None
+
+    def get_run_champion(self, run_id: str) -> ChampionBinding | None:
+        del run_id
+        return None
 
     def close_run_if_ready(
         self,
@@ -1413,7 +1420,11 @@ async def test_orchestration_selects_among_pending_proposals() -> None:
     request = agent.calls[0]
     assert isinstance(request, OrchestrationRequest)
     assert DecisionAction.IMPLEMENT in request.allowed_actions
-    assert {p.experiment_id for p in request.pending_proposals} == {"exp-a", "exp-b"}
+    assert request.experiment_history is not None
+    assert {p.experiment_id for p in request.experiment_history.pending_proposals} == {
+        "exp-a",
+        "exp-b",
+    }
 
 
 async def test_orchestration_rejects_unknown_proposal_target() -> None:
@@ -1436,6 +1447,43 @@ async def test_orchestration_rejects_unknown_proposal_target() -> None:
 
     assert result["pending_route"] == "persist_failure"
     assert "unknown proposal" in str(result["terminal_reason"])
+
+
+async def test_orchestration_bounds_pending_history_and_authorizes_exposed_ids_only() -> None:
+    store = _MultiProposalStore()
+    for index in range(55):
+        store.experiments[f"exp-{index:02d}"] = _proposal(
+            f"exp-{index:02d}", "h" * 4_000
+        )
+    agent = _ScriptedAgentClient(
+        [
+            OrchestrationDecision(
+                decision_id="pick-hidden",
+                action=DecisionAction.IMPLEMENT,
+                target_experiment_id="exp-54",
+                rationale="not exposed",
+            )
+        ]
+    )
+    controller = ProductionController(_make_services(store=store, agent_client=agent))
+
+    result = await controller.orchestrate(minimal_state(phase=RunPhase.RESEARCH))
+
+    assert result["pending_route"] == "persist_failure"
+    request = agent.calls[0]
+    assert isinstance(request, OrchestrationRequest)
+    assert "pending_proposals" not in request.model_dump()
+    assert request.experiment_history is not None
+    assert request.experiment_history.total_pending_proposals == 55
+    assert request.experiment_history.pending_truncated is True
+    assert len(request.experiment_history.pending_proposals) == 50
+    assert "exp-54" not in {
+        proposal.experiment_id for proposal in request.experiment_history.pending_proposals
+    }
+    assert all(
+        len(proposal.hypothesis) <= 2_000
+        for proposal in request.experiment_history.pending_proposals
+    )
 
 async def test_orchestration_offers_empty_run_only_research() -> None:
     store = _FakeStore()
@@ -1626,6 +1674,55 @@ async def test_research_receives_authoritative_controller_context() -> None:
     assert request.controller_context.source_commit_stage == "post_implementation"
     assert request.controller_context.experiment_registry is not None
     assert request.controller_context.experiment_registry.complete is True
+
+
+async def test_planning_requests_share_exact_parent_source_and_run_history() -> None:
+    repository_root = Path(__file__).parents[2]
+    parent_commit = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    store = _FakeStore()
+    agent = _ScriptedAgentClient(
+        [
+            OrchestrationDecision(
+                decision_id="research-for-context",
+                action=DecisionAction.RESEARCH,
+                rationale="Need another bounded proposal",
+            ),
+            ResearchDecision(
+                request_id="research-test-run-1",
+                kind="proposal",
+                experiment_spec=_estimated_experiment(("src/tiktok2026/experiment",)),
+                message="bounded proposal",
+            ),
+        ]
+    )
+    controller = ProductionController(
+        _make_services(
+            store=store,
+            agent_client=agent,
+            repository_root=str(repository_root),
+            parent_commit=parent_commit,
+        )
+    )
+    state = minimal_state(phase=RunPhase.RESEARCH)
+
+    orchestration = await controller.orchestrate(state)
+    await controller.research(state | orchestration)  # type: ignore[arg-type]
+
+    orchestration_request, research_request = agent.calls
+    assert isinstance(orchestration_request, OrchestrationRequest)
+    assert isinstance(research_request, ResearchRequest)
+    assert orchestration_request.source_context is not None
+    assert research_request.source_context == orchestration_request.source_context
+    assert orchestration_request.source_context.source_commit == parent_commit
+    assert orchestration_request.experiment_history is not None
+    assert research_request.experiment_history is not None
+    assert orchestration_request.experiment_history.total_records == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2627,6 +2724,8 @@ def _make_services(
     default_memory_bytes: int = 1024**3,
     default_cpus: float = 1.0,
     default_gpu_count: int = 0,
+    repository_root: str | None = None,
+    parent_commit: str | None = None,
 ) -> ControllerServices:
     """Build real service-driven transitions with fake injected services."""
     if store is None:
@@ -2643,6 +2742,11 @@ def _make_services(
         resource_accountant=resource_accountant,
         run_store=store,
         evaluator_id="evaluator-1",
+        repository_root=repository_root,
+        parent_commit=parent_commit,
+        repository_inspector=(
+            RepositoryInspector(Path(repository_root)) if repository_root is not None else None
+        ),
         default_timeout_seconds=default_timeout_seconds,
         default_memory_bytes=default_memory_bytes,
         default_cpus=default_cpus,

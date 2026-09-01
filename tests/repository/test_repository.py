@@ -192,3 +192,17 @@ def test_inspector_bounds_reads(tmp_path: Path) -> None:
     create_repository(repository)
     (repository / "large.txt").write_text("abcdefghij", encoding="utf-8")
     assert RepositoryInspector(repository).read("large.txt", max_characters=4) == "abcd"
+
+
+def test_inspector_reads_the_requested_commit_not_checkout(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    first_commit = create_repository(repository)
+    target = repository / "README.md"
+    target.write_text("checkout\n", encoding="utf-8")
+    run_git(repository, "add", "README.md")
+    run_git(repository, "commit", "-m", "checkout change")
+
+    assert target.read_text(encoding="utf-8") == "checkout\n"
+    assert RepositoryInspector(repository).read_at_commit(
+        first_commit, "README.md"
+    ) == "base\n"

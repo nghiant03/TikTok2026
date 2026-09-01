@@ -25,6 +25,7 @@ from tiktok2026.contracts import (
     Evaluator,
     ExecutionRequest,
     Executor,
+    ExperimentHistoryContext,
     ExperimentSpec,
     ExportService,
     FailureKind,
@@ -47,6 +48,7 @@ from tiktok2026.contracts import (
     ProposalSummary,
     ProvenanceRequest,
     ProvisionalFinalizationRequest,
+    RepositoryInspectorPort,
     ResearchDecision,
     ResearchRequest,
     ResourceAccountant,
@@ -57,6 +59,7 @@ from tiktok2026.contracts import (
     RunRecord,
     RunStore,
     ScoredObservationRequest,
+    SourceContext,
     ValidationBlocker,
     ValidationBlockerContext,
     ValidationOperationIdentity,
@@ -81,6 +84,12 @@ class MissingAuthorityError(RuntimeError):
     """A transition cannot proceed without a persisted authority record."""
 
     terminal = True
+
+
+@dataclass(frozen=True)
+class _PendingProposalView:
+    items: tuple[ProposalSummary, ...]
+    total: int
 
 
 class TerminalLifecycleError(RuntimeError):
@@ -110,6 +119,12 @@ CONTROLLER_READ_SCOPES = (
 MAX_TERMINAL_TEXT = 2_000
 MAX_EVIDENCE_REFS = 8
 MAX_EVIDENCE_REF_LENGTH = 256
+MAX_CONTEXT_HISTORY = 50
+MAX_CONTEXT_PROPOSALS = 50
+SOURCE_CONTEXT_EXCERPT = 2_000
+MAX_PROPOSAL_TEXT = 2_000
+MAX_PROPOSAL_SCOPE = 256
+MAX_PROPOSAL_SCOPE_ITEMS = 16
 
 
 def _agent(s: ServiceTransitions, role: AgentRole) -> AgentClient | None:
@@ -216,6 +231,7 @@ class ServiceTransitions:
     resource_accountant: ResourceAccountant | None = None
     policy_gate: PolicyGate | None = None
     run_store: RunStore | None = None
+    repository_inspector: RepositoryInspectorPort | None = None
     frontier_service: FrontierService | None = None
     export_service: ExportService | None = None
     bundle_service: FinalizationBundleService | None = None
@@ -329,6 +345,7 @@ def make_service_transitions(
     resource_accountant: ResourceAccountant | None = None,
     policy_gate: PolicyGate | None = None,
     run_store: RunStore | None = None,
+    repository_inspector: RepositoryInspectorPort | None = None,
     frontier_service: FrontierService | None = None,
     export_service: ExportService | None = None,
     bundle_service: FinalizationBundleService | None = None,
@@ -360,6 +377,7 @@ def make_service_transitions(
         resource_accountant=resource_accountant,
         policy_gate=policy_gate,
         run_store=run_store,
+        repository_inspector=repository_inspector,
         frontier_service=frontier_service,
         export_service=export_service,
         bundle_service=bundle_service,
@@ -442,7 +460,7 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
             return {"pending_route": "research"}
         evaluated_candidate_ready = _evaluated_candidate_ready(s, state)
         pending = _pending_proposals(s, state["run_id"])
-        history = _outcome_history(s, state["run_id"])
+        history_context = _experiment_history(s, state["run_id"], pending)
         allowed_actions = (DecisionAction.RESEARCH,)
         if evaluated_candidate_ready:
             allowed_actions = (
@@ -451,7 +469,7 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
                 DecisionAction.INCREASE_FIDELITY,
                 DecisionAction.REVISIT_BRANCH,
             )
-        if pending:
+        if pending.total:
             allowed_actions = (*allowed_actions, DecisionAction.IMPLEMENT)
         request = OrchestrationRequest(
             request_id=f"orchestration-{state['run_id']}-{state['state_version']}",
@@ -464,8 +482,8 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
             finalization_ready=False,
             failure_summary=state.get("terminal_reason"),
             controller_context=_controller_context(s),
-            pending_proposals=pending,
-            outcome_history=history,
+            source_context=_source_context(s),
+            experiment_history=history_context,
         )
         response = await client.invoke(request)
         if isinstance(response, AgentFailure):
@@ -478,7 +496,9 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
                 FailureKind.SCHEMA_MISMATCH,
                 f"orchestration selected disallowed action: {response.action.value}",
             )
-        pending_ids = {p.experiment_id for p in pending}
+        # Only identities actually exposed in the bounded history context are
+        # selectable.  The total count is evidence, not authorization.
+        pending_ids = {p.experiment_id for p in history_context.pending_proposals}
         if response.action == DecisionAction.IMPLEMENT:
             if s.run_store is None or response.target_experiment_id not in pending_ids:
                 return _failure(
@@ -501,11 +521,14 @@ def _orchestrate(s: ServiceTransitions) -> Transition:
                 "terminal_reason": None,
                 "pending_route": "proposal_policy",
             }
-        if (
-            response.target_experiment_id is not None
-            and response.target_experiment_id != request.current_experiment_id
-            and response.target_experiment_id not in pending_ids
-        ):
+        if response.action in (DecisionAction.RESEARCH, DecisionAction.STOP):
+            if response.target_experiment_id is not None:
+                return _failure(
+                    state,
+                    FailureKind.SCHEMA_MISMATCH,
+                    f"{response.action.value} decisions must not select an experiment identity",
+                )
+        elif response.target_experiment_id != request.current_experiment_id:
             return _failure(
                 state,
                 FailureKind.SCHEMA_MISMATCH,
@@ -566,6 +589,8 @@ def _research(s: ServiceTransitions) -> Transition:
                     )
                 except MissingAuthorityError as error:
                     return _failure(state, FailureKind.SCHEMA_MISMATCH, str(error))
+        pending = _pending_proposals(s, state["run_id"])
+        history_context = _experiment_history(s, state["run_id"], pending)
         request = ResearchRequest(
             request_id=f"research-{state['run_id']}-{state['state_version']}",
             objective=objective,
@@ -574,6 +599,8 @@ def _research(s: ServiceTransitions) -> Transition:
             allowed_paths=IMPLEMENTATION_ROOTS,
             controller_context=_controller_context(s),
             unresolved_blockers=unresolved_context,
+            source_context=_source_context(s),
+            experiment_history=history_context,
         )
         response = await client.invoke(request)
         if isinstance(response, AgentFailure):
@@ -619,7 +646,7 @@ def _research(s: ServiceTransitions) -> Transition:
             "terminal_reason": None,
             "pending_route": (
                 "orchestrate"
-                if getattr(s, "min_pending_proposals", 1) > 1
+                if pending.total and getattr(s, "min_pending_proposals", 1) > 1
                 else "proposal_policy"
             ),
         }
@@ -750,27 +777,51 @@ def _resource_feasibility_escalated(
         typed_getter(experiment_id, ImplementationCriterionId.RESOURCE_FEASIBILITY)
     ) >= 2
 
-def _pending_proposals(s: ServiceTransitions, run_id: str) -> tuple[ProposalSummary, ...]:
+def _bounded_text(value: str, limit: int) -> str:
+    return value[:limit]
+
+
+def _pending_proposals(s: ServiceTransitions, run_id: str) -> _PendingProposalView:
     if s.run_store is None:
-        return ()
+        return _PendingProposalView((), 0)
     lister = getattr(s.run_store, "list_experiments_by_status", None)
     if lister is None:
-        return ()
+        return _PendingProposalView((), 0)
     attempted: set[str] = set()
     obs_lister = getattr(s.run_store, "list_scored_observations", None)
     if obs_lister is not None:
         attempted = {o.experiment_id for o in obs_lister(run_id)}
-    return tuple(
+    failure_lister = getattr(s.run_store, "list_failure_records", None)
+    if callable(failure_lister):
+        attempted.update(
+            record.experiment_id
+            for record in cast(Callable[[str], tuple[FailureRecord, ...]], failure_lister)(run_id)
+            if record.experiment_id is not None
+        )
+    candidates = tuple(
+        x for x in lister(run_id, "proposed") if x.experiment_id not in attempted
+    )
+    ordered = tuple(sorted(candidates, key=lambda item: item.experiment_id))
+    # Count the complete eligible set, but construct contracts only for the
+    # bounded projection that agents can actually receive and select.
+    exposed = tuple(
         ProposalSummary(
             experiment_id=x.experiment_id,
-            hypothesis=x.hypothesis,
-            mechanism=x.mechanism,
-            implementation_scope=x.implementation_scope,
-            parent_experiment_id=x.parent_experiment_id,
+            hypothesis=_bounded_text(x.hypothesis, MAX_PROPOSAL_TEXT),
+            mechanism=_bounded_text(x.mechanism, MAX_PROPOSAL_TEXT),
+            implementation_scope=tuple(
+                _bounded_text(scope, MAX_PROPOSAL_SCOPE)
+                for scope in x.implementation_scope[:MAX_PROPOSAL_SCOPE_ITEMS]
+            ),
+            parent_experiment_id=(
+                _bounded_text(x.parent_experiment_id, MAX_PROPOSAL_SCOPE)
+                if x.parent_experiment_id is not None
+                else None
+            ),
         )
-        for x in lister(run_id, "proposed")
-        if x.experiment_id not in attempted
+        for x in ordered[:MAX_CONTEXT_PROPOSALS]
     )
+    return _PendingProposalView(exposed, len(ordered))
 
 
 def _outcome_history(s: ServiceTransitions, run_id: str) -> tuple[OutcomeSummary, ...]:
@@ -788,8 +839,13 @@ def _outcome_history(s: ServiceTransitions, run_id: str) -> tuple[OutcomeSummary
         out.append(
             OutcomeSummary(
                 experiment_id=o.experiment_id,
-                hypothesis=spec.hypothesis if spec is not None else "",
+                hypothesis=(
+                    _bounded_text(spec.hypothesis, MAX_PROPOSAL_TEXT)
+                    if spec is not None
+                    else ""
+                ),
                 primary_score=o.primary_score,
+                ordering_key=o.attempt_id,
                 delta_vs_parent=(
                     round(o.primary_score - scores[parent], 6)
                     if parent is not None and parent in scores
@@ -798,6 +854,129 @@ def _outcome_history(s: ServiceTransitions, run_id: str) -> tuple[OutcomeSummary
             )
         )
     return tuple(out)
+
+
+def _failed_history(s: ServiceTransitions, run_id: str) -> tuple[OutcomeSummary, ...]:
+    """Convert explicitly run-bound failure records into history rows."""
+    if s.run_store is None:
+        return ()
+    getter = getattr(s.run_store, "list_failure_records", None)
+    if callable(getter):
+        records = list(cast(Callable[[str], tuple[FailureRecord, ...]], getter)(run_id))
+    else:
+        lister = getattr(s.run_store, "list_json", None)
+        if not callable(lister):
+            return ()
+        records: list[FailureRecord] = []
+        for payload in cast(Callable[[str], tuple[str, ...]], lister)("failure"):
+            try:
+                record = FailureRecord.model_validate_json(payload)
+            except ValueError:
+                continue
+            if record.run_id == run_id:
+                records.append(record)
+    history: list[OutcomeSummary] = []
+    for failure in records:
+        spec = s.run_store.get_experiment(failure.experiment_id) if failure.experiment_id else None
+        detail = failure.kind.value
+        if failure.evidence_refs:
+            detail = f"{detail}: {', '.join(failure.evidence_refs[:MAX_EVIDENCE_REFS])}"
+        history.append(
+            OutcomeSummary(
+                experiment_id=_bounded_text(
+                    failure.experiment_id or failure.failure_id, MAX_PROPOSAL_SCOPE
+                ),
+                hypothesis=(
+                    _bounded_text(spec.hypothesis, MAX_PROPOSAL_TEXT)
+                    if spec is not None
+                    else ""
+                ),
+                terminal="failed",
+                failure_summary=detail[:MAX_TERMINAL_TEXT],
+                ordering_key=_bounded_text(failure.failure_id, MAX_PROPOSAL_SCOPE),
+            )
+        )
+    return tuple(history)
+
+
+def _champion_summary(
+    s: ServiceTransitions, run_id: str, scored: tuple[OutcomeSummary, ...]
+) -> tuple[str | None, float | None]:
+    del scored
+    if s.run_store is not None:
+        champion = s.run_store.get_run_champion(run_id)
+        if champion is not None:
+            observation = s.run_store.get_scored_observation(champion.observation_id)
+            if observation is None:
+                raise MissingAuthorityError("run champion observation is absent")
+            return observation.experiment_id, observation.primary_score
+    return None, None
+
+
+def _experiment_history(
+    s: ServiceTransitions, run_id: str, pending: _PendingProposalView
+) -> ExperimentHistoryContext:
+    scored = _outcome_history(s, run_id)
+    records = tuple(
+        sorted(
+            (*scored, *_failed_history(s, run_id)),
+            key=lambda item: (item.ordering_key, item.experiment_id, item.terminal),
+        )
+    )
+    champion_id, champion_score = _champion_summary(s, run_id, scored)
+    bounded_records = records[-MAX_CONTEXT_HISTORY:]
+    evidence_payload = {
+        "run_id": run_id,
+        "records": [item.model_dump(mode="json") for item in bounded_records],
+        "pending_proposals": [item.model_dump(mode="json") for item in pending.items],
+        "champion_experiment_id": champion_id,
+        "champion_score": champion_score,
+        "total_records": len(records),
+        "total_pending_proposals": pending.total,
+    }
+    evidence_digest = hashlib.sha256(
+        json.dumps(evidence_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return ExperimentHistoryContext(
+        evidence_id=f"experiment-history-{evidence_digest[:24]}",
+        run_id=run_id,
+        records=bounded_records,
+        pending_proposals=pending.items,
+        champion_experiment_id=champion_id,
+        champion_score=champion_score,
+        total_records=len(records),
+        truncated=len(records) > len(bounded_records),
+        total_pending_proposals=pending.total,
+        pending_truncated=pending.total > len(pending.items),
+    )
+
+
+def _source_context(s: ServiceTransitions) -> SourceContext | None:
+    """Describe the exact parent used by worktree creation, if inspectable."""
+    if s.repository_inspector is None or s.parent_commit is None or len(s.parent_commit) != 40:
+        return None
+    inspector = s.repository_inspector
+    try:
+        excerpt = inspector.read_at_commit(
+            s.parent_commit, EXPERIMENT_ENTRYPOINT, SOURCE_CONTEXT_EXCERPT
+        )
+        digest = inspector.sha256_at_commit(s.parent_commit, EXPERIMENT_ENTRYPOINT)
+        structural = inspector.structural_summary_at_commit(
+            s.parent_commit, EXPERIMENT_ENTRYPOINT
+        )
+    except Exception:
+        # Never fall back to a different checkout revision or alter lineage.
+        return None
+    summary = ", ".join(structural) or "no top-level definitions"
+    return SourceContext(
+        evidence_id=f"source-context-{digest[:24]}",
+        source_commit=s.parent_commit,
+        parent_commit=s.parent_commit,
+        entrypoint_sha256=digest,
+        source_summary=f"entrypoint top-level structure: {summary}"[:MAX_TERMINAL_TEXT],
+        source_excerpt=excerpt,
+        structural_summary=structural,
+    )
 
 def _controller_context(
     s: ServiceTransitions,
@@ -2287,9 +2466,13 @@ def _persist_failure(s: ServiceTransitions) -> Transition:
         kind, message, evidence = _failure_details(state)
         record = FailureRecord(
             failure_id=f"failure-{state['run_id']}-{state['state_version']}",
+            run_id=state["run_id"],
             experiment_id=state.get("current_experiment_id"),
             kind=kind,
-            evidence_refs=evidence or (message,),
+            evidence_refs=tuple(
+                item[:MAX_EVIDENCE_REF_LENGTH]
+                for item in (evidence or (message,))[:MAX_EVIDENCE_REFS]
+            ),
             repair_attempt=state["repair_attempts"],
         )
         if s.run_store is None:
@@ -2434,6 +2617,7 @@ def _mark_terminal_failure(
 ) -> NoReturn:
     record = FailureRecord(
         failure_id=f"failure-{state['run_id']}-{state['state_version']}-terminal",
+        run_id=state["run_id"],
         experiment_id=state.get("current_experiment_id"),
         kind=kind,
         evidence_refs=tuple(

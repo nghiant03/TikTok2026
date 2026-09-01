@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
+from inspect import isawaitable
 from typing import TypeVar, cast
 
 from loguru import logger
@@ -14,7 +15,7 @@ from tiktok2026.contracts import AgentFailure, AgentRole, ContractModel
 ModelT = TypeVar("ModelT", bound=ContractModel)
 
 # Tool handler: (tool_name, arguments_dict) → result_string
-ToolHandler = Callable[[str, dict[str, object]], str]
+ToolHandler = Callable[[str, dict[str, object]], str | Awaitable[str]]
 # Terminal guard: return a bounded diagnostic to reject a validated submission,
 # or ``None`` to accept it.
 TerminalGuard = Callable[[ModelT], str | None]
@@ -383,7 +384,8 @@ async def invoke_agentic(
                         continue
                 return result
             try:
-                result_text = tool_handler(tool_name, arguments)
+                handled = tool_handler(tool_name, arguments)
+                result_text = await handled if isawaitable(handled) else handled
             except Exception as error:
                 result_text = f"error: {type(error).__name__}: {error}"
                 logger.warning(

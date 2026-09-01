@@ -25,7 +25,7 @@ repository, execution, evaluation, persistence, observability
 bootstrap composition
 ```
 
-`src/tiktok2026/contracts` contains versioned Pydantic models and capability protocols. `policies` contains pure decisions. Agent code depends on contracts and injected capabilities, not concrete Git, Docker, SQLite, or evaluator services. Graph nodes call controller operations; they do not issue SQL, shell, Git, Docker, or evaluator calls. `bootstrap.py` is the composition root for the concrete production adapters. The CLI constructs `ProductionOperations`, which delegates service construction to that root.
+`src/tiktok2026/contracts` contains versioned Pydantic models and capability protocols. `policies` contains pure decisions. Agent code depends on contracts and injected capabilities, not concrete Git, Docker, SQLite, or evaluator services. Graph nodes call controller operations; they do not issue SQL, shell, Git, Docker, or evaluator calls. `bootstrap.py` is the composition root for the concrete production adapters. The CLI constructs `ProductionOperations`, which delegates service construction to that root. Repository revision inspection is an injected read-only capability; controller use cases do not construct Git inspectors or invoke subprocesses.
 
 The production bootstrap currently composes the application and graph SQLite stores, resource ledger, artifact store, Git worktree manager, constrained Docker executor, verified dataset provider, provisional evaluator, and one role-specific OpenAI-compatible client per role. The repository also contains reusable memory, trace, and MLflow protocol/adapter modules, but those are not wired into `build_production_services`; a concrete literature adapter is not present. The dedicated `ResearchAgent` and research context modules are available as typed components, while the current production composition uses `RoleSpecificAgentClient` with bootstrap-supplied prompts and capability names.
 
@@ -83,6 +83,45 @@ cannot run arbitrary commands. Agents return typed decisions, results, and
 reports; they do not create authoritative source, artifact, evaluator, dataset,
 or blocker identities. The controller owns validation of payload identity,
 policy, hashes, persistence, and routing.
+
+Planning requests also carry two bounded contexts. `SourceContext` identifies the
+exact approved parent commit used by `WorktreeManager.create`, the fixed training
+entrypoint and its content hash, plus a small structural summary/excerpt. It is
+assembled by the controller-side repository inspector; agents never infer source
+lineage from their checkout. `ExperimentHistoryContext` is run-local and contains
+bounded scored and explicitly run-bound failed records, pending proposals, the
+authoritative champion scalar when available, and total/truncation metadata. It is
+bound to its request `run_id`, and the application authority persists the
+run-to-experiment status association used for pending authorization. It is not
+the global duplicate registry: that registry remains in `ControllerContext`.
+Both contexts are request data only and are never added to compact LangGraph
+state. Missing repository evidence leaves `SourceContext` absent rather than
+falling back to a different revision.
+
+The existing Research role can optionally run a bounded tool loop with
+`search_online`; no additional runtime role or graph node is introduced. The
+tool accepts only a short public query and configured domain allowlist, and the
+provider returns typed, HTTPS-only `OnlineSource` records. Research may cite
+only source IDs returned in that session. Query count, result count, turns, and
+text sizes are hard bounded, while Orchestration, Implementor, and Validator
+receive no online capability. OpenAI hosted web search is the initial concrete
+provider, configured through `online_research` and disabled by default:
+
+```toml
+[online_research]
+enabled = true
+provider = "openai_web_search"
+max_searches = 3
+max_results_per_search = 5
+allowed_domains = ["arxiv.org", "openreview.net"]
+```
+
+Each search result is content-addressed and persisted as bounded provenance
+metadata under the external runtime `literature/` directory. Retrieved content
+is untrusted scientific inspiration, never training data, measured experiment
+evidence, or lifecycle authority. Existing runtime databases are not backfilled
+into the run-scoped experiment-state ledger introduced by migration 011; use a
+fresh runtime root after this schema change.
 
 The execution payload is fixed and includes the required controller-injected
 `--dataset-manifest-sha256` (and optional dataset-view hash), `--data-root`, and

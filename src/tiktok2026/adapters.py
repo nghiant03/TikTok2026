@@ -17,8 +17,10 @@ from tiktok2026.contracts import (
     AuditEvent,
     BaselineCalibrationRecord,
     BlockerResolution,
+    ChampionBinding,
     ContractModel,
     DatasetManifestIdentity,
+    DecisionAction,
     EvaluationResult,
     EvaluatorIdentity,
     ExecutionResult,
@@ -34,6 +36,8 @@ from tiktok2026.contracts import (
     ImplementationRequest,
     ImplementationResult,
     ImplementationSubmission,
+    OnlineResearchProvider,
+    OnlineSearchRequest,
     OrchestrationDecision,
     OrchestrationRequest,
     PolicyDecisionModel,
@@ -60,12 +64,19 @@ from tiktok2026.contracts import (
     validation_blocker_id,
 )
 from tiktok2026.observability.exports import export_records
-from tiktok2026.persistence.repositories import ApplicationRepository
+from tiktok2026.persistence.repositories import ApplicationRepository, PersistenceConflictError
 from tiktok2026.persistence.resources import ResourceLedger
 from tiktok2026.policies.lifecycle import can_repair, convergence_reason
 from tiktok2026.policies.paths import check_changed_paths
 
 ModelT = TypeVar("ModelT", bound=ContractModel)
+
+MAX_FAILURE_ID_LENGTH = 256
+MAX_FAILURE_RUN_ID_LENGTH = 256
+MAX_FAILURE_EXPERIMENT_ID_LENGTH = 256
+MAX_FAILURE_EVIDENCE_REFS = 8
+MAX_FAILURE_EVIDENCE_REF_LENGTH = 256
+MAX_FAILURE_REPAIR_ATTEMPT = 3
 
 
 def _tool(
@@ -156,6 +167,19 @@ _DIFF_TOOL = _tool(
             "default": 20_000,
         }
     },
+)
+
+_SEARCH_ONLINE_TOOL = _tool(
+    "search_online",
+    (
+        "Search current public sources for scientific evidence. Never include repository "
+        "source, credentials, private paths, dataset rows, or test information in the query."
+    ),
+    {
+        "query": {"type": "string", "minLength": 3, "maxLength": 500},
+        "max_results": {"type": "integer", "minimum": 1, "maximum": 8, "default": 5},
+    },
+    ("query",),
 )
 
 
@@ -271,12 +295,20 @@ class RoleSpecificAgentClient:
         prompt: str,
         capabilities: tuple[str, ...] = (),
         scoped_repository: ScopedRepository | None = None,
+        online_research: OnlineResearchProvider | None = None,
+        max_online_searches: int = 3,
+        max_online_results: int = 5,
+        online_allowed_domains: tuple[str, ...] = (),
     ) -> None:
         self._client = client
         self.role = role
         self.prompt = prompt
         self.capabilities = capabilities
         self.scoped_repository = scoped_repository
+        self.online_research = online_research
+        self.max_online_searches = max_online_searches
+        self.max_online_results = max_online_results
+        self.online_allowed_domains = online_allowed_domains
 
     def bind_worktree(
         self,
@@ -327,7 +359,13 @@ class RoleSpecificAgentClient:
                 message="unsupported agent role",
                 repair_attempts=0,
             )
-        if self.role == AgentRole.IMPLEMENTOR and isinstance(
+        if (
+            self.role == AgentRole.RESEARCH
+            and isinstance(request, ResearchRequest)
+            and self.online_research is not None
+        ):
+            result = await self._invoke_research_agentic(request, model_type)
+        elif self.role == AgentRole.IMPLEMENTOR and isinstance(
             self.scoped_repository, ScopedWorktreeRepository
         ):
             result = await self._invoke_implementor_agentic(request_id, request)
@@ -364,10 +402,21 @@ class RoleSpecificAgentClient:
                     message=f"orchestration selected disallowed action: {result.action.value}",
                     repair_attempts=0,
                 )
-            if (
-                result.target_experiment_id is not None
-                and result.target_experiment_id != request.current_experiment_id
-            ):
+            pending_targets: set[str] = {
+                proposal.experiment_id
+                for proposal in (
+                    request.experiment_history.pending_proposals
+                    if request.experiment_history is not None
+                    else ()
+                )
+            }
+            if result.action in (DecisionAction.RESEARCH, DecisionAction.STOP):
+                target_is_invalid = result.target_experiment_id is not None
+            elif result.action == DecisionAction.IMPLEMENT:
+                target_is_invalid = result.target_experiment_id not in pending_targets
+            else:
+                target_is_invalid = result.target_experiment_id != request.current_experiment_id
+            if target_is_invalid:
                 return AgentFailure(
                     request_id=request.request_id,
                     role=AgentRole.ORCHESTRATION,
@@ -430,6 +479,18 @@ class RoleSpecificAgentClient:
                 message="research request ID mismatch",
                 repair_attempts=0,
             )
+        if isinstance(request, ResearchRequest) and isinstance(result, ResearchDecision):
+            spec = result.experiment_spec
+            if spec is not None and not set(spec.implementation_scope).issubset(
+                set(request.allowed_paths)
+            ):
+                return AgentFailure(
+                    request_id=request_id,
+                    role=self.role,
+                    kind="policy",
+                    message="experiment scope is not authorized",
+                    repair_attempts=0,
+                )
         if (
             isinstance(request, ImplementationRequest)
             and isinstance(result, ImplementationResult)
@@ -455,6 +516,76 @@ class RoleSpecificAgentClient:
                 repair_attempts=0,
             )
         return result
+
+    async def _invoke_research_agentic(
+        self, request: ResearchRequest, model_type: type[ContractModel]
+    ) -> ContractModel:
+        provider = self.online_research
+        if provider is None:
+            raise AssertionError("online research provider is not bound")
+        evidence_ids: set[str] = set()
+        if request.source_context is not None:
+            evidence_ids.add(request.source_context.evidence_id)
+        if request.experiment_history is not None:
+            evidence_ids.add(request.experiment_history.evidence_id)
+        if (
+            request.controller_context is not None
+            and request.controller_context.experiment_registry is not None
+        ):
+            evidence_ids.add(request.controller_context.experiment_registry.evidence_id)
+        online_ids: set[str] = set()
+        searches = 0
+
+        async def _handle(tool_name: str, arguments: dict[str, object]) -> str:
+            nonlocal searches
+            if tool_name != "search_online":
+                raise ValueError(f"unsupported research tool: {tool_name}")
+            if searches >= self.max_online_searches:
+                raise ValueError("online research search budget exhausted")
+            searches += 1
+            requested_limit = int(str(arguments.get("max_results", self.max_online_results)))
+            search_request = OnlineSearchRequest(
+                request_id=f"{request.request_id}-online-{searches}",
+                query=str(arguments.get("query", "")),
+                max_results=min(requested_limit, self.max_online_results),
+                allowed_domains=self.online_allowed_domains,
+            )
+            result = await provider.search(search_request)
+            for source in result.sources:
+                if source.source_id in evidence_ids:
+                    raise ValueError(f"duplicate research evidence ID: {source.source_id}")
+                evidence_ids.add(source.source_id)
+                online_ids.add(source.source_id)
+            return result.model_dump_json()
+
+        def _guard(result: ContractModel) -> str | None:
+            if not isinstance(result, (ResearchDecision, ExperimentProposalDecision)):
+                return "research submitted an invalid result type"
+            references = set(result.evidence_refs)
+            if result.experiment_spec is not None:
+                references.update(result.experiment_spec.evidence_refs)
+            unknown = references - evidence_ids
+            if unknown:
+                return f"research cites unknown evidence IDs: {tuple(sorted(unknown))}"
+            if online_ids and references.isdisjoint(online_ids):
+                return "online search results were used but no online evidence ID was cited"
+            if result.request_id != request.request_id:
+                return "research request ID mismatch"
+            return None
+
+        return await invoke_agentic(
+            self._client,
+            self.role,
+            request.request_id,
+            model_type,
+            self.prompt,
+            request.model_dump(mode="json"),
+            (_SEARCH_ONLINE_TOOL, _submit_tool(model_type)),
+            _handle,
+            max_turns=self.max_online_searches + 3,
+            terminal_tool="submit_result",
+            terminal_guard=_guard,
+        )
 
     async def _invoke_implementor_agentic(
         self, request_id: str, request: ContractModel
@@ -1009,23 +1140,98 @@ class RepositoryRunStore:
         return self._repo.list_unresolved_blockers(experiment_id)
 
     def put_failure(self, record: FailureRecord, run_id: str) -> None:
-        payload = record.model_dump_json()
-        existing = {
-            json.loads(value).get("failure_id") for value in self._repo.list_json("failure")
-        }
-        self._repo.put_json("failure", record.failure_id, payload)
-        if record.failure_id not in existing:
-            self._repo.put_audit_event(
-                AuditEvent(
-                    event_id=f"failure-{record.failure_id}",
-                    run_id=run_id,
-                    experiment_id=record.experiment_id,
-                    event_type="failure_persisted",
-                    actor_type="controller",
-                    actor_id="production-controller",
-                    payload=record.model_dump(mode="json"),
-                )
+        if record.run_id is not None and record.run_id != run_id:
+            raise ValueError("failure record run_id does not match its persistence run")
+        get_json = getattr(self._repo, "get_json", None)
+        if callable(get_json):
+            existing_payload = cast(Callable[[str, str], str | None], get_json)(
+                "failure", record.failure_id
             )
+        else:
+            # Compatibility fallback for older repository doubles.  Do not
+            # validate unrelated rows while locating the requested identity.
+            existing_payload = None
+            for value in self._repo.list_json("failure"):
+                try:
+                    value_id = json.loads(value).get("failure_id")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if value_id == record.failure_id:
+                    existing_payload = value
+                    break
+        existing_record = (
+            FailureRecord.model_validate_json(existing_payload)
+            if existing_payload is not None
+            else None
+        )
+        if existing_record is not None:
+            if existing_record.run_id is not None and existing_record.run_id != run_id:
+                raise ValueError("persisted failure record belongs to another run")
+            if existing_record.run_id is None:
+                # Legacy records are immutable and intentionally remain unbound.
+                if existing_record != record.model_copy(update={"run_id": None}):
+                    raise PersistenceConflictError(
+                        f"failure {record.failure_id} legacy content changed"
+                    )
+                return
+            if existing_record != record:
+                raise PersistenceConflictError(
+                    f"failure {record.failure_id} content changed"
+                )
+            return
+        self._validate_new_failure_record(record, run_id)
+        bound = record.model_copy(update={"run_id": run_id})
+        payload = bound.model_dump_json()
+        self._repo.put_json("failure", bound.failure_id, payload)
+        self._repo.put_audit_event(
+            AuditEvent(
+                event_id=f"failure-{bound.failure_id}",
+                run_id=run_id,
+                experiment_id=bound.experiment_id,
+                event_type="failure_persisted",
+                actor_type="controller",
+                actor_id="production-controller",
+                payload=bound.model_dump(mode="json"),
+            )
+        )
+
+    @staticmethod
+    def _validate_new_failure_record(record: FailureRecord, run_id: str) -> None:
+        """Apply current write limits without narrowing the v1 read contract."""
+        values: list[tuple[str, str, int]] = [
+            ("failure_id", record.failure_id, MAX_FAILURE_ID_LENGTH),
+            ("run_id", run_id, MAX_FAILURE_RUN_ID_LENGTH),
+        ]
+        if record.experiment_id is not None:
+            values.append(
+                ("experiment_id", record.experiment_id, MAX_FAILURE_EXPERIMENT_ID_LENGTH)
+            )
+        for name, value, limit in values:
+            if not value or len(value) > limit:
+                raise ValueError(f"new failure {name} exceeds its write boundary")
+        if len(record.evidence_refs) > MAX_FAILURE_EVIDENCE_REFS:
+            raise ValueError("new failure evidence_refs exceeds its write boundary")
+        if any(
+            not reference or len(reference) > MAX_FAILURE_EVIDENCE_REF_LENGTH
+            for reference in record.evidence_refs
+        ):
+            raise ValueError("new failure evidence reference exceeds its write boundary")
+        if not 0 <= record.repair_attempt <= MAX_FAILURE_REPAIR_ATTEMPT:
+            raise ValueError("new failure repair attempt exceeds its write boundary")
+
+    def list_failure_records(self, run_id: str) -> tuple[FailureRecord, ...]:
+        """Read only failures explicitly bound to one run."""
+        records: list[FailureRecord] = []
+        for payload in self._repo.list_json("failure"):
+            try:
+                record = FailureRecord.model_validate_json(payload)
+            except ValueError:
+                # A malformed historical record must not hide valid run-local
+                # failures from replay and planning.
+                continue
+            if record.run_id == run_id:
+                records.append(record)
+        return tuple(records)
 
     def put_worktree_assignment(self, assignment: WorktreeAssignment) -> None:
         self._repo.put_json(
@@ -1037,6 +1243,12 @@ class RepositoryRunStore:
 
     def get_experiment(self, experiment_id: str) -> ExperimentSpec | None:
         return self._repo.get_experiment(experiment_id)
+
+    def list_experiments_by_status(
+        self, run_id: str, status: str
+    ) -> tuple[ExperimentSpec, ...]:
+        """Expose the existing run-local proposal ledger to planning contexts."""
+        return self._repo.list_experiments_by_status(run_id, status)
 
     def get_experiment_registry(
         self, limit: int = 50, exclude_experiment_id: str | None = None
@@ -1183,6 +1395,9 @@ class RepositoryRunStore:
 
     def get_run_closure(self, run_id: str) -> RunClosure | None:
         return self._repo.get_run_closure(run_id)
+
+    def get_run_champion(self, run_id: str) -> ChampionBinding | None:
+        return self._repo.get_run_champion(run_id)
 
     def close_run_if_ready(
         self,

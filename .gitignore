@@ -37,6 +37,3 @@ worktrees/
 *.tmp
 submission_final.csv
 run_log.jsonl
-
-# Local deepwork session state
-.slim/deepwork/

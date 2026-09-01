@@ -8,12 +8,15 @@ from tiktok2026.contracts import (
     ArtifactRecord,
     ArtifactRetention,
     ContractModel,
+    ExperimentHistoryContext,
     ExperimentSpec,
     Fidelity,
     FinalizationRecord,
+    OutcomeSummary,
     PredictionArtifactRegistration,
     ResourceReservation,
     RuntimePaths,
+    SourceContext,
 )
 
 
@@ -112,6 +115,44 @@ def test_experiment_scope_rejects_prose_appended_to_path() -> None:
             fidelity=Fidelity.SMOKE,
             success_criteria="success",
             failure_criteria="failure",
+        )
+
+
+def test_bounded_contexts_are_immutable_and_report_truncation() -> None:
+    source = SourceContext(
+        evidence_id="source-context-1",
+        source_commit="a" * 40,
+        parent_commit="a" * 40,
+        entrypoint_sha256="b" * 64,
+        source_summary="bounded structure",
+        source_excerpt="def train(): pass",
+        structural_summary=("functiondef:train",),
+    )
+    history = ExperimentHistoryContext(
+        evidence_id="history-context-1",
+        run_id="run-1",
+        records=(OutcomeSummary(experiment_id="exp-1", hypothesis="h"),),
+        total_records=2,
+        truncated=True,
+    )
+
+    assert source.source_commit == source.parent_commit
+    assert history.truncated is True
+    with pytest.raises(ValidationError):
+        source.source_commit = "c" * 40  # type: ignore[misc]
+
+
+def test_history_context_rejects_more_than_fifty_items() -> None:
+    records = tuple(
+        OutcomeSummary(experiment_id=f"exp-{index}", hypothesis="h")
+        for index in range(51)
+    )
+    with pytest.raises(ValidationError):
+        ExperimentHistoryContext(
+            evidence_id="history-context-1",
+            run_id="run-1",
+            records=records,
+            total_records=51,
         )
 
 

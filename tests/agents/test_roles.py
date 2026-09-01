@@ -19,6 +19,7 @@ from tiktok2026.contracts import (
     AgentFailure,
     AgentRole,
     DecisionAction,
+    ExperimentHistoryContext,
     ExperimentSpec,
     Fidelity,
     ImplementationEdit,
@@ -28,6 +29,7 @@ from tiktok2026.contracts import (
     ImplementationSubmission,
     OrchestrationDecision,
     OrchestrationRequest,
+    ProposalSummary,
     ResearchDecision,
     ResearchRequest,
     ResourceState,
@@ -179,6 +181,50 @@ async def test_production_orchestration_repairs_research_target(
     assert isinstance(result, OrchestrationDecision)
     assert result.target_experiment_id is None
     assert len(transport.requests) == 2
+
+
+async def test_production_orchestration_accepts_pending_proposal_target(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    payload = OrchestrationDecision(
+        decision_id="decision-pending",
+        action=DecisionAction.IMPLEMENT,
+        target_experiment_id="pending-exp",
+        rationale="Use the controller-authorized pending proposal",
+    ).model_dump(mode="json")
+    agent = RoleSpecificAgentClient(
+        client(monkeypatch, payload),
+        AgentRole.ORCHESTRATION,
+        "Select one allowed action.",
+    )
+    request = OrchestrationRequest(
+        request_id="request-pending",
+        run_id="run-1",
+        phase="research",
+        allowed_actions=(DecisionAction.IMPLEMENT,),
+        resource_state=ResourceState(
+            remaining_gpu_hours=1,
+            accumulated_gpu_hours=0,
+            remaining_wall_seconds=100,
+            used_tokens=0,
+            remaining_tokens=1000,
+            disk_bytes_available=1000,
+            reserved_final_gpu_hours=0.25,
+        ),
+        experiment_history=ExperimentHistoryContext(
+            evidence_id="history-1",
+            run_id="run-1",
+            pending_proposals=(
+                ProposalSummary(experiment_id="pending-exp", hypothesis="h", mechanism="m"),
+            ),
+            total_pending_proposals=1,
+        ),
+    )
+
+    result = await agent.invoke(request)
+
+    assert isinstance(result, OrchestrationDecision)
+    assert result.target_experiment_id == "pending-exp"
 
 
 async def test_proposal_request_repairs_evidence_request(monkeypatch: MonkeyPatch) -> None:
