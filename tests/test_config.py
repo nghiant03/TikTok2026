@@ -7,6 +7,7 @@ from tiktok2026.config import (
     AppSettings,
     BudgetSettings,
     ExecutionSettings,
+    LiteLLMSearchSettings,
     ModelSettings,
     OnlineResearchSettings,
 )
@@ -59,6 +60,15 @@ def test_online_research_is_disabled_and_bounded_by_default() -> None:
     assert settings.max_results_per_search == 5
     with pytest.raises(ValidationError):
         OnlineResearchSettings(max_searches=9)
+
+
+def test_litellm_search_settings_are_independent_and_bounded() -> None:
+    settings = OnlineResearchSettings(provider="litellm_search")
+    assert settings.litellm_search == LiteLLMSearchSettings()
+    assert settings.litellm_search.base_url == "http://127.0.0.1:4000/v1"
+    assert settings.litellm_search.search_tool_name == "research-search"
+    with pytest.raises(ValidationError):
+        LiteLLMSearchSettings(timeout_seconds=5.0)
 
 
 def test_online_research_requires_a_research_model(tmp_path: Path) -> None:
@@ -124,7 +134,7 @@ def test_development_profile_configures_execution_resources() -> None:
         overrides={"runtime_root": Path("/tmp/tiktok2026-test-runtime")},
     )
     assert settings.execution.memory_bytes == 4_294_967_296
-    assert settings.execution.timeout_seconds == 3_600
+    assert settings.execution.timeout_seconds == 7_200
     assert settings.execution.cpus == 1.0
     assert settings.execution.gpu_count == 1
     assert settings.budget.gpu_hours == 48.0
@@ -132,3 +142,16 @@ def test_development_profile_configures_execution_resources() -> None:
     assert settings.budget.tokens == 2_000_000_000
     assert settings.budget.disk_bytes == 107_374_182_400
     assert settings.models[AgentRole.RESEARCH].max_tokens == 32_768
+
+
+def test_litellm_operator_enables_independent_keyless_search() -> None:
+    settings = AppSettings.load(
+        repository_root=Path("/tmp/repo"),
+        profile_path=Path("config/budgets/development.toml"),
+        operator_path=Path("config/litellm/operator-models.toml"),
+        overrides={"runtime_root": Path("/tmp/tiktok2026-test-runtime")},
+    )
+    assert settings.models[AgentRole.RESEARCH].model == "tiktok2026-research"
+    assert settings.online_research.enabled is True
+    assert settings.online_research.provider == "litellm_search"
+    assert settings.online_research.litellm_search.search_tool_name == "research-search"

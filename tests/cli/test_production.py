@@ -132,7 +132,11 @@ def test_production_runs_bind_cached_starter_baseline(
             graph=_CompletingGraph(), repository=repository, resource_ledger=None
         )
 
-    settings = SimpleNamespace(models={}, dataset_root=tmp_path / "dataset")
+    settings = SimpleNamespace(
+        models={},
+        dataset_root=tmp_path / "dataset",
+        online_research=SimpleNamespace(enabled=False),
+    )
     monkeypatch.setattr(bootstrap, "verify_manifests", fake_verify)
     monkeypatch.setattr(bootstrap, "build_production_services", fake_services)
     operations = ProductionOperations(
@@ -173,7 +177,11 @@ def test_production_resume_backfills_baseline_without_checkpoint_mutation(
         runtime_root,
         baseline_calibrator=lambda *args: (_baseline_calibration(), True),
     )
-    settings = SimpleNamespace(models={}, dataset_root=tmp_path / "dataset")
+    settings = SimpleNamespace(
+        models={},
+        dataset_root=tmp_path / "dataset",
+        online_research=SimpleNamespace(enabled=False),
+    )
     checkpoint: dict[str, object] = {
         "phase": "complete",
         "state_version": 9,
@@ -365,7 +373,11 @@ def test_production_resume_rejects_conflicting_baseline_binding(
     )
     existing = _baseline_binding("run-1", "older-calibration")
     repository.put_run_baseline(existing)
-    settings = SimpleNamespace(models={}, dataset_root=tmp_path / "dataset")
+    settings = SimpleNamespace(
+        models={},
+        dataset_root=tmp_path / "dataset",
+        online_research=SimpleNamespace(enabled=False),
+    )
     def fake_verify(repository_root: Path) -> object:
         del repository_root
         return object()

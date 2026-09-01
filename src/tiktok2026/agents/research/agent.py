@@ -12,6 +12,7 @@ from tiktok2026.contracts import (
     ResearchDecision,
     ResearchRequest,
 )
+from tiktok2026.policies.paths import check_changed_paths
 
 
 class ResearchAgent:
@@ -61,9 +62,9 @@ class ResearchAgent:
                     raise ValueError("research request ID mismatch")
                 if not set(decision.evidence_refs).issubset(evidence_ids):
                     raise ValueError("research decision cites unknown evidence")
-                if decision.experiment_spec is not None and not set(
-                    decision.experiment_spec.implementation_scope
-                ).issubset(set(request.allowed_paths)):
+                if decision.experiment_spec is not None and not check_changed_paths(
+                    decision.experiment_spec.implementation_scope, request.allowed_paths
+                ).allowed:
                     raise ValueError("experiment scope is not authorized")
                 return decision
             except (ValidationError, ValueError, json.JSONDecodeError) as error:

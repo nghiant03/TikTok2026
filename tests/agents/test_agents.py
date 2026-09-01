@@ -12,8 +12,12 @@ from tiktok2026.agents.common.client import ChatTransport, OpenAICompatibleClien
 from tiktok2026.agents.common.structured import invoke_agentic
 from tiktok2026.agents.research.agent import ResearchAgent
 from tiktok2026.agents.research.context import ResearchCapabilities
-from tiktok2026.agents.research.online import OpenAIWebSearchProvider
-from tiktok2026.config import ModelSettings
+from tiktok2026.agents.research.online import (
+    HttpxPageFetcher,
+    LiteLLMSearchProvider,
+    OpenAIWebSearchProvider,
+)
+from tiktok2026.config import LiteLLMSearchSettings, ModelSettings
 from tiktok2026.contracts import (
     AgentFailure,
     AgentRole,
@@ -422,6 +426,107 @@ async def test_openai_web_search_records_only_authorized_https_sources(
     web_tool = transport.requests[0][1]["tools"]
     assert isinstance(web_tool, list)
     assert web_tool[0]["filters"] == {"allowed_domains": ["arxiv.org"]}  # type: ignore[index]
+
+
+class RecordingPageFetcher:
+    def __init__(self, text: str | None) -> None:
+        self.text = text
+        self.requests: list[tuple[str, tuple[str, ...]]] = []
+
+    async def fetch(self, url: str, allowed_domains: tuple[str, ...]) -> str | None:
+        self.requests.append((url, allowed_domains))
+        return self.text
+
+
+async def test_litellm_search_reads_authorized_pages_and_persists_evidence(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("LITELLM_API_KEY", "proxy-secret")
+    transport = RecordingTransport(
+        [
+            {
+                "object": "search",
+                "results": [
+                    {
+                        "title": "Current paper",
+                        "url": "https://arxiv.org/abs/1234",
+                        "snippet": "Search snippet",
+                    },
+                    {
+                        "title": "Blocked result",
+                        "url": "https://example.org/private",
+                        "snippet": "Must not be returned",
+                    },
+                ],
+            }
+        ]
+    )
+    page_fetcher = RecordingPageFetcher("Full authorized page text")
+    provider = LiteLLMSearchProvider(
+        LiteLLMSearchSettings(),
+        tmp_path,
+        transport,
+        page_fetcher,
+    )
+
+    result = await provider.search(
+        OnlineSearchRequest(
+            request_id="online-1",
+            query="recent recommender evaluation methods",
+            allowed_domains=("arxiv.org",),
+        )
+    )
+
+    assert result.provider == "litellm_search"
+    assert tuple(source.url for source in result.sources) == (
+        "https://arxiv.org/abs/1234",
+    )
+    assert result.sources[0].excerpt == "Full authorized page text"
+    assert page_fetcher.requests == [
+        ("https://arxiv.org/abs/1234", ("arxiv.org",)),
+    ]
+    assert transport.requests[0][0].endswith("/search/research-search")
+    assert transport.requests[0][1] == {
+        "query": "recent recommender evaluation methods",
+        "max_results": 5,
+        "search_domain_filter": ["arxiv.org"],
+    }
+    assert (tmp_path / f"{result.result_id}.json").is_file()
+
+
+async def test_litellm_search_rejects_malformed_results(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("LITELLM_API_KEY", "proxy-secret")
+    provider = LiteLLMSearchProvider(
+        LiteLLMSearchSettings(),
+        tmp_path,
+        RecordingTransport([{"object": "search", "results": [{"url": 3}]}]),
+        RecordingPageFetcher(None),
+    )
+
+    with raises(ValueError, match="requires title, url, and snippet strings"):
+        await provider.search(
+            OnlineSearchRequest(request_id="online-1", query="recommender evaluation")
+        )
+
+
+async def test_page_fetcher_extracts_text_and_blocks_disallowed_redirects() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/paper":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                text="<html><style>hidden</style><body>Useful <b>paper</b> text</body></html>",
+            )
+        return httpx.Response(302, headers={"location": "https://example.org/private"})
+
+    fetcher = HttpxPageFetcher(httpx.MockTransport(handler))
+
+    assert await fetcher.fetch("https://arxiv.org/paper", ("arxiv.org",)) == (
+        "Useful paper text"
+    )
+    assert await fetcher.fetch("https://arxiv.org/redirect", ("arxiv.org",)) is None
 
 
 # ---------------------------------------------------------------------------

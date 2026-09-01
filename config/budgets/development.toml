@@ -1,9 +1,9 @@
-dataset_root = "/home/nghiant/Git/Project/TikTok2026/data/Post-KuaiRand-Pure"
+dataset_root = "/home/nghiant/Git/Contest/TikTok2026/data/Post-KuaiRand-Pure"
 docker_image = "localhost:5000/tiktok2026@sha256:2e21acbb85500217a479cedab3a8f13d9b5f7b9c611876e0921473ff608534e2"
 
 [execution]
 memory_bytes = 4294967296
-timeout_seconds = 3600
+timeout_seconds = 7200
 cpus = 1.0
 gpu_count = 1
 

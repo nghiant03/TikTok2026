@@ -481,9 +481,9 @@ class RoleSpecificAgentClient:
             )
         if isinstance(request, ResearchRequest) and isinstance(result, ResearchDecision):
             spec = result.experiment_spec
-            if spec is not None and not set(spec.implementation_scope).issubset(
-                set(request.allowed_paths)
-            ):
+            if spec is not None and not check_changed_paths(
+                spec.implementation_scope, request.allowed_paths
+            ).allowed:
                 return AgentFailure(
                     request_id=request_id,
                     role=self.role,

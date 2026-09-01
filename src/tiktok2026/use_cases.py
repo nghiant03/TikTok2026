@@ -794,7 +794,12 @@ def _bounded_text(value: str, limit: int) -> str:
     return value[:limit]
 
 
-def _pending_proposals(s: ServiceTransitions, run_id: str) -> _PendingProposalView:
+def _pending_proposals(
+    s: ServiceTransitions,
+    run_id: str,
+    *,
+    exclude_experiment_id: str | None = None,
+) -> _PendingProposalView:
     if s.run_store is None:
         return _PendingProposalView((), 0)
     lister = getattr(s.run_store, "list_experiments_by_status", None)
@@ -812,7 +817,9 @@ def _pending_proposals(s: ServiceTransitions, run_id: str) -> _PendingProposalVi
             if record.experiment_id is not None
         )
     candidates = tuple(
-        x for x in lister(run_id, "proposed") if x.experiment_id not in attempted
+        x
+        for x in lister(run_id, "proposed")
+        if x.experiment_id not in attempted and x.experiment_id != exclude_experiment_id
     )
     ordered = tuple(sorted(candidates, key=lambda item: item.experiment_id))
     # Count the complete eligible set, but construct contracts only for the
@@ -1111,8 +1118,15 @@ def _proposal_validation(s: ServiceTransitions) -> Transition:
                 if source_context is not None
                 else None
             ),
+            # Match the pre-persistence history snapshot supplied to Research.
             "experiment_history": _experiment_history(
-                s, state["run_id"], _pending_proposals(s, state["run_id"])
+                s,
+                state["run_id"],
+                _pending_proposals(
+                    s,
+                    state["run_id"],
+                    exclude_experiment_id=spec.experiment_id,
+                ),
             ).model_dump(mode="json"),
         }
         operation = _validation_operation(state, ValidationStage.PROPOSAL, subject)

@@ -482,6 +482,12 @@ class _FakeStore:
 
 
 class _ContentAddressedRegistryStore(_FakeStore):
+    def list_experiments_by_status(
+        self, run_id: str, status: str
+    ) -> tuple[ExperimentSpec, ...]:
+        del run_id, status
+        return tuple(self.experiments.values())
+
     def get_experiment_registry(
         self, limit: int = 50, exclude_experiment_id: str | None = None
     ) -> ExperimentRegistrySnapshot:
@@ -796,6 +802,10 @@ async def test_proposal_validation_reuses_research_registry_identity() -> None:
     validation_registry = validation_context["experiment_registry"]
     assert isinstance(validation_registry, dict)
     assert validation_registry["evidence_id"] == research_registry.evidence_id
+    assert research_request.experiment_history is not None
+    validation_history = validation_request.subject["experiment_history"]
+    assert isinstance(validation_history, dict)
+    assert validation_history["evidence_id"] == research_request.experiment_history.evidence_id
 
 
 async def test_rejected_proposal_returns_to_research_with_feedback() -> None:

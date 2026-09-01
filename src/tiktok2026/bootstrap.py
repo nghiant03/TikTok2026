@@ -27,7 +27,7 @@ from tiktok2026.adapters import (
     RepositoryTransitionStore,
     RoleSpecificAgentClient,
 )
-from tiktok2026.agents.research.online import OpenAIWebSearchProvider
+from tiktok2026.agents.research.online import LiteLLMSearchProvider, OpenAIWebSearchProvider
 from tiktok2026.benchmark.kuaireand_pure.manifest import BenchmarkManifest, verify_protected_files
 from tiktok2026.contracts import (
     DEFAULT_IMPLEMENTATION_CRITERIA,
@@ -475,6 +475,13 @@ class ProductionOperations:
                     if not os.getenv(model.api_key_env)
                 }
             )
+            if (
+                settings.online_research.enabled
+                and settings.online_research.provider == "litellm_search"
+                and not os.getenv(settings.online_research.litellm_search.api_key_env)
+            ):
+                missing.append(settings.online_research.litellm_search.api_key_env)
+                missing = sorted(set(missing))
             if missing:
                 raise OperationalError(
                     "production run requires configured credentials: " + ", ".join(missing)
@@ -1693,6 +1700,13 @@ def build_production_services(settings: Any) -> ProductionServices:
                 if not os.getenv(model.api_key_env)
             }
         )
+        if (
+            app_settings.online_research.enabled
+            and app_settings.online_research.provider == "litellm_search"
+            and not os.getenv(app_settings.online_research.litellm_search.api_key_env)
+        ):
+            missing_credentials.append(app_settings.online_research.litellm_search.api_key_env)
+            missing_credentials = sorted(set(missing_credentials))
         if missing_credentials:
             missing.append("credentials for " + ", ".join(missing_credentials))
         if missing:
@@ -1795,11 +1809,15 @@ def build_production_services(settings: Any) -> ProductionServices:
         ),
     }
     research_model = app_settings.models.get(AgentRole.RESEARCH)
-    online_research = (
-        OpenAIWebSearchProvider(research_model, paths.literature)
-        if app_settings.online_research.enabled and research_model is not None
-        else None
-    )
+    online_research = None
+    if app_settings.online_research.enabled and research_model is not None:
+        if app_settings.online_research.provider == "openai_web_search":
+            online_research = OpenAIWebSearchProvider(research_model, paths.literature)
+        else:
+            online_research = LiteLLMSearchProvider(
+                app_settings.online_research.litellm_search,
+                paths.literature,
+            )
     agents: dict[AgentRole, RoleSpecificAgentClient] = {
         role: RoleSpecificAgentClient(
             OpenAICompatibleClient(model),

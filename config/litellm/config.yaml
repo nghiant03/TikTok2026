@@ -1,5 +1,11 @@
 # config/litellm/config.yaml
 
+search_tools:
+  # Independent keyless search; ChatGPT remains the reasoning provider.
+  - search_tool_name: research-search
+    litellm_params:
+      search_provider: duckduckgo
+
 model_list:
 
   # Cheap/fast controller decisions

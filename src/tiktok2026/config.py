@@ -46,14 +46,24 @@ class ExecutionSettings(BaseModel):
     smoke_disk_bytes: int = Field(default=64 * 1024 * 1024, gt=0)
 
 
+class LiteLLMSearchSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    base_url: str = Field(default="http://127.0.0.1:4000/v1", min_length=1, max_length=2_048)
+    api_key_env: str = Field(default="LITELLM_API_KEY", min_length=1, max_length=128)
+    search_tool_name: str = Field(default="research-search", min_length=1, max_length=128)
+    timeout_seconds: float = Field(default=60.0, ge=30.0, le=120.0)
+
+
 class OnlineResearchSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     enabled: bool = False
-    provider: Literal["openai_web_search"] = "openai_web_search"
+    provider: Literal["openai_web_search", "litellm_search"] = "openai_web_search"
     max_searches: int = Field(default=3, ge=1, le=8)
     max_results_per_search: int = Field(default=5, ge=1, le=8)
     allowed_domains: tuple[str, ...] = Field(default=(), max_length=32)
+    litellm_search: LiteLLMSearchSettings = LiteLLMSearchSettings()
 
 
 class AppSettings(BaseModel):

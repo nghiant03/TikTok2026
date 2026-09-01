@@ -241,7 +241,7 @@ async def test_proposal_request_repairs_evidence_request(monkeypatch: MonkeyPatc
         mechanism="test mechanism",
         motivation="test motivation",
         expected_signal="test signal",
-        implementation_scope=("src/tiktok2026/experiment",),
+        implementation_scope=("src/tiktok2026/experiment/train.py",),
         fidelity=Fidelity.SMOKE,
         implementation_resource_estimate=ImplementationResourceEstimate(
             predicted_wall_seconds=10.0,
